@@ -2630,45 +2630,95 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		// Zielgleichung. Tatsaechlich ist fw.t1 = -P1_vor - rho*d + 2*(elibb_dp.t1); ohne den
 		// dritten Summanden zielt S2 auf die falsche Groesse. Am Fahrzeug ist ELIBB nicht
 		// abschaltbar (ohne ihn verzehnfacht sich die Reibung), der Term ist dort kein Rest.
-		float s2_r1 = -def_fac_tau*twe - (P1 - rek_dp1);
-)+"#ifdef FACETTEN_ELIBB"+R(
-		s2_r1 = fma(2.0f, elibb_dp.x*t1x+elibb_dp.y*t1y+elibb_dp.z*t1z, s2_r1);
-)+"#endif"+R( // FACETTEN_ELIBB
+		// ★★★ S1 (24.09.2026 nachmittags): DAS REINE MODELLZIEL. Hier stand bis eben die
+		// BUCHUNGSIDENTITAET -def_fac_tau*twe - (P1 - rek_dp1) + 2*(elibb_dp.t1). Die ist gemessen
+		// gekippt (Ub +143 %, cf 0) -- aber NICHT, weil eine Zellquelle auf R1 nicht tragen kann:
+		// CFD_FAC_KRAFT speist DASSELBE R1 lagfrei an einer Obermenge ein und haelt den Antrieb
+		// auf 1,6 %. Was kippt, ist die Kombination aus (a) P1 im Ziel und (b) Lag 1.
+		// P1 ist an Treppen der DEVIATORISCHE Austausch und im FLAECHENINTEGRAL exakt 0 -- ueber
+		// die ganze Wand hebt -P1 sich weg, ueber die markierte 1/3-Teilmenge NICHT. Eine
+		// Zellquelle darauf ist eine stehende Koerperkraft; der Akkumulator hat +64,63 je Schritt
+		// gegen ein Budget von 0,998 gemessen, also fast genau |P1|/twe = 67,85 dieser Menge.
+		// DESHALB JETZT: nur der Modellanteil. Kein P1, kein ELIBB-Glied.
+		// STRUKTURELLE ABNAHME -- ★ BERICHTIGT 24.09. nachmittags (Pruefagent H1/H2). Hier stand:
+		//   "twe = fmin(tw*faca, 0,5*rhon*ut) => |s2_d1| <= def_fac_tau*0,5*ut, also kann die Schranke
+		//    fuer def_fac_tau <= 1 NIE greifen. SLOT 395 MUSS EXAKT 0 SEIN."
+		// Der Schluss stimmt ALGEBRAISCH, die Umsetzung stand in float daneben: s2_max = 0.5f*ut trug
+		// null Rundungen, s2_d1 = fl(0.5f*rhon*ut)/rhon deren zwei. Genau dort, wo die twe-Klemme bindet
+		// (Slot 8), ueberschritt s2_d1 die Schranke um 1-2 ulp und die Zelle fiel STILL auf Bounce-Back
+		// zurueck. Der frueher gemessene Slot 400 = 9 ist genau diese Kante.
+		// JETZT wird im twe-Bereich verglichen, mit BUCHSTAEBLICH demselben Ausdruck wie das fmin in
+		// 2328 und 2406 (0.5f*rhon*ut, gleiche Assoziation) -- damit ist die Kante exakt.
+		// FOLGE, die man wissen muss: die Schranke ist unter S1 damit STRUKTURELL redundant. Slot 395
+		// ist eine STOLPERDRAHT-Null, KEINE bestandene Messung. Er feuert nur, wenn jemand die
+		// tw_max-Klemme entfernt (wie beim MOZ-Tausch 2371 schon einmal geschehen).
+		// DESHALB: SLOT 395 IST NUR ZUSAMMEN MIT SLOT 8 DEUTBAR -- Slot 8 sagt, ob der Pfad ueberhaupt lief.
+		const float s2_r1 = -def_fac_tau*twe;
 		const float s2_d1 = s2_r1/rhon;
-		const float s2_max = 0.5f*ut;
 		const float s2_alt = fac_nb[def_nb_stride*(ulong)fid+def_nb_roff+4ul];
-		const bool s2_ok = (fabs(s2_d1)<=s2_max);
+		const bool s2_ok = (fabs(s2_r1)<=def_fac_tau*(0.5f*rhon*ut)); // ★ H2: derselbe Ausdruck wie das fmin, keine Division, keine ulp-Kante
 		const float s2_neu = s2_ok ? s2_d1 : 0.0f;
 		fac_nb[def_nb_stride*(ulong)fid+def_nb_roff+4ul] = s2_neu;
 		if(t%def_zaehl_takt==0ul) {
-			// [393] KONVERGENZ: relative Schrittaenderung ueber der Schwelle. Faellt sie nicht,
-			// ist der Lag-1-Kreis nicht kontrahiert und die Amplitude schwingt.
+			// [393] SCHRITTFLUKTUATION der Amplitude. ★ BERICHTIGT 24.09. (Pruefagent H3): hier stand
+			// "KONVERGENZ ... faellt sie nicht, ist der Lag-1-Kreis nicht kontrahiert". Das galt fuer das
+			// ALTE Ziel mit P1 (e_{n+1} = e* - G11roh*e_n). Seit S1 haengt s2_neu nur noch an twe und rhon
+			// DESSELBEN Schritts -- es gibt keine Rueckkopplung mehr, also auch nichts zu kontrahieren.
+			// Was der Zaehler jetzt misst: wie stark die Amplitude von Schritt zu Schritt schwankt, und
+			// damit DIREKT, wie weit die ANGEWANDTE (= die des Vorschritts, Lag 1) von der richtigen
+			// abweicht. 63,8 % gemessen heisst: an fast zwei Dritteln der Marken ist der Lag-Fehler > 5 %.
+			// Das bleibt ein Grund, den Lag zu entfernen -- aber es ist KEIN Konvergenzbefund.
 			const float s2_dd = fabs(s2_neu-s2_alt);
 			if(s2_dd>0.05f*fmax(fabs(s2_neu), 1.0E-30f)&&hits[393]<0xF0000000u) atomic_inc(&hits[393]);
 			// [394] die rho-Klemme VERSTAERKT hier, statt zu daempfen -- eigene Klasse, eigener Zaehler.
 			if(rhon<=0.5f&&hits[394]<0xF0000000u) atomic_inc(&hits[394]);
 			// [395] die Schranke hat gegriffen, die Zelle faellt auf Bounce-Back zurueck.
 			if(!s2_ok&&hits[395]<0xF0000000u) atomic_inc(&hits[395]);
-			// [396] Vorzeichen von R1. ★ BERICHTIGT 24.09.: hier stand "beschleunigen statt bremsen" -- das
-			// ist FALSCH. R1 ist die KORREKTUR, nicht die Wandkraft; nach Anwendung ist
-			// phi1 = -def_fac_tau*twe < 0, die Wand bremst (gemessen: phi1 = -twe exakt). R1 > 0
-			// heisst nur, dass Bounce-Back hier MEHR bremst als das Modell will.
-			if(s2_r1>0.0f&&hits[396]<0xF0000000u) atomic_inc(&hits[396]);
+			// [396] RICHTUNG der Schrittaenderung. ★ ERSETZT 24.09. (Pruefagent H1): hier stand das
+			// Vorzeichen von R1. Unter S1 ist s2_r1 = -def_fac_tau*twe mit twe >= 0 lueckenlos und
+			// def_fac_tau in {0;1} (drei Zuweisungen, alle Literale: setup.cpp:11537/11546/11661 -- ein
+			// CFD_FAC_TAU gibt es NICHT). Also s2_r1 <= 0 IMMER: der Zaehler KONNTE nicht feuern, und der
+			// Gegenphasentest verglich 0 % gegen 0 % und meldete zwangslaeufig "keine Periode-2-Mode".
+			// Das ist die Klasse, die dieses Projekt an Slot 124/125 und an Slot 331 schon bezahlt hat.
+			// JETZT: bei einer Periode-2-Mode steigt die Amplitude in der einen Paritaet und faellt in der
+			// anderen, also 396/397 -> 100 % und 401/402 -> 0 % (oder umgekehrt). Bei reiner Fluktuation
+			// liegen BEIDE bei rund 50 %. Das ist der Detektor, den HOCH-2 gemeint hat.
+			if(s2_neu>s2_alt&&hits[396]<0xF0000000u) atomic_inc(&hits[396]);
 			// [397] WIRKPFAD und Nenner fuer alle vier.
 			if(hits[397]<0xF0000000u) atomic_inc(&hits[397]);
+			// [403..407] AMPLITUDENGROESSE -- ★ NEU 24.09. (Pruefagent H4), das entscheidende fehlende
+			// Instrument. Unter S2 ist CFD_FAC_REK_EPS zwingend 0 (setup.cpp:786), deshalb schweigen BEIDE
+			// Groessenwaechter: setup.cpp:857 (harte Sperre 1e-6, "der Hub ueberlebt store_f nicht") und
+			// setup.cpp:863 (Messhub 1e-4, "darunter koennen alle Zaehler gruen sein, ohne dass der Hub den
+			// naechsten Zeitschritt erreicht -- sie messen registerseitig"). Beide haengen an rek_eps_b>0.
+			// Fuer die LAUFZEITamplitude gab es damit keinen einzigen Waechter -- und genau sie liegt nach
+			// der Herleitung bei |du| = twe/rhon ~ 4,5e-6..1,35e-5 (twe = 6,733998e-06 gemessen am kipp26,
+			// setup.cpp:766; rhon in [0,5;1,5]), also 7- bis 22-fach UNTER dem Messhub.
+			// Die Faechergrenzen SIND diese projekteigenen Schwellen: der Lauf sagt damit selbst, ob er im
+			// stillen Band arbeitet. Nenner ist 397 (gleiches Gate).
+			// ACHTUNG BERECHNETER INDEX: ein Literal-Grep nach "hits[404]" findet diese Slots NICHT --
+			// dieselbe Falle wie die SGS_DIAG-Faecher 30..48, die zweimal bezahlt wurde.
+			const float s2_b = fabs(s2_neu);
+			const uint s2_f = (s2_b<1.0E-6f) ? 403u : ((s2_b<1.0E-5f) ? 404u : ((s2_b<1.0E-4f) ? 405u : ((s2_b<1.0E-3f) ? 406u : 407u)));
+			if(hits[s2_f]<0xF0000000u) atomic_inc(&hits[s2_f]);
 		}
-		// ★★ HOCH-2 (Nachpruefung 24.09.): die fuenf Zaehler oben tasten ALLE dieselbe Paritaet ab.
-		// def_zaehl_takt ist gerade, die Zaehlschritte sind also 0, takt, 2*takt, ... und damit alle
-		// gerade -- waehrend die dort gelesene Amplitude vom Schritt DAVOR stammt, also von einem
-		// ungeraden. Eine Periode-2-Mode, die der Plan ausdruecklich als real fuehrt, ist so
-		// KONSTRUKTIV UNSICHTBAR: sie liest sich als einseitiges Vorzeichen (gemessen 99,7 %), als
-		// Schranke die nie greift (gemessen 0 bzw. 9) und als dauerhafte Schrittaenderung (79 %).
-		// Genau dieses Muster lag vor. Diese drei Zaehler tasten die ANDERE Phase ab, zum selben
-		// Preis. Weichen 400/401 stark von 395/396 ab, schwingt die Amplitude, statt einseitig zu
-		// sein -- und dann ist keine der Kraftzahlen dieses Arms deutbar.
+		// ★★ GEGENPHASE (HOCH-2, 24.09. vormittags gebaut -- ★ NEU GEFASST 24.09. nachmittags).
+		// Bauanlass: die Zaehler oben tasten alle dieselbe Paritaet ab (def_zaehl_takt gerade, Zaehl-
+		// schritte 0, takt, 2*takt ...), waehrend die dort GELESENE Amplitude vom Schritt davor stammt,
+		// also von einer ungeraden. Eine Periode-2-Mode waere dadurch konstruktiv unsichtbar.
+		// WAS DIE ERSTE FASSUNG NICHT LEISTETE: sie spiegelte 395 und 396, und BEIDE sind unter S1
+		// konstruktiv still -- 395 strukturell redundant, 396 wegen s2_r1 <= 0 unmoeglich. Der Vergleich
+		// lief also 0 % gegen 0 % und meldete zwangslaeufig "keine Periode-2-Mode": eine Tautologie, die
+		// wie eine bestandene Abnahme aussah. Gemessen wurde sie als 99,7 % gegen 99,7 % (0,0 pp).
+		// JETZT spiegelt 401 den RICHTUNGSzaehler 396 (steigt/faellt). Weichen 401/402 und 396/397 stark
+		// voneinander ab, schwingt die Amplitude -- und dann ist keine Kraftzahl dieses Arms deutbar.
+		// ★ M3 OFFEN: dass def_zaehl_takt GERADE ist, waechtert nirgends jemand. zaehl_takt() skaliert
+		// mit dx (lbm.cpp:636); bei dx = 3,75 mm ergibt CFD_ZAEHL_TAKT=1000 den Wert 1067 -- ungerade,
+		// dann treffen ==0 und ==1 beide Paritaeten und dieser ganze Block ist bedeutungslos.
+		// Der Waechter gehoert an die Emission von def_zaehl_takt in lbm.cpp.
 		if(t%def_zaehl_takt==1ul) {
 			if(!s2_ok&&hits[400]<0xF0000000u) atomic_inc(&hits[400]);
-			if(s2_r1>0.0f&&hits[401]<0xF0000000u) atomic_inc(&hits[401]);
+			if(s2_neu>s2_alt&&hits[401]<0xF0000000u) atomic_inc(&hits[401]); // ★ H1: spiegelt jetzt 396 (Richtung), war das tote R1-Vorzeichen
 			if(hits[402]<0xF0000000u) atomic_inc(&hits[402]);
 		}
 	}

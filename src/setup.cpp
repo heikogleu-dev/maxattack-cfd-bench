@@ -1165,31 +1165,55 @@ static void pruefe_rek_wirkpfad(LBM_Domain* D, const ulong t_ende, const string&
 			if(D->fac_rek_s2_jit) {
 				const ulong w=(ulong)H[397], nk=(ulong)H[393], rk=(ulong)H[394], kl=(ulong)H[395], vz=(ulong)H[396];
 				const ulong w2=(ulong)H[402], kl2=(ulong)H[400], vz2=(ulong)H[401];
-				print_info("["+ort+"] S2 AMPLITUDE AUS DEM ZIEL: Besuche "+to_string(w)+", Schrittaenderung ueber 5 % "+to_string(nk)+", rho auf der unteren Klemme "+to_string(rk)+", Schranke gegriffen (Rueckfall) "+to_string(kl)+", R1 > 0 (beschleunigend) "+to_string(vz)+".");
+				const ulong kl8=(ulong)H[8]; // ★ H2 (24.09. nachm.): [395] ist NUR mit Slot 8 deutbar -- er sagt, ob der twe-Klemmpfad ueberhaupt lief
+				const ulong a0=(ulong)H[403], a1=(ulong)H[404], a2=(ulong)H[405], a3=(ulong)H[406], a4=(ulong)H[407]; // ★ H4: Amplitudengroesse
+				const ulong as=a0+a1+a2+a3+a4;
+				print_info("["+ort+"] S2 AMPLITUDE AUS DEM ZIEL: Besuche "+to_string(w)+", Schrittaenderung ueber 5 % "+to_string(nk)+", rho auf der unteren Klemme "+to_string(rk)+", Schranke gegriffen (Rueckfall) "+to_string(kl)+", Amplitude gestiegen "+to_string(vz)+".");
 				if(g_alle<0xF0000000ull&&w!=g_alle) k_befund("["+ort+"] S2: Slot 397 = "+to_string(w)+" != Slot 370 = "+to_string(g_alle)+". Beide haengen am selben Gate und es liegt kein return dazwischen -- die Gleichheit ist strikt. Eine Abweichung heisst, dass der Bestimmungsblock nicht jeden markierten Besuch sieht.");
 				if(w==0ull) k_befund("["+ort+"] S2: Slot 397 = 0 -- der Bestimmungsblock wurde NIE erreicht, obwohl FAC_REK_S2 im uebersetzten Kernel steht. Die Amplitude bleibt dann auf ihrem Anfangswert 0 und der Arm ist ein stiller No-Op.");
 				else {
-					// DIE Abnahme des Lag-1-Kreises. Kontrahiert er, faellt die Schrittaenderung gegen 0.
+					// ★ BERICHTIGT 24.09. nachmittags (Pruefagent H3). Hier stand: "DIE Abnahme des
+					// Lag-1-Kreises. Kontrahiert er, faellt die Schrittaenderung gegen 0." Das galt fuer das
+					// ALTE Ziel mit P1. Seit S1 gibt es keine Rueckkopplung mehr -- der Zaehler misst die
+					// Schrittschwankung von twe/rhon und damit DIREKT, wie weit die angewandte Amplitude
+					// (die des Vorschritts, Lag 1) von der richtigen abweicht. Alter Text:
 					// Tut sie das nicht, schwingt die Amplitude -- die Periode-2-Mode, die der Plan als
 					// real fuehrt. Das ist KEIN Baufehler, sondern ein Messergebnis, und es entscheidet,
 					// ob S2 so bleiben kann oder die Injektion hinter die Momentenschleife muss.
-					if(nk>w/2ull) print_warning("["+ort+"] S2 KONVERGENZ: an "+to_string((float)(100.0*(double)nk/(double)w),1u)+" % der gezaehlten Besuche aendert sich die Amplitude noch um mehr als 5 %. Der Lag-1-Kreis ist NICHT erkennbar kontrahiert. Vor jeder Deutung der Kraefte: den Impuls-Akkumulator als Zeitreihe ansehen -- driftet er oder oszilliert er?");
-					else print_info("["+ort+"] S2 KONVERGENZ: nur "+to_string((float)(100.0*(double)nk/(double)w),1u)+" % der Besuche aendern die Amplitude noch um mehr als 5 % -- der Lag-1-Kreis kontrahiert.");
+					if(nk>w/2ull) print_warning("["+ort+"] S2 KONVERGENZ: an "+to_string((float)(100.0*(double)nk/(double)w),1u)+" % der gezaehlten Besuche aendert sich die Amplitude noch um mehr als 5 %. Das ist der LAG-1-FEHLER, nicht eine ausbleibende Konvergenz: die angewandte Amplitude stammt aus dem Vorschritt. ★ H3 (24.09. nachm.): hier stand \"Der Lag-1-Kreis ist NICHT erkennbar kontrahiert\" -- diesen Kreis gibt es seit S1 nicht mehr. Vor jeder Deutung der Kraefte: den Impuls-Akkumulator als Zeitreihe ansehen -- driftet er oder oszilliert er?");
+					else print_info("["+ort+"] S2 KONVERGENZ: nur "+to_string((float)(100.0*(double)nk/(double)w),1u)+" % der Besuche aendern die Amplitude um mehr als 5 % -- der Lag-1-Fehler ist damit klein.");
 					// H2 des Planungsschritts: wird die Schranke zum neuen Knopf?
+					// ★ 24.09. nachmittags (Pruefagent H1/H2): unter S1 ist die Schranke STRUKTURELL redundant
+					// (|s2_r1| = def_fac_tau*twe <= def_fac_tau*tw_max per fmin), [395] = 0 ist also eine
+					// STOLPERDRAHT-Null und keine bestandene Messung. Slot 8 sagt, ob der Klemmpfad lief.
+					if(kl==0ull) print_info("["+ort+"] S2 SCHRANKE: Slot 395 = 0. Das ist unter S1 STRUKTURELL erzwungen und KEIN Messergebnis -- die Schranke kann nicht greifen, solange twe durch dasselbe fmin laeuft. Der Zaehler ist ein Stolperdraht gegen das Entfernen der tw_max-Klemme. Begleitend Slot 8 (twe-Klemme) = "+to_string(kl8)+": steht er auf 0, wurde der Klemmpfad in diesem Lauf nie betreten und die Null sagt noch weniger.");
 					if(kl>w/2ull) k_befund("["+ort+"] S2 SCHRANKE: an "+to_string((float)(100.0*(double)kl/(double)w),1u)+" % der Besuche greift 0,5*u_t und die Zelle faellt auf Bounce-Back zurueck. Die wirksame Amplitude stammt dann von der SCHRANKE und nicht vom Wandmodell -- eine Konstante mit physikalischem Namen. Genau das sollte S2 abschaffen.");
 					else if(kl>w/5ull) print_warning("["+ort+"] S2 SCHRANKE: an "+to_string((float)(100.0*(double)kl/(double)w),1u)+" % der Besuche greift 0,5*u_t. Noch tragbar, aber die Amplitude ist dort nicht mehr aus dem Ziel bestimmt.");
 					if(rk>0ull) print_info("["+ort+"] S2 rho-KLEMME: an "+to_string((float)(100.0*(double)rk/(double)w),1u)+" % der Besuche liegt rhon auf der unteren Klemme. ACHTUNG, VORZEICHENUMKEHR gegen die frueheren Stufen: rho steht hier im NENNER, die Klemme VERSTAERKT die Amplitude (rho 0,5 gibt doppeltes du), waehrend sie sie unter eps gedaempft hat.");
+					// ★★ AMPLITUDENGROESSE (Slots 403..407, neu 24.09. nachmittags, Pruefagent H4).
+					// Das Instrument, das unter S2 komplett fehlte: CFD_FAC_REK_EPS ist hier zwingend 0,
+					// also schweigen beide eps-Groessenwaechter (1e-6 harte Sperre, 1e-4 Messhub) -- sie
+					// haengen an rek_eps_b>0. Liegt die Masse unter dem Messhub, sind ALLE gruenen Zahlen
+					// dieses Arms registerseitig und belegen nichts ueber den naechsten Zeitschritt.
+					if(as!=w) k_befund("["+ort+"] S2 AMPLITUDE: Histogrammsumme [403..407] = "+to_string(as)+" != Slot 397 = "+to_string(w)+" -- jeder gezaehlte Besuch muss in genau einem Fach landen.");
+					else {
+						print_info("["+ort+"] S2 AMPLITUDE |du|: <1e-6 "+to_string(a0)+" | 1e-6..1e-5 "+to_string(a1)+" | 1e-5..1e-4 "+to_string(a2)+" | 1e-4..1e-3 "+to_string(a3)+" | >=1e-3 "+to_string(a4)+" (Summe "+to_string(as)+").");
+						if(a0>0ull) k_befund("["+ort+"] S2 AMPLITUDE: an "+to_string((float)(100.0*(double)a0/(double)w),1u)+" % der Besuche liegt |du| UNTER 1e-6, dem FP16S-Impulsquantum. Dort ueberlebt der Hub store_f nicht -- der Arm ist an diesen Zellen ein getarnter No-Op, und die Zaehler 328..332 bleiben trotzdem gruen, weil sie registerseitig messen (dieselbe Begruendung wie die harte eps-Sperre in dieser Datei).");
+						else if(a0+a1+a2>w/2ull) k_befund("["+ort+"] S2 AMPLITUDE: an "+to_string((float)(100.0*(double)(a0+a1+a2)/(double)w),1u)+" % der Besuche liegt |du| UNTER dem Messhub 1e-4. Das Projekt fuehrt dieses Band ausdruecklich als still: \"darunter koennen alle Zaehler gruen sein, ohne dass der Hub den naechsten Zeitschritt erreicht -- sie messen registerseitig.\" KEINE Kraftzahl dieses Arms ist damit ausserhalb der Register belegt. Das ist der erwartete Fall, wenn die Amplitude aus twe kommt: |du| = twe/rhon liegt bei rund 4,5e-6..1,35e-5.");
+						else if(a0+a1+a2>w/20ull) print_warning("["+ort+"] S2 AMPLITUDE: an "+to_string((float)(100.0*(double)(a0+a1+a2)/(double)w),1u)+" % der Besuche liegt |du| unter dem Messhub 1e-4 -- dort ist der Hub registerseitig und erreicht den naechsten Zeitschritt moeglicherweise nicht.");
+						else print_info("["+ort+"] S2 AMPLITUDE: die Masse liegt UEBER dem Messhub 1e-4 -- der Hub ueberlebt store_f und die Zaehler dieses Arms messen mehr als ihre eigenen Register.");
+					}
 					// ★★ HOCH-2: die GEGENPHASE. Weicht sie stark ab, schwingt die Amplitude mit Periode 2,
 					// statt einseitig zu sein -- und dann ist KEINE Kraftzahl dieses Arms deutbar.
 					if(w2==0ull) k_befund("["+ort+"] S2 GEGENPHASE: Slot 402 = 0 -- die zweite Paritaet wurde nie abgetastet. Ohne sie kann eine Periode-2-Mode nicht von einem einseitigen Vorzeichen unterschieden werden.");
 					else {
 						const double p1=100.0*(double)vz/(double)w, p2=100.0*(double)vz2/(double)w2;
 						const double q1=100.0*(double)kl/(double)w, q2=100.0*(double)kl2/(double)w2;
-						print_info("["+ort+"] S2 GEGENPHASE: Vorzeichen R1>0 "+to_string((float)p1,1u)+" % (gerade) gegen "+to_string((float)p2,1u)+" % (ungerade); Schranke "+to_string((float)q1,1u)+" % gegen "+to_string((float)q2,1u)+" %.");
-						if(fabs(p1-p2)>20.0) k_befund("["+ort+"] S2 PERIODE-2-MODE: das Vorzeichen von R1 unterscheidet sich zwischen den beiden Paritaeten um "+to_string((float)fabs(p1-p2),1u)+" Prozentpunkte. Die Amplitude SCHWINGT, statt zu konvergieren. Der Plan fuehrt diese Mode als real; sie ist mit einem Lag-1-Kreis nicht heilbar, die Injektion muss hinter die Momentenschleife. KEINE Kraftzahl dieses Arms ist deutbar.");
-						else print_info("["+ort+"] S2 GEGENPHASE: beide Paritaeten stimmen im Vorzeichen auf "+to_string((float)fabs(p1-p2),1u)+" Prozentpunkte ueberein -- keine Periode-2-Mode.");
+						print_info("["+ort+"] S2 GEGENPHASE: Amplitude gestiegen "+to_string((float)p1,1u)+" % (gerade) gegen "+to_string((float)p2,1u)+" % (ungerade); Schranke "+to_string((float)q1,1u)+" % gegen "+to_string((float)q2,1u)+" %.");
+						if(fabs(p1-p2)>20.0) k_befund("["+ort+"] S2 PERIODE-2-MODE: die RICHTUNG der Schrittaenderung unterscheidet sich zwischen den beiden Paritaeten um "+to_string((float)fabs(p1-p2),1u)+" Prozentpunkte. Die Amplitude SCHWINGT, statt zu konvergieren. Der Plan fuehrt diese Mode als real; sie ist mit einem Lag-1-Kreis nicht heilbar, die Injektion muss hinter die Momentenschleife. KEINE Kraftzahl dieses Arms ist deutbar.");
+						else print_info("["+ort+"] S2 GEGENPHASE: beide Paritaeten stimmen in der Richtung auf "+to_string((float)fabs(p1-p2),1u)+" Prozentpunkte ueberein -- keine Periode-2-Mode.");
 					}
-					if(vz>0ull) print_info("["+ort+"] S2 VORZEICHEN: an "+to_string((float)(100.0*(double)vz/(double)w),1u)+" % der Besuche ist R1 > 0. ★ BERICHTIGT 24.09.: hier stand \"die Wand BESCHLEUNIGT dort also\" -- FALSCH. R1 ist die KORREKTUR, nicht die Wandkraft; nach Anwendung ist phi1 = -def_fac_tau*twe < 0, die Wand bremst (an dieser Zellmenge gemessen: phi1 = -twe exakt). R1 > 0 heisst nur, dass Bounce-Back hier MEHR bremst als das Modell will. Die Erwartung von rund 40 % stammt aus der RDIAG-Leiter vom 07.09., die aber mit acht anderen Schaltern lief (u. a. CFD_FAC_UTKORR=1.5, das twe skaliert) -- der Abstand zu dieser Quote ist damit KEIN sauberer Beleg.");
+					if(vz>0ull) print_info("["+ort+"] S2 RICHTUNG: an "+to_string((float)(100.0*(double)vz/(double)w),1u)+" % der gezaehlten Besuche STEIGT die Amplitude. Rund 50 % heisst Fluktuation, nahe 0 oder 100 % heisst Drift oder Periode-2 (dann die Gegenphase 401/402 danebenhalten). ★ BERICHTIGT 24.09.: hier stand \"die Wand BESCHLEUNIGT dort also\" -- FALSCH. R1 ist die KORREKTUR, nicht die Wandkraft; nach Anwendung ist phi1 = -def_fac_tau*twe < 0, die Wand bremst (an dieser Zellmenge gemessen: phi1 = -twe exakt). R1 > 0 heisst nur, dass Bounce-Back hier MEHR bremst als das Modell will. Die Erwartung von rund 40 % stammt aus der RDIAG-Leiter vom 07.09., die aber mit acht anderen Schaltern lief (u. a. CFD_FAC_UTKORR=1.5, das twe skaliert) -- der Abstand zu dieser Quote ist damit KEIN sauberer Beleg.");
 				}
 			}
 			// ★★ HOCH-3 und HOCH-4: die beiden Zaehler, die sagen, ob die Prozentzahlen oben ueberhaupt
