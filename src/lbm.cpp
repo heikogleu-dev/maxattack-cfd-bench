@@ -550,6 +550,7 @@ bool LBM_Domain::s_fac_elibb = false;
 uint LBM_Domain::s_sgs_fdwand = 0u; // ★ 02.09. Geistermoden-Fix
 uint LBM_Domain::s_sgs_gdiag = 0u; // ★ 31.08. g-Diagnose (CFD_SGS_GDIAG)
 uint LBM_Domain::s_fac_messnur = 0u; // ★ 30.08. Mess-Nur-Modus (BB-Physik, Facetten-Instrument)
+float LBM_Domain::s_fac_rek_leiter = 1.0f; // ★ 24.09. CFD_FAC_REK_LEITER (Diagnoseleiter, Vorgabe 1.0 = bitgleich)
 uint LBM_Domain::s_fac_rek = 0u; // ★ 22.09. CFD_FAC_REK (S0/S1 Wandzell-Rekonstruktion)
 uint LBM_Domain::s_fac_pinv = 0u; // ★ 04.09. CFD_FAC_PINV: Rang-1-Pseudoinverse im gekoppelten Zweig
 uint LBM_Domain::s_fac_idx_voll = 0u; // ★ 03.09. Rueckschalter auf die fac_idx-Vollfeldform (A/B gegen die Bitmaske)
@@ -2706,7 +2707,7 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	+(f_liste_on ? (string)"\n	#define F_LISTE" : (string)"")
 	+(fac_idx_voll_on ? (string)"\n	#define FAC_IDX_VOLL" : (string)"")
 	+(fac_pinv_on ? (string)"\n	#define FACETTEN_PINV" : (string)"")
-	+(fac_rek_on ? (string)"\n	#define FAC_REK" : (string)"")+((fac_rek_on&&s_fac_rek>=2u) ? (string)"\n	#define FAC_REK_R3" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define FAC_REK_S2" : (string)"") // ★ 23.09. R3: eigener Arm (CFD_FAC_REK=2) fuer Gate + Buchung, damit Tor-Wirkung und eps-Wirkung trennbar bleiben. ★ BERICHTIGT 23.09. spaet: hier stand, das Gate sei auch bei eps=0 eine Physikaenderung und schalte den Solve an ALLEN Rang-0-Facetten ab -- am kipp26 ist das GEMESSEN falsch (Slot 331 = 0, Hash = Anker), am 8-mm-Fahrzeug dagegen richtig (30 335). Die Trennung lohnt also, aber sie zeigt, WO das Tor ueberhaupt wirkt // ★ 22.09. S0: schaltet NUR den Block ein; die Amplitude kommt als Laufzeitwert aus fac_geo[8i+6], damit IGC die Identitaet bei eps=0 NICHT wegoptimieren kann
+	+(fac_rek_on ? (string)"\n	#define FAC_REK" : (string)"")+((fac_rek_on&&s_fac_rek>=2u) ? (string)"\n	#define FAC_REK_R3" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define FAC_REK_S2" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define def_fac_rek_leiter "+to_string(s_fac_rek_leiter,4u)+"f" : (string)"") // ★ 24.09. Diagnoseleiter: NUR unter Arm 3 emittiert, damit der Kerneltext aller anderen Arme zeichengleich bleibt (die Preprozessor-Diff-Abnahme haengt daran) // ★ 23.09. R3: eigener Arm (CFD_FAC_REK=2) fuer Gate + Buchung, damit Tor-Wirkung und eps-Wirkung trennbar bleiben. ★ BERICHTIGT 23.09. spaet: hier stand, das Gate sei auch bei eps=0 eine Physikaenderung und schalte den Solve an ALLEN Rang-0-Facetten ab -- am kipp26 ist das GEMESSEN falsch (Slot 331 = 0, Hash = Anker), am 8-mm-Fahrzeug dagegen richtig (30 335). Die Trennung lohnt also, aber sie zeigt, WO das Tor ueberhaupt wirkt // ★ 22.09. S0: schaltet NUR den Block ein; die Amplitude kommt als Laufzeitwert aus fac_geo[8i+6], damit IGC die Identitaet bei eps=0 NICHT wegoptimieren kann
 	+(f_liste_on ? (string)"\n	#define F_STRIDE ((ulong)f_maske[2ul*((def_FBN+31ul)/32ul)])"
 	             : (string)"\n	#define F_STRIDE def_FBN")
 #ifndef PARTICLES

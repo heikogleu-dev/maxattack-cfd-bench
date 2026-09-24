@@ -2653,7 +2653,12 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		// ist eine STOLPERDRAHT-Null, KEINE bestandene Messung. Er feuert nur, wenn jemand die
 		// tw_max-Klemme entfernt (wie beim MOZ-Tausch 2371 schon einmal geschehen).
 		// DESHALB: SLOT 395 IST NUR ZUSAMMEN MIT SLOT 8 DEUTBAR -- Slot 8 sagt, ob der Pfad ueberhaupt lief.
-		const float s2_r1 = -def_fac_tau*twe;
+		// ★ DIAGNOSELEITER (CFD_FAC_REK_LEITER, 24.09. spaet). Der Faktor steht HIER und nicht weiter
+		// unten, damit die Schranke s2_ok die SKALIERTE Amplitude sieht: sonst koennte die Leiter
+		// unbemerkt ueber 0,5*u_t hinausschieben. Bei 1.0f ist die Multiplikation verlustfrei
+		// (IEEE754), der Arm also bitgleich -- das wird als Sprosse 1 der Leiter GEMESSEN, nicht
+		// behauptet. Wirkpfadbeleg ist das Histogramm [403..407]: es MUSS mit der Leiter wandern.
+		const float s2_r1 = -def_fac_tau*twe*def_fac_rek_leiter;
 		const float s2_d1 = s2_r1/rhon;
 		const float s2_alt = fac_nb[def_nb_stride*(ulong)fid+def_nb_roff+4ul];
 		const bool s2_ok = (fabs(s2_r1)<=def_fac_tau*(0.5f*rhon*ut)); // ★ H2: derselbe Ausdruck wie das fmin, keine Division, keine ulp-Kante
