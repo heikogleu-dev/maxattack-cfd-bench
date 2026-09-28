@@ -1989,6 +1989,66 @@ float3 elibb_rekonstruiere(float* fhn, const uxx* j, const global uchar* flags, 
 	return (float3)(0.0f, 0.0f, 0.0f);
 } // elibb_rekonstruiere()
 )+"#endif"+R( // FACETTEN_ELIBB
+)+"#ifdef FAC_R1Q_AN"+R(
+// ★ 28.09.2026 R1Q: masselose Zellquelle Sum c_i Df_i = rho*du in der Delta-Form des Gleichgewichts
+// (dieselbe Form wie der FAC_REK-Block: Df = f_eq(rho,u+du) - f_eq(rho,u), s = 2u + du). Eigene Funktion,
+// damit der REK-Block Zeichen fuer Zeichen unveraendert bleibt. Aufruf nur weiter unten (C99).
+void r1q_einspeisen(float* fhn, const float rhon, const float uxn, const float uyn, const float uzn, const float dux, const float duy, const float duz) {
+	const float sx = fma(2.0f, uxn, dux);
+	const float sy = fma(2.0f, uyn, duy);
+	const float sz = fma(2.0f, uzn, duz);
+	const float h3 = -1.5f*fma(sx, dux, fma(sy, duy, sz*duz));
+	const float wr_s = def_ws*rhon;
+	const float wr_e = def_we*rhon;
+	const float d3x = 3.0f*dux;
+	const float d3y = 3.0f*duy;
+	const float d3z = 3.0f*duz;
+	const float s3x = 3.0f*sx;
+	const float s3y = 3.0f*sy;
+	const float s3z = 3.0f*sz;
+	fhn[0] += def_w0*rhon*h3;
+	fhn[1] += wr_s*fma(d3x, fma(0.5f, s3x, 1.0f), h3);
+	fhn[2] += wr_s*fma(-d3x, fma(-0.5f, s3x, 1.0f), h3);
+	fhn[3] += wr_s*fma(d3y, fma(0.5f, s3y, 1.0f), h3);
+	fhn[4] += wr_s*fma(-d3y, fma(-0.5f, s3y, 1.0f), h3);
+	fhn[5] += wr_s*fma(d3z, fma(0.5f, s3z, 1.0f), h3);
+	fhn[6] += wr_s*fma(-d3z, fma(-0.5f, s3z, 1.0f), h3);
+	const float dxy = d3x+d3y;
+	const float sxy = s3x+s3y;
+	const float dxz = d3x+d3z;
+	const float sxz = s3x+s3z;
+	const float dyz = d3y+d3z;
+	const float syz = s3y+s3z;
+	const float dxmy = d3x-d3y;
+	const float sxmy = s3x-s3y;
+	const float dxmz = d3x-d3z;
+	const float sxmz = s3x-s3z;
+	const float dymz = d3y-d3z;
+	const float symz = s3y-s3z;
+	fhn[7] += wr_e*fma(dxy, fma(0.5f, sxy, 1.0f), h3);
+	fhn[8] += wr_e*fma(-dxy, fma(-0.5f, sxy, 1.0f), h3);
+	fhn[9] += wr_e*fma(dxz, fma(0.5f, sxz, 1.0f), h3);
+	fhn[10] += wr_e*fma(-dxz, fma(-0.5f, sxz, 1.0f), h3);
+	fhn[11] += wr_e*fma(dyz, fma(0.5f, syz, 1.0f), h3);
+	fhn[12] += wr_e*fma(-dyz, fma(-0.5f, syz, 1.0f), h3);
+	fhn[13] += wr_e*fma(dxmy, fma(0.5f, sxmy, 1.0f), h3);
+	fhn[14] += wr_e*fma(-dxmy, fma(-0.5f, sxmy, 1.0f), h3);
+	fhn[15] += wr_e*fma(dxmz, fma(0.5f, sxmz, 1.0f), h3);
+	fhn[16] += wr_e*fma(-dxmz, fma(-0.5f, sxmz, 1.0f), h3);
+	fhn[17] += wr_e*fma(dymz, fma(0.5f, symz, 1.0f), h3);
+	fhn[18] += wr_e*fma(-dymz, fma(-0.5f, symz, 1.0f), h3);
+}
+// ★ 28.09. R1Q: erstes Moment und Masse von fhn (D3Q19-Reihenfolge wie im REK-Block: 7 (+,+,0), 13 (+,-,0), 15 (+,0,-), 17 (0,+,-)).
+// Nur fuer die Proben 428/429 an Zaehlschritten.
+float4 r1q_momente(const float* f) {
+	const float jx = f[1]-f[2]+f[7]-f[8]+f[9]-f[10]+f[13]-f[14]+f[15]-f[16];
+	const float jy = f[3]-f[4]+f[7]-f[8]+f[11]-f[12]-f[13]+f[14]+f[17]-f[18];
+	const float jz = f[5]-f[6]+f[9]-f[10]+f[11]-f[12]-f[15]+f[16]-f[17]+f[18];
+	float m = f[0];
+	for(uint i=1u; i<19u; i++) m += f[i];
+	return (float4)(jx, jy, jz, m);
+}
+)+"#endif"+R( // FAC_R1Q_AN
 // ★★ iMEM-Facettenpfad (FACETTEN-IMEM.md, an Asmuth et al. 2021 Gl. 20-28 verankert, Revision
 // 2026-08-16): Slip-Geschwindigkeit u_s statt Diagonalpaar-Tausch. JEDER Link mit solidem
 // Streaming-Ursprung traegt (linkweise, nicht paarweise); der Zusatzterm q_i = 6 w_i (c_i*u_s)
@@ -2734,6 +2794,11 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	bool rueckfall=false; // ★ BUCHUNGSSCHLUSS (Baustein 2/1, 27.08.): Rueckfaelle steigen nicht mehr per return aus, sondern buchen mit s=0 (P-only)
 	float res2=0.0f;
 	uint zweig=0u; // ★ KREUZTABELLE 04.09. abends: Solve-Zweig der REALEN Kaskade, 1=[78] 2=[79] 3=[12] 4=[14]/[80]; nur Zaehler, kein Float
+)+"#ifdef FAC_R1Q"+R(
+	bool r1q_pinv=false;
+	float r1q_a=0.0f;
+	float r1q_b=0.0f;
+)+"#endif"+R( // FAC_R1Q
 )+"#ifndef FACETTEN_UW"+R(
 )+"#ifdef FACETTEN_MASSE_X"+R(
 	// ★ ARM X (CFD_FAC_MASSE_ALLE=3, 04.09.2026): Rueckfall-Entscheid im SCHATTEN wie unter ALPHA2 --
@@ -2871,6 +2936,11 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		s1=(Gt11*R1+Gt12*R2)*it2; s2=(Gt12*R1+Gt22*R2)*it2;
 		res2=fabs(fma(Gt12,s1,Gt22*s2)-R2);
 		if(t%def_zaehl_takt==0ul) { atomic_inc(&hits[14]); if(hits[80]<0xF0000000u) atomic_inc(&hits[80]); } zweig=4u;
+)+"#ifdef FAC_R1Q"+R(
+		r1q_pinv = true;
+		r1q_a = Gt11/tr;
+		r1q_b = Gt12/tr;
+)+"#endif"+R( // FAC_R1Q
 	}
 )+"#elif defined(FACETTEN_LSQ)"+R(
 	else if(Gt11>=1e-4f*G11&&Gt11>=1e-8f) { const float d=fma(Gt11,Gt11,Gt12*Gt12); s1=(d>0.0f)?(Gt11*R1+Gt12*R2)/d:0.0f; s2=0.0f; res2=fabs(Gt12*s1-R2); if(t%def_zaehl_takt==0ul) { atomic_inc(&hits[14]); atomic_inc(&hits[65]); } zweig=4u; } // Slot 14, kleinste Quadrate (s.o.)
@@ -3224,6 +3294,78 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		fwx += 2.0f*(elibb_dp.x-edn_*nx); fwy += 2.0f*(elibb_dp.y-edn_*ny); fwz += 2.0f*(elibb_dp.z-edn_*nz);
 	}
 )+"#endif"+R( // FACETTEN_ELIBB
+)+"#ifdef FAC_R1Q"+R(
+	// ★★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q). Hier stehen P, Pass 2, phi und fw fest; fhn wird danach
+	// in dieser Funktion nicht mehr gelesen, und die Kollision laeuft im SELBEN Schritt auf u+du.
+	// Ziel Z = (Z1, 0) in (t1, t2), Z1 = -def_fac_tau*twe. Der PINV-Zweig praegt G~*s_Z = Z1*(a^2+b^2, b) auf
+	// (a = Gt11/tr, b = Gt12/tr, Gt22/tr = 1-a). Es fehlt m = (Z1*(1-a^2-b^2), -Z1*b): die t1-Komponente ist
+	// der fehlende Wandschub in Stroemungsrichtung (Anteil 1-cos^2), die t2-Komponente nimmt den Querimpuls
+	// Z1*cos*sin zurueck, den die PINV quer zur Stroemung einpraegt. rho*du = m, masselos, tangential.
+	// NUR an Marken (Lage 1, statischer Rang 1) UND nur, wenn in diesem Besuch der PINV-Zweig angewandt wurde.
+	{
+		const bool r1q_zs = (t%def_zaehl_takt==0ul);
+		const bool r1q_marke = (fac_geo[b+7ul] < -0.5f);
+		const bool r1q_quelle = r1q_pinv&&pass2_an;
+		if(r1q_zs) {
+			if(r1q_marke) {
+				if(hits[408]<0xF0000000u) atomic_inc(&hits[408]);
+				const uint r1q_fach = r1q_quelle ? 409u : (r1q_pinv ? 410u : (zweig==3u ? 411u : ((zweig==1u||zweig==2u) ? 412u : 413u)));
+				if(hits[r1q_fach]<0xF0000000u) atomic_inc(&hits[r1q_fach]);
+			}
+			else if(r1q_quelle&&hits[414]<0xF0000000u) atomic_inc(&hits[414]);
+		}
+		if(r1q_marke&&r1q_quelle) {
+			const float r1q_z1 = -def_fac_tau*twe;
+			const float r1q_q = 1.0f-r1q_a*r1q_a-r1q_b*r1q_b;
+			const float r1q_m1 = r1q_z1*r1q_q;
+			const float r1q_m2 = -r1q_z1*r1q_b;
+			const float r1q_ir = 1.0f/rhon;
+			const float r1q_dux = (r1q_m1*t1x+r1q_m2*t2x)*r1q_ir;
+			const float r1q_duy = (r1q_m1*t1y+r1q_m2*t2y)*r1q_ir;
+			const float r1q_duz = (r1q_m1*t1z+r1q_m2*t2z)*r1q_ir;
+			const float r1q_dl = sqrt(fma(r1q_dux, r1q_dux, fma(r1q_duy, r1q_duy, r1q_duz*r1q_duz)));
+			if(r1q_zs) {
+				const uint r1q_bq = r1q_q<0.1f ? 0u : (r1q_q<0.3f ? 1u : (r1q_q<0.5f ? 2u : (r1q_q<0.7f ? 3u : (r1q_q<0.9f ? 4u : 5u))));
+				if(hits[415u+r1q_bq]<0xF0000000u) atomic_inc(&hits[415u+r1q_bq]);
+				const float r1q_pp1 = P1-(r1q_a*P1+r1q_b*P2);
+				const float r1q_pp2 = r1q_a*P2-r1q_b*P1;
+				const float r1q_pr = sqrt(fma(r1q_pp1, r1q_pp1, r1q_pp2*r1q_pp2))/fmax(fabs(r1q_z1), 1.0E-30f);
+				const uint r1q_bp = (r1q_z1==0.0f) ? 5u : (r1q_pr<0.1f ? 0u : (r1q_pr<1.0f ? 1u : (r1q_pr<10.0f ? 2u : (r1q_pr<100.0f ? 3u : 4u))));
+				if(hits[421u+r1q_bp]<0xF0000000u) atomic_inc(&hits[421u+r1q_bp]);
+				if(r1q_dl>0.5f*ut*1.0001f&&hits[427]<0xF0000000u) atomic_inc(&hits[427]);
+				if(fabs(r1q_dux*nx+r1q_duy*ny+r1q_duz*nz)>1.0E-3f*r1q_dl+1.0E-12f&&hits[431]<0xF0000000u) atomic_inc(&hits[431]);
+			}
+)+"#ifdef FAC_R1Q_AN"+R(
+			float4 r1q_vor = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+			float r1q_fabs = 0.0f;
+			if(r1q_zs) {
+				r1q_vor = r1q_momente(fhn);
+				for(uint i=0u; i<19u; i++) r1q_fabs += fabs(fhn[i]);
+			}
+			const float r1q_fw1 = fwx*t1x+fwy*t1y+fwz*t1z;
+			const float r1q_fw2 = fwx*t2x+fwy*t2y+fwz*t2z;
+			const float r1q_fwb = fabs(fwx)+fabs(fwy)+fabs(fwz);
+			r1q_einspeisen(fhn, rhon, uxn, uyn, uzn, r1q_dux, r1q_duy, r1q_duz);
+			fwx -= rhon*r1q_dux;
+			fwy -= rhon*r1q_duy;
+			fwz -= rhon*r1q_duz;
+			if(r1q_zs) {
+				const float4 r1q_nach = r1q_momente(fhn);
+				const float r1q_mb = rhon*r1q_dl;
+				const float r1q_bod = 2.4E-7f*r1q_fabs;
+				const float r1q_ex = r1q_nach.x-r1q_vor.x-rhon*r1q_dux;
+				const float r1q_ey = r1q_nach.y-r1q_vor.y-rhon*r1q_duy;
+				const float r1q_ez = r1q_nach.z-r1q_vor.z-rhon*r1q_duz;
+				if(sqrt(fma(r1q_ex, r1q_ex, fma(r1q_ey, r1q_ey, r1q_ez*r1q_ez)))>1.0E-2f*r1q_mb+r1q_bod&&hits[428]<0xF0000000u) atomic_inc(&hits[428]);
+				if(fabs(r1q_nach.w-r1q_vor.w)>r1q_bod+1.0E-9f&&hits[429]<0xF0000000u) atomic_inc(&hits[429]);
+				const float r1q_d1 = (fwx*t1x+fwy*t1y+fwz*t1z)-r1q_fw1+r1q_m1;
+				const float r1q_d2 = (fwx*t2x+fwy*t2y+fwz*t2z)-r1q_fw2+r1q_m2;
+				if(fabs(r1q_d1)+fabs(r1q_d2)>1.0E-2f*r1q_mb+4.8E-7f*r1q_fwb&&hits[430]<0xF0000000u) atomic_inc(&hits[430]);
+			}
+)+"#endif"+R( // FAC_R1Q_AN
+		}
+	}
+)+"#endif"+R( // FAC_R1Q
 )+"#ifdef FAC_REK_R3"+R(
 	// ★★ BUCHUNG DER REKONSTRUKTION (23.09.2026). Der Block traegt der Zelle +rho*du an Impuls ein;
 	// der Akkumulator [1..3] traegt den Impuls, den die WAND dem Fluid NIMMT (Vorzeichenkonvention
