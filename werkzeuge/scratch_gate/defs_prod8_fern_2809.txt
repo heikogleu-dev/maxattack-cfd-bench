@@ -1,0 +1,119 @@
+
+	#define def_Nx 400u
+	#define def_Ny 320u
+	#define def_Nz 288u
+	#define def_N 36864000ul
+	#define uxx uint
+	#define def_GNx 400u
+	#define def_GNy 320u
+	#define def_GNz 288u
+	#define def_Dx 1u
+	#define def_Dy 1u
+	#define def_Dz 1u
+	#define def_Ox 0
+	#define def_Oy 0
+	#define def_Oz 0
+	#define def_Ax 92160u
+	#define def_Ay 115200u
+	#define def_Az 128000u
+	#define def_domain_offset_x 0.00000000f
+	#define def_domain_offset_y 0.00000000f
+	#define def_domain_offset_z 0.00000000f
+	#define D3Q19
+	#define def_velocity_set 19u
+	#define def_dimensions 3u
+	#define def_transfers 5u
+	#define def_c 0.57735027f
+	#define def_w 1.99997640f
+	#define def_w0 (1.0f/3.0f)
+	#define def_ws (1.0f/18.0f)
+	#define def_we (1.0f/36.0f)
+	#define SRT
+	#define PTRT
+	#define def_omega_g 1.90000000f
+	#define TYPE_S 0x01
+	#define TYPE_E 0x02
+	#define TYPE_T 0x04
+	#define TYPE_F 0x08
+	#define TYPE_I 0x10
+	#define TYPE_G 0x20
+	#define TYPE_X 0x40
+	#define TYPE_Y 0x80
+	#define SPONGE
+	#define def_sponge_n 32u
+	#define def_sponge_a 3000.0000f
+	#define def_sponge_wmin 0.5000f
+	#define REG_E(i) (feq[i])
+	#define RHO_CLAMP
+	#define RHO_CLAMP_MIN 0.5000f
+	#define RHO_CLAMP_MAX 1.5000f
+	#define def_tor_lo (1.0f-1.5625f*0.500000f)
+	#define def_tor_hi (1.0f+1.5625f*0.500000f)
+	#define def_tor_gate_lo 0.5f
+	#define def_tor_gate_hi 2.0f
+	#define def_w210_lo 0.4f
+	#define def_w210_hi 2.1f
+	#define KLEMM_BILANZ
+	#define def_klemm_s 16384.0f
+	#define def_u2max (def_c*def_c)
+	#define U_BETRAG
+	#define POSITIV
+	#define POSITIV_ANWENDEN
+	#define def_pos_sub 7u
+	#define def_pos_t0 (4.0f/32768.0f)
+	#define def_pos_ts (0.5f/32768.0f)
+	#define def_pos_te (0.25f/32768.0f)
+	#define def_pos_g0 (def_pos_t0-def_w0)
+	#define def_pos_gs (def_pos_ts-def_ws)
+	#define def_pos_ge (def_pos_te-def_we)
+	#define SGS_GUO
+	#define def_zaehl_takt 300ul
+	#define def_nb_roff 2ul
+	#define def_nb_stride 2ul
+	#define RHO_SMBOX
+	#define RHO_SPARSAM
+	#define TYPE_MS 0x03
+	#define TYPE_BO 0x03
+	#define TYPE_IF 0x18
+	#define TYPE_IG 0x30
+	#define TYPE_GI 0x38
+	#define TYPE_SU 0x38
+	#define TYPE_XY 0xC0
+	#define fpxx half
+	#define fpxx_copy ushort
+	#define load(p,o) (vload_half(o,p)*3.0517578E-5f)
+	#define store(p,o,x) vstore_half_rte((x)*32768.0f,o,p)
+	#define RHO_FP16
+	#define rhoxx half
+	#define load_rho(p,o) (vload_half(o,p)*3.0517578E-5f+1.0f)
+	#define load_drho(p,o) (vload_half(o,p)*3.0517578E-5f)
+	#define store_rho(p,o,x) vstore_half_rte(((x)-1.0f)*32768.0f,o,p)
+	#define U_FP16
+	#define velxx half
+	#define load_u(p,o) (vload_half(o,p)*3.0517578E-5f)
+	#define store_u(p,o,x) vstore_half_rte((x)*32768.0f,o,p)
+	#define UPDATE_FIELDS
+	#define VOLUME_FORCE
+	#define MOVING_BOUNDARIES
+	#define EQUILIBRIUM_BOUNDARIES
+	#define FORCE_FIELD
+	#define SUBGRID
+	#define def_SMX0 72u
+	#define def_SMY0 116u
+	#define def_SMZ0 0u
+	#define def_SMNX 241u
+	#define def_SMNY 88u
+	#define def_SMNZ 63u
+	#define def_FBX0 82u
+	#define def_FBY0 126u
+	#define def_FBZ0 0u
+	#define def_FBNX 148u
+	#define def_FBNY 67u
+	#define def_FBNZ 42u
+	#define def_FBN 416472ul
+	#define F_LISTE
+	#define FACETTEN_PINV
+	#define F_STRIDE ((ulong)f_maske[2ul*((def_FBN+31ul)/32ul)])
+	#define F_NUR_SOLID
+	#define TS_P
+	#define TS_A

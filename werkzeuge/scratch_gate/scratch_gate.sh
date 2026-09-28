@@ -38,7 +38,12 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 #   paarweise Form (Richtung/Gegenrichtung teilen c.du und c.s) senkt auf 64/224 B. Gemessene Kosten am 8-mm-Fahrzeug B70 mit der
 #   192-B-Form: Wanduhr 7:45 gegen 7:40 min (r1q_f8_vr4_7 gegen r1q_f8_b7, je ein Lauf). SCHULD: vor einem Standard-Umstieg auf R1Q
 #   die Einspeisung aus apply_facette_imem nach stream_collide (nach dem Aufruf, du als float3 zurueckgeben) verlegen und neu messen.
-BEKANNT="prod8nahr1q4/0xe223/stream_collide:0:64 prod8nahr1q4/0x7d67/stream_collide:0:224"
+#   ★ 28.09.2026 spaet (C-M1): mit den ECHTEN Produktionsdefines (Arme n2809*, Dump r1q_f8_vr4p) ist der R1Q=4-Spill groesser als im
+#   Schnappschuss-Arm: stream_collide 1088 B (B70) / 672 B (iGPU), ohne KDIAG 1024 / 608 B; der Bezugsarm n2809 (ohne R1Q) ist 0/0.
+#   Gemessene Kosten am 8-mm-Fahrzeug B70 (Einzellaeufe, LEISTUNG-AB-MARKE ab 100 ms): r1q_f8_vr4p 357,4 s gegen r1q_f8_mess (R1Q=1)
+#   355,9 s und t2_f8_kdiag (ohne R1Q) 354,3 s -> +0,4 bzw. +0,9 %. Bei 4 mm im Lauf selbst gegen den Bezug messen (nicht hochrechnen).
+#   Dieselbe SCHULD wie oben: Einspeisung nach stream_collide verlegen, dann diese vier Eintraege entfernen.
+BEKANNT="prod8nahr1q4/0xe223/stream_collide:0:64 prod8nahr1q4/0x7d67/stream_collide:0:224 n2809q4/0xe223/stream_collide:0:1088 n2809q4/0x7d67/stream_collide:0:672 n2809q4k/0xe223/stream_collide:0:1024 n2809q4k/0x7d67/stream_collide:0:608"
 
 g++ -O1 -c "$REPO/src/kernel.cpp" -o "$T/kernel.o"
 g++ -O1 "$HIER/gen_main.cpp" "$T/kernel.o" -o "$T/gen"
@@ -109,11 +114,20 @@ g++ -O1 "$HIER/gen_main.cpp" "$T/kernel.o" -o "$T/gen"
 # private fhn per Zeiger, r1q_pinv/a/b bleiben ueber Pass 2 hinweg live. Die defs-Dateien sind defs_prod8_nah.txt + diese Zeilen.
 "$T/gen" datei "$HIER/defs_prod8_nah_r1q1.txt" "$T/prod8nahr1q1.cl" >/dev/null
 "$T/gen" datei "$HIER/defs_prod8_nah_r1q4.txt" "$T/prod8nahr1q4.cl" >/dev/null
+# ★ 28.09.2026 spaet (Pruefbefund C-M1): die defs_prod8_*.txt oben sind der Schnappschuss vom 15.09. -- ihnen fehlen SGS_BAND/_PI,
+# POSITIV_ANWENDEN, U_BETRAG und FACETTEN_KDIAG, dafuer tragen sie das abgeloeste U_SPARSAM. Das Gate pruefte also NICHT den Kernel,
+# der gerechnet wird. Neu: vier Arme aus dem ECHTEN Dump des 8-mm-Laufs r1q_f8_vr4p (b65b449, CFD_DUMP_CL=1, Vorspann = Dump ohne
+# get_opencl_c_code(), endswith-geprueft): n2809 = Nahfeld ohne die FAC_R1Q-Zeilen (Bezugsarm), n2809q4 = wie gefahren (R1Q=4, KDIAG),
+# n2809q4k = R1Q=4 ohne FACETTEN_KDIAG (moegliche 4-mm-Zeile), f2809 = Fernfeld. Neu dumpen, wenn sich die Produktionszeile aendert.
+"$T/gen" datei "$HIER/defs_prod8_nah_2809.txt"         "$T/n2809.cl"    >/dev/null
+"$T/gen" datei "$HIER/defs_prod8_nah_2809_r1q4.txt"    "$T/n2809q4.cl"  >/dev/null
+"$T/gen" datei "$HIER/defs_prod8_nah_2809_r1q4_ok.txt" "$T/n2809q4k.cl" >/dev/null
+"$T/gen" datei "$HIER/defs_prod8_fern_2809.txt"        "$T/f2809.cl"    >/dev/null
 
 rc=0
 neu_bekannt=""
 for dev in 0x7d67 0xe223; do
-  for arm in e1p1 e1p0 e0p1 e0p0 e1p1r e1p0r e0p1r e0p0r e1p1s e1p1rs e1p1su e1p1rsu e1p1ruR e1p1uR prod8nah prod8fern prod8nahh3 prod8nahp1 prod8nahp2 prod8fernp2 prod8fernp1 prod8nahp2fh1 prod8nahp1h3 prod8nahub prod8fernub prod8nahp2ub prod8naht prod8nahp2ubr prod8fernp2ubr prod8naha prod8nahA prod8nahM prod8nahr1q1 prod8nahr1q4; do
+  for arm in e1p1 e1p0 e0p1 e0p0 e1p1r e1p0r e0p1r e0p0r e1p1s e1p1rs e1p1su e1p1rsu e1p1ruR e1p1uR prod8nah prod8fern prod8nahh3 prod8nahp1 prod8nahp2 prod8fernp2 prod8fernp1 prod8nahp2fh1 prod8nahp1h3 prod8nahub prod8fernub prod8nahp2ub prod8naht prod8nahp2ubr prod8fernp2ubr prod8naha prod8nahA prod8nahM prod8nahr1q1 prod8nahr1q4 n2809 n2809q4 n2809q4k f2809; do
     ausgabe=$("$HIER/igc_offline.sh" "$T/$arm.cl" "$dev" ALLE || true)
     # ★ 11.09.2026: BAUFEHLER IST NICHT SCRATCH. Vorher fiel ein gescheiterter Bau in beide
     # Gates, weil die Zeile dann schlicht kein "private_size=0" enthielt -- das Gate meldete
