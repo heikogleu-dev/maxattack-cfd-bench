@@ -9,6 +9,8 @@
 #   Ziel aus den Rang-2-Facetten unter den 26 Gitternachbarn: je Nachbar j u_tau,j aus Spalding an
 #   (ut_j, yw_j), am eigenen y_w ausgewertet, gemittelt. du_B = Mittel - ut. Nachbarschaft = D3Q27-
 #   Stencil, keine frei gewaehlte Reichweite. Ohne Rang-2-Nachbarn: kein du_B (gezaehlt).
+#   28.09. Heiko: nur Nachbarn, die FLACH zur Zelle liegen (n_i.n_j >= cosmin, 6. Argument); die Schwelle
+#   wird als Leiter gefahren, damit sie kein Handwert ist -- das Ergebnis darf von ihr nicht abhaengen.
 # Konstanten: kappa 0,41, B 5,5 (Spalding 1961, wie kernel.cpp wf_spalding_uplus); nu aus dem Log.
 #
 # ENTSCHEIDREGEL (VOR den Daten festgelegt, Tagesprotokoll 28.09.):
@@ -40,12 +42,12 @@ def u_bei(utau, y, nu):  # u an y fuer gegebenes u_tau
     yp = y*utau/nu
     return utau*bis(lambda p: yplus(p) - yp, 0.0, 300.0)
 
-def main(csvp, Nx, Ny, nu, dx):
+def main(csvp, Nx, Ny, nu, dx, cosmin=-2.0):
     F = {}
     for r in csv.DictReader(l for l in open(csvp) if not l.startswith('#')):
         n = int(r['n']); x = n % Nx; y = (n//Nx) % Ny; z = n//(Nx*Ny)
         F[n] = dict(x=x, y=y, z=z, L=int(r['eigene_links']), yw=float(r['yw']), nx=float(r['nx']), nz=float(r['nz']),
-                    rate=float(r['rate']), ut=float(r['ut']), ub=float(r['ut_ab']), yb=float(r['yw_ab']), rang=int(r['rang']))
+                    rate=float(r['rate']), ny=float(r['ny']), ut=float(r['ut']), ub=float(r['ut_ab']), yb=float(r['yw_ab']), rang=int(r['rang']))
     zmax = max(f['z'] for f in F.values()); zgr = zmax - 0.45/dx
     def zone(f):
         if f['z'] < zgr or f['nz'] <= 0.3: return 'rest'
@@ -66,9 +68,10 @@ def main(csvp, Nx, Ny, nu, dx):
                 for dxx in (-1, 0, 1):
                     if dxx == dy == dz == 0: continue
                     g = F.get(n + dxx + Nx*(dy + Ny*dz))
-                    if g and g['rang'] == 2 and g['utau_eig']: z_.append(u_bei(g['utau_eig'], f['yw'], nu))
+                    if g and g['rang'] == 2 and g['utau_eig'] and f['nx']*g['nx']+f['ny']*g['ny']+f['nz']*g['nz'] >= cosmin: z_.append(u_bei(g['utau_eig'], f['yw'], nu))
         if z_: f['B'] = st.mean(z_) - f['ut']
         else: n_ohne += 1
+    print(f"Flachheit: nur Rang-2-Nachbarn mit n_i.n_j >= {cosmin}")
     print(f"Facetten {len(F)}, Rang 0 {sum(f['rang']==0 for f in F.values())}, ohne Rang-2-Nachbarn (Rang 0+2) {n_ohne}, 255 {sum(f['rang']==255 for f in F.values())}")
     def med(v): return st.median(v) if v else float('nan')
     ergebnis = {}
@@ -91,4 +94,4 @@ def main(csvp, Nx, Ny, nu, dx):
 
 if __name__ == '__main__':
     # Aufruf: nb_amplitude_s0.py <facetten_persistenz.csv> <Nx> <Ny> <nu_lat> <dx_m>
-    main(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
+    main(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6]) if len(sys.argv) > 6 else -2.0)
