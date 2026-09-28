@@ -1993,7 +1993,10 @@ float3 elibb_rekonstruiere(float* fhn, const uxx* j, const global uchar* flags, 
 // ★ 28.09.2026 R1Q: masselose Zellquelle Sum c_i Df_i = rho*du in der Delta-Form des Gleichgewichts
 // (dieselbe Form wie der FAC_REK-Block: Df = f_eq(rho,u+du) - f_eq(rho,u), s = 2u + du). Eigene Funktion,
 // damit der REK-Block Zeichen fuer Zeichen unveraendert bleibt. Aufruf nur weiter unten (C99).
-void r1q_einspeisen(float* fhn, const float rhon, const float uxn, const float uyn, const float uzn, const float dux, const float duy, const float duz) {
+float4 r1q_einspeisen(float* fhn, const float rhon, const float uxn, const float uyn, const float uzn, const float dux, const float duy, const float duz) {
+	// ★ Rueckgabe: (Sum c_x Df, Sum c_y Df, Sum c_z Df, Sum Df), gebildet aus den INKREMENTEN selbst -- nicht als
+	// Differenz zweier fp32-Summen ueber fhn (deren Rundung bis ~3e-6*Sum|f| ueberdeckte jeden Fehler dieser Groesse;
+	// CPU-Stufe 28.09.: Slot 429 feuerte an 0,3 % bei korrektem Code). So sind die Proben 428/429 streng.
 	const float sx = fma(2.0f, uxn, dux);
 	const float sy = fma(2.0f, uyn, duy);
 	const float sz = fma(2.0f, uzn, duz);
@@ -2006,13 +2009,6 @@ void r1q_einspeisen(float* fhn, const float rhon, const float uxn, const float u
 	const float s3x = 3.0f*sx;
 	const float s3y = 3.0f*sy;
 	const float s3z = 3.0f*sz;
-	fhn[0] += def_w0*rhon*h3;
-	fhn[1] += wr_s*fma(d3x, fma(0.5f, s3x, 1.0f), h3);
-	fhn[2] += wr_s*fma(-d3x, fma(-0.5f, s3x, 1.0f), h3);
-	fhn[3] += wr_s*fma(d3y, fma(0.5f, s3y, 1.0f), h3);
-	fhn[4] += wr_s*fma(-d3y, fma(-0.5f, s3y, 1.0f), h3);
-	fhn[5] += wr_s*fma(d3z, fma(0.5f, s3z, 1.0f), h3);
-	fhn[6] += wr_s*fma(-d3z, fma(-0.5f, s3z, 1.0f), h3);
 	const float dxy = d3x+d3y;
 	const float sxy = s3x+s3y;
 	const float dxz = d3x+d3z;
@@ -2025,27 +2021,49 @@ void r1q_einspeisen(float* fhn, const float rhon, const float uxn, const float u
 	const float sxmz = s3x-s3z;
 	const float dymz = d3y-d3z;
 	const float symz = s3y-s3z;
-	fhn[7] += wr_e*fma(dxy, fma(0.5f, sxy, 1.0f), h3);
-	fhn[8] += wr_e*fma(-dxy, fma(-0.5f, sxy, 1.0f), h3);
-	fhn[9] += wr_e*fma(dxz, fma(0.5f, sxz, 1.0f), h3);
-	fhn[10] += wr_e*fma(-dxz, fma(-0.5f, sxz, 1.0f), h3);
-	fhn[11] += wr_e*fma(dyz, fma(0.5f, syz, 1.0f), h3);
-	fhn[12] += wr_e*fma(-dyz, fma(-0.5f, syz, 1.0f), h3);
-	fhn[13] += wr_e*fma(dxmy, fma(0.5f, sxmy, 1.0f), h3);
-	fhn[14] += wr_e*fma(-dxmy, fma(-0.5f, sxmy, 1.0f), h3);
-	fhn[15] += wr_e*fma(dxmz, fma(0.5f, sxmz, 1.0f), h3);
-	fhn[16] += wr_e*fma(-dxmz, fma(-0.5f, sxmz, 1.0f), h3);
-	fhn[17] += wr_e*fma(dymz, fma(0.5f, symz, 1.0f), h3);
-	fhn[18] += wr_e*fma(-dymz, fma(-0.5f, symz, 1.0f), h3);
-}
-// ★ 28.09. R1Q: erstes Moment und Masse von fhn (D3Q19-Reihenfolge wie im REK-Block: 7 (+,+,0), 13 (+,-,0), 15 (+,0,-), 17 (0,+,-)).
-// Nur fuer die Proben 428/429 an Zaehlschritten.
-float4 r1q_momente(const float* f) {
-	const float jx = f[1]-f[2]+f[7]-f[8]+f[9]-f[10]+f[13]-f[14]+f[15]-f[16];
-	const float jy = f[3]-f[4]+f[7]-f[8]+f[11]-f[12]-f[13]+f[14]+f[17]-f[18];
-	const float jz = f[5]-f[6]+f[9]-f[10]+f[11]-f[12]-f[15]+f[16]-f[17]+f[18];
-	float m = f[0];
-	for(uint i=1u; i<19u; i++) m += f[i];
+	const float d0 = def_w0*rhon*h3;
+	const float d1 = wr_s*fma(d3x, fma(0.5f, s3x, 1.0f), h3);
+	const float d2 = wr_s*fma(-d3x, fma(-0.5f, s3x, 1.0f), h3);
+	const float d3 = wr_s*fma(d3y, fma(0.5f, s3y, 1.0f), h3);
+	const float d4 = wr_s*fma(-d3y, fma(-0.5f, s3y, 1.0f), h3);
+	const float d5 = wr_s*fma(d3z, fma(0.5f, s3z, 1.0f), h3);
+	const float d6 = wr_s*fma(-d3z, fma(-0.5f, s3z, 1.0f), h3);
+	const float d7 = wr_e*fma(dxy, fma(0.5f, sxy, 1.0f), h3);
+	const float d8 = wr_e*fma(-dxy, fma(-0.5f, sxy, 1.0f), h3);
+	const float d9 = wr_e*fma(dxz, fma(0.5f, sxz, 1.0f), h3);
+	const float d10 = wr_e*fma(-dxz, fma(-0.5f, sxz, 1.0f), h3);
+	const float d11 = wr_e*fma(dyz, fma(0.5f, syz, 1.0f), h3);
+	const float d12 = wr_e*fma(-dyz, fma(-0.5f, syz, 1.0f), h3);
+	const float d13 = wr_e*fma(dxmy, fma(0.5f, sxmy, 1.0f), h3);
+	const float d14 = wr_e*fma(-dxmy, fma(-0.5f, sxmy, 1.0f), h3);
+	const float d15 = wr_e*fma(dxmz, fma(0.5f, sxmz, 1.0f), h3);
+	const float d16 = wr_e*fma(-dxmz, fma(-0.5f, sxmz, 1.0f), h3);
+	const float d17 = wr_e*fma(dymz, fma(0.5f, symz, 1.0f), h3);
+	const float d18 = wr_e*fma(-dymz, fma(-0.5f, symz, 1.0f), h3);
+	fhn[0] += d0;
+	fhn[1] += d1;
+	fhn[2] += d2;
+	fhn[3] += d3;
+	fhn[4] += d4;
+	fhn[5] += d5;
+	fhn[6] += d6;
+	fhn[7] += d7;
+	fhn[8] += d8;
+	fhn[9] += d9;
+	fhn[10] += d10;
+	fhn[11] += d11;
+	fhn[12] += d12;
+	fhn[13] += d13;
+	fhn[14] += d14;
+	fhn[15] += d15;
+	fhn[16] += d16;
+	fhn[17] += d17;
+	fhn[18] += d18;
+	// D3Q19-Reihenfolge wie im REK-Block: 7 (+,+,0), 9 (+,0,+), 11 (0,+,+), 13 (+,-,0), 15 (+,0,-), 17 (0,+,-).
+	const float jx = d1-d2+d7-d8+d9-d10+d13-d14+d15-d16;
+	const float jy = d3-d4+d7-d8+d11-d12-d13+d14+d17-d18;
+	const float jz = d5-d6+d9-d10+d11-d12-d15+d16-d17+d18;
+	const float m = ((d0+d1+d2)+(d3+d4+d5+d6))+((d7+d8+d9+d10)+(d11+d12+d13+d14))+((d15+d16)+(d17+d18));
 	return (float4)(jx, jy, jz, m);
 }
 )+"#endif"+R( // FAC_R1Q_AN
@@ -3336,28 +3354,20 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 				if(fabs(r1q_dux*nx+r1q_duy*ny+r1q_duz*nz)>1.0E-3f*r1q_dl+1.0E-12f&&hits[431]<0xF0000000u) atomic_inc(&hits[431]);
 			}
 )+"#ifdef FAC_R1Q_AN"+R(
-			float4 r1q_vor = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
-			float r1q_fabs = 0.0f;
-			if(r1q_zs) {
-				r1q_vor = r1q_momente(fhn);
-				for(uint i=0u; i<19u; i++) r1q_fabs += fabs(fhn[i]);
-			}
 			const float r1q_fw1 = fwx*t1x+fwy*t1y+fwz*t1z;
 			const float r1q_fw2 = fwx*t2x+fwy*t2y+fwz*t2z;
 			const float r1q_fwb = fabs(fwx)+fabs(fwy)+fabs(fwz);
-			r1q_einspeisen(fhn, rhon, uxn, uyn, uzn, r1q_dux, r1q_duy, r1q_duz);
+			const float4 r1q_inj = r1q_einspeisen(fhn, rhon, uxn, uyn, uzn, r1q_dux, r1q_duy, r1q_duz);
 			fwx -= rhon*r1q_dux;
 			fwy -= rhon*r1q_duy;
 			fwz -= rhon*r1q_duz;
 			if(r1q_zs) {
-				const float4 r1q_nach = r1q_momente(fhn);
 				const float r1q_mb = rhon*r1q_dl;
-				const float r1q_bod = 2.4E-7f*r1q_fabs;
-				const float r1q_ex = r1q_nach.x-r1q_vor.x-rhon*r1q_dux;
-				const float r1q_ey = r1q_nach.y-r1q_vor.y-rhon*r1q_duy;
-				const float r1q_ez = r1q_nach.z-r1q_vor.z-rhon*r1q_duz;
-				if(sqrt(fma(r1q_ex, r1q_ex, fma(r1q_ey, r1q_ey, r1q_ez*r1q_ez)))>1.0E-2f*r1q_mb+r1q_bod&&hits[428]<0xF0000000u) atomic_inc(&hits[428]);
-				if(fabs(r1q_nach.w-r1q_vor.w)>r1q_bod+1.0E-9f&&hits[429]<0xF0000000u) atomic_inc(&hits[429]);
+				const float r1q_ex = r1q_inj.x-rhon*r1q_dux;
+				const float r1q_ey = r1q_inj.y-rhon*r1q_duy;
+				const float r1q_ez = r1q_inj.z-rhon*r1q_duz;
+				if(sqrt(fma(r1q_ex, r1q_ex, fma(r1q_ey, r1q_ey, r1q_ez*r1q_ez)))>1.0E-3f*r1q_mb+1.0E-12f&&hits[428]<0xF0000000u) atomic_inc(&hits[428]);
+				if(fabs(r1q_inj.w)>1.0E-3f*r1q_mb+1.0E-12f&&hits[429]<0xF0000000u) atomic_inc(&hits[429]);
 				const float r1q_d1 = (fwx*t1x+fwy*t1y+fwz*t1z)-r1q_fw1+r1q_m1;
 				const float r1q_d2 = (fwx*t2x+fwy*t2y+fwz*t2z)-r1q_fw2+r1q_m2;
 				if(fabs(r1q_d1)+fabs(r1q_d2)>1.0E-2f*r1q_mb+4.8E-7f*r1q_fwb&&hits[430]<0xF0000000u) atomic_inc(&hits[430]);
