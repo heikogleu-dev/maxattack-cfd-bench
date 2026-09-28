@@ -88,3 +88,12 @@ ld = np.einsum("na,nab,nb->n", v, t, v); lq = np.einsum("na,nab,nb->n", w, t, w)
 tr = A11 + A22; disc = np.maximum(tr*tr - 4*(A11*A22 - A12*A12), 0.0); lmax = 0.5*(tr + np.sqrt(disc))
 print(f"\nSelbstpruefung Rang 1 ({int(r1.sum())} Zellen): max |q(d)-lmax|/lmax = {np.max(np.abs(ld[r1]-lmax[r1])/lmax[r1]):.2e},"
       f" max q(quer)/lmax = {np.max(lq[r1]/lmax[r1]):.2e}  (Soll: beide ~0, Rang-1-Schwelle lmin/lmax < 1e-9)")
+
+# ★ 28.09. (Heiko: Rang der Lage-1-Zellen als VTK auf die Facettenflaeche projizieren): je aktiver Facette
+# Rang und |cos(Wirkrichtung, u_t)| fuer das VTK-Werkzeug lage1_rang_vtk.py ablegen. cos nur fuer Rang 1 sinnvoll,
+# sonst -1 (Rang 2 loest beide Richtungen, Rang 0 keine).
+U2 = np.asarray(U[n]).astype(np.float64); un2 = (U2*nv).sum(1); ut2 = U2 - un2[:, None]*nv
+cs_alle = np.abs((dvec*ut2).sum(1))/np.maximum(np.linalg.norm(ut2, axis=1), 1e-30)
+cs_alle = np.where(rg19 == 1, cs_alle, -1.0)
+np.savez(os.path.join(lauf, "lage1_rang1_richtung.npz"), n=n, rang=rg19.astype(np.int8), cos=cs_alle.astype(np.float32))
+print(f"geschrieben: {os.path.join(lauf, 'lage1_rang1_richtung.npz')}")
