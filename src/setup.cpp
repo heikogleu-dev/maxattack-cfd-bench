@@ -888,7 +888,7 @@ static void pruefe_rek_vorbedingungen(const string& ort, const bool hat_zensus) 
 static void pruefe_r1q_vorbedingungen(const string& ort) {
 	const uint r1q = env_u("CFD_FAC_R1Q", 0u);
 	if(r1q==0u) return;
-	if(r1q>3u) print_error("CFD_FAC_R1Q kennt 0 (aus), 1 (messen: rechnen und zaehlen, nichts anwenden), 2 (V_Z: nur der Modellanteil (I-M)Z) und 3 (V_R: voller Rest (I-M)(Z-P) -- quer zur loesbaren Richtung Wandmodell statt Bounce-Back, wie an Rang-2-Zellen).");
+	if(r1q>4u) print_error("CFD_FAC_R1Q kennt 0 (aus), 1 (messen: rechnen und zaehlen, nichts anwenden), 2 (V_Z: nur der Modellanteil (I-M)Z), 3 (V_R: voller Rest (I-M)(Z-P) -- quer zur loesbaren Richtung Wandmodell statt Bounce-Back, wie an Rang-2-Zellen) und 4 (V_R ohne den isotropen Druckanteil 2(rho-1)(S1.t) des BB).");
 	if(env_u("CFD_FAC_SATGATE", 0u)==0u) print_error("["+ort+"] CFD_FAC_R1Q braucht CFD_FAC_SATGATE=1: ohne SATGATE werden s1/s2 geklemmt statt verworfen, der PINV-Zweig praegt dann G~*s_geklemmt auf, der Rest wird aber aus dem UNgeklemmten M*R gerechnet -- still falsch (Pruefbefund M2, 28.09.).");
 	if(env_u("CFD_FAC_MASSE_ALLE", 0u)>0u) print_error("["+ort+"] CFD_FAC_R1Q + CFD_FAC_MASSE_ALLE: dort gilt der ROH-Rang ohne ALPHA2-Downdate, die Marke waere eine andere Menge (Pruefbefund N4).");
 	if(env_u("CFD_FACETTEN", 0u)<3u) print_error("["+ort+"] CFD_FAC_R1Q braucht CFD_FACETTEN>=3 (iMEM) -- fac_r1q_on traegt s_fac_imem als Bedingung.");
@@ -905,7 +905,7 @@ static void pruefe_r1q_vorbedingungen(const string& ort) {
 	print_error("["+ort+"] CFD_FAC_R1Q ist nur fuer D3Q19 gebaut (fhn[0..18]).");
 #endif
 	if(r1q>=2u) print_info("["+ort+"] R1Q ANSAGE (Pruefbefund N5): die Quelle wird als Wandreibung in fac_tau gebucht -- sie steht NUR in cd_facetten.csv (cd_reib/cz_reib). cd_bericht.csv (cd_rest/cz_rest) ist der Druckpfad aus object_force und enthaelt sie NICHT: eine Aenderung von cz_rest ist eine echte Druckaenderung im Feld. NIE die Quellsumme zu cz_rest addieren (Lehre 16.09.; Pruefbefund M2 vom 28.09. berichtigt die erste Fassung dieser Ansage).");
-	print_info("["+ort+"] RANG-1-QUERREST (CFD_FAC_R1Q="+to_string(r1q)+"): "+string(r1q>=3u?"V_R -- ":(r1q==2u?"V_Z -- ":""))+string(r1q>=2u?"ANWENDUNG -- der Rest des Wandmodellziels wird an Lage-1-Rang-1-Zellen als Zellquelle eingespeist und als Wandreibung gebucht.":"MESSMODUS -- Rest rechnen und zaehlen, NICHTS anwenden (muss bitgleich zum Arm ohne R1Q sein)."));
+	print_info("["+ort+"] RANG-1-QUERREST (CFD_FAC_R1Q="+to_string(r1q)+"): "+string(r1q>=4u?"V_R OHNE DRUCKANTEIL -- ":(r1q==3u?"V_R -- ":(r1q==2u?"V_Z -- ":"")))+string(r1q>=2u?"ANWENDUNG -- der Rest des Wandmodellziels wird an Lage-1-Rang-1-Zellen als Zellquelle eingespeist und als Wandreibung gebucht.":"MESSMODUS -- Rest rechnen und zaehlen, NICHTS anwenden (muss bitgleich zum Arm ohne R1Q sein)."));
 }
 void k_befund(const string& t); // ★ 23.09. Pruefbefund M-1: Vorwaertsdeklaration -- die Definition steht weiter unten, die Sammelform wird hier aber schon gebraucht
 // ★ 28.09.2026 R1Q-ABNAHME am Laufende. Slots (Legende lbm.cpp): [408] Nenner (markierte Besuche am Anwendungspunkt),
@@ -944,6 +944,7 @@ static void pruefe_r1q_wirkpfad(LBM_Domain* D, const ulong t_ende, const string&
 	}
 	const bool vr = D->fac_r1q_vr_jit;
 	if((env_u("CFD_FAC_R1Q",0u)>=3u)!=vr) k_befund("["+ort+"] R1Q: CFD_FAC_R1Q="+to_string(env_u("CFD_FAC_R1Q",0u))+", aber '#define FAC_R1Q_VR' steht "+string(vr?"":"NICHT ")+"im uebersetzten Kernel.");
+	if((env_u("CFD_FAC_R1Q",0u)>=4u)!=D->fac_r1q_od_jit) k_befund("["+ort+"] R1Q: CFD_FAC_R1Q="+to_string(env_u("CFD_FAC_R1Q",0u))+", aber '#define FAC_R1Q_OHNE_DRUCK' steht "+string(D->fac_r1q_od_jit?"":"NICHT ")+"im uebersetzten Kernel.");
 	if(vr) print_info("["+ort+"] R1Q V_R-TOR [427]: "+to_string((ulong)H[427])+" von "+to_string(quelle)+" berechneten Besuchen ("+to_string(quelle>0ull?(float)(100.0*(double)H[427]/(double)quelle):0.0f,2u)+" %) mit |du| > 0,5*ut NICHT angewandt (Bounce-Back bleibt, wie SATGATE).");
 	else if(H[427]>0u) k_befund("["+ort+"] R1Q: Slot 427 = "+to_string((ulong)H[427])+" -- |du| > 0,5*ut. Unter V_Z strukturell ausgeschlossen (|m| <= |Z1| <= 0,5*rho*ut); ein Ausschlag heisst, die tw_max-Klemme fehlt oder rho ist falsch.");
 	if(H[431]>0u) k_befund("["+ort+"] R1Q: Slot 431 = "+to_string((ulong)H[431])+" -- die Quelle traegt einen NORMALANTEIL. du muss tangential stehen.");

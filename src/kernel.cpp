@@ -3340,8 +3340,19 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 			// Nach dem PINV-Solve ist phi = P + M*R; ein Rang-2-Solve haette phi = Z. Es fehlt (I-M)R: quer zur
 			// loesbaren Richtung wird der Bounce-Back-Austausch durch das Wandmodellziel ERSETZT -- genau das, was der
 			// Solve an Rang-2-Zellen ohnehin tut. V_Z (nur (I-M)Z) war am Fahrzeug wirkungslos (r1q_f8_vz, 28.09.).
-			const float r1q_m1 = (1.0f-r1q_a)*R1-r1q_b*R2;
-			const float r1q_m2 = r1q_a*R2-r1q_b*R1;
+)+"#ifdef FAC_R1Q_OHNE_DRUCK"+R(
+			// ★ 28.09. R1Q=4: V_R OHNE den isotropen Druckanteil des BB-Austauschs. P enthaelt A = 2(rho-1)(S1.t)
+			// (derselbe Term wie KDIAG [12], S1 ROH); ersetzt wird nur der Reibungsanteil P - A, also R' = R + A.
+			// Anlass: V_R (R1Q=3) am Fahrzeug -- Grenzschicht vorn OF13-duenn, aber Abloesung 0,4 m frueher (r1q_f8_vr).
+			const float r1q_ad = 2.0f*(rhon-1.0f);
+			const float r1q_r1 = fma(r1q_ad, S1x*t1x+S1y*t1y+S1z*t1z, R1);
+			const float r1q_r2 = fma(r1q_ad, S1x*t2x+S1y*t2y+S1z*t2z, R2);
+)+"#else"+R(
+			const float r1q_r1 = R1;
+			const float r1q_r2 = R2;
+)+"#endif"+R( // FAC_R1Q_OHNE_DRUCK
+			const float r1q_m1 = (1.0f-r1q_a)*r1q_r1-r1q_b*r1q_r2;
+			const float r1q_m2 = r1q_a*r1q_r2-r1q_b*r1q_r1;
 )+"#else"+R(
 			const float r1q_m1 = r1q_z1*r1q_q;
 			const float r1q_m2 = -r1q_z1*r1q_b;

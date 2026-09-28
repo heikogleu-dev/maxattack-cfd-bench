@@ -534,7 +534,7 @@ public:
 	Memory<uint> f_maske;
 	bool fac_rek_r3_jit = false; bool fac_rek_s2_jit = false; // ★ 23.09. R3-Arm im uebersetzten Kernel (aus dem JIT-Text, nicht aus der Statik)
 	ulong fac_rek_marken = 0ull; float fac_rek_eps = 0.0f; // ★ 22.09. S0: Zahl der gesetzten Marken und die Amplitude -- Vergleichsgroessen fuer die Abnahme
-	bool fac_r1q_on = false; bool fac_r1q_jit = false; bool fac_r1q_an_jit = false; bool fac_r1q_vr_jit = false; ulong fac_r1q_marken = 0ull; // ★ 28.09. R1Q: Hostzustand, Kernelzustand aus dem JIT-Text (Mess-/Anwendungsdefine getrennt), Zahl der gesetzten Marken
+	bool fac_r1q_on = false; bool fac_r1q_jit = false; bool fac_r1q_an_jit = false; bool fac_r1q_vr_jit = false; bool fac_r1q_od_jit = false; ulong fac_r1q_marken = 0ull; // ★ 28.09. R1Q: Hostzustand, Kernelzustand aus dem JIT-Text (Mess-/Anwendungsdefine getrennt), Zahl der gesetzten Marken
 	bool fac_rek_on = false; bool fac_rek_jit = false; // ★ 22.09. S0: Hostzustand und der aus dem JIT-Text gelesene Kernelzustand -- alloc vergleicht sie (Pruefbefund M2 vom selben Tag)
 	bool fac_pinv_on = false; // Konstruktionszustand eingefroren
 	bool fac_idx_voll_on = false; // Konstruktionszustand eingefroren; true = alte Vollfeld-Bauform von fac_idx
