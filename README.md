@@ -451,11 +451,23 @@ vehicle, judged on the boundary-layer field at the roof (at 8 mm the forces are 
 - *full rank-2 equivalent* — the boundary layer on the roof plateau becomes as thin as in the reference
   (δ99 28 mm vs 148 mm, reference 29–39 mm), but the near-wall flow collapses further aft and
   separation moves **0.4 m upstream**;
-- *the same without the isotropic pressure part of the bounce-back exchange* — the near-wall velocity at
-  the roof front rises by 50 % without the collapse; separation point and shape factor move toward the
-  reference, **but still within the scatter of three field snapshots**.
+- *the same without the isotropic pressure part of the bounce-back exchange* — the first variant that
+  moves the field the right way. Seven field snapshots per arm (0.30–0.74 s), mid-plane:
 
-Next: more field snapshots per arm to separate effect from scatter, then 4 mm.
+  | roof, 8 mm | baseline | this variant | change | reference |
+  |---|---|---|---|---|
+  | shape factor H, roof plateau | 1.61 | **1.51** | −0.10 (4.4 SE) | 1.17 |
+  | shape factor H, suction peak | 2.33 | **1.95** | −0.38 (2.9 SE) | – |
+  | near-wall u_t at x = 2.5 m | 6.6 m/s | **8.9 m/s** | +2.3 (2.9 SE) | 24–32 m/s |
+  | separation point | 3.36 m | 3.51 m | +0.15 (1.4 SE, not significant) | 3.63 m |
+  | δ99, roof plateau | 149 mm | 147 mm | none | 29–39 mm |
+
+  The direction is right; the gap to the reference is still large. SE is a lower bound — consecutive
+  snapshots are correlated.
+
+Next: a full code audit of the mechanism, then a 4 mm production run with it. A diagnosis channel with
+the flow driven *across* the steps (the existing tilted channel drives it along them and therefore cannot
+show the defect) is the planned test rig with a DNS answer.
 
 The measurements behind every claim above — including the arms that were rejected — live in the
 project's working notes and the run archive, which are kept out of this repository on purpose: they
