@@ -1454,6 +1454,12 @@ static void bericht_gdiag_band(LBM_Domain* D, const string& out_dir, const strin
 	if(bes_fac_je>0.0&&fabs(bes_band_je-bes_fac_je)>0.5) print_error("["+ort+"] BAND-g-DIAGNOSE: Besuche je Bandzelle "+to_string((float)bes_band_je,2u)+" != Besuche je Facette "+to_string((float)bes_fac_je,2u)+" -- die beiden Instanzen laufen nicht an derselben Kadenz.");
 	print_info("  CSV: "+out_dir+"band_gdiag.csv. LESART: Pi/FD ~ 1 in Lage 2 = FD-Sbar ist zum Pi-nu_t konsistent; Pi/FD >> 1 = der Band-Abzug (nu_t,Pi - c2*Sbar_FD) ist systematisch zu klein (Protokoll B30/B32).");
 }
+// ★ 28.09.2026 Nachbar-Amplitude Stufe 0 (host-only, bitneutral): statischer Tangentialrang JE fid aus dem
+// Zensus, damit facetten_persistenz.csv die Rang-0-Marke auch bei CFD_FAC_REK=0 traegt. 255 = kein Rang
+// bestimmt (entartete Normale oder ohne Wandlink). Geschrieben von zensus_statische_klassen, gelesen NUR in
+// bericht_klassen; beide laufen je Lauf genau einmal an derselben (Nah-)Domaene. Die Groesse wird beim Lesen
+// gegen die fid-Zahl geprueft -- passt sie nicht, fehlt die Spalte (Befund), statt still verschoben zu schreiben.
+static std::vector<uchar> s_rang_je_fid;
 // ★ KLASSEN-DIAGNOSTIK (Weg-1-Plan Stufe 0, 30.08.): fac_kd je Facette -> Mittel je Treppenklasse (eigene_links, y_w).
 // Beantwortet je Klasse: welches u_t geht ins Modell, welches Ziel (tw physikalisch, twe angewandt), wie gross ist
 // der Linkaustausch |P1| dagegen, was wird angewandt (s1) und gebucht (phi1), wie oft faellt die Klasse zurueck.
@@ -1475,7 +1481,10 @@ static void bericht_klassen(LBM_Domain* D, const std::vector<Facette>& F, const 
 	// Mittelung ueber bediente Nachbarn traegt -- in einem Cluster aus Dauer-Rueckfaellern gibt es keine.
 	std::ofstream fp(out_dir+"facetten_persistenz.csv"); fp.precision(6);
 	fp << "# Rueckfallrate JE FACETTE (" << ort << "): rate = fac_kd[16k+6]/fac_kd[16k+7]; n = Zellindex im Nahfeldgitter\n";
-	fp << "n,eigene_links,yw,nx,ny,nz,besuche,rate\n";
+	ulong n_fid0=0ull; for(const Facette& f_ : F) if(f_.klasse==0u) n_fid0++;
+	const bool rang_da = (n_fid0==(ulong)s_rang_je_fid.size());
+	if(!rang_da) print_warning("["+ort+"] facetten_persistenz.csv: Rang je fid hat "+to_string((ulong)s_rang_je_fid.size())+" Eintraege, fid-Zahl "+to_string(n_fid0)+" -- Spalte rang wird mit 255 gefuellt (Zensus lief nicht, z. B. CFD_FAC_ZENSUS=0). WARNUNG statt print_error: das waere exit(1) und kostete alle Berichte danach (Lehre B1/E-5).");
+	fp << "n,eigene_links,yw,nx,ny,nz,besuche,rate,ut,ut_ab,yw_ab,rang\n";
 	double wA=0.0, wAbs=0.0, wB=0.0, wC=0.0, wV=0.0, wBes=0.0; ulong nb_n=0ull, nb_bruch=0ull; double nb_max=0.0; // Wandsummen + Nullbeweis (05.09.)
 	for(const Facette& f : F) { if(f.klasse!=0u) continue; if(16ull*k+15ull>=D->fac_kd.length()) break; // 16 seit 05.09. -- STILLE TRUNKIERUNG, wenn hier 12 stehen bliebe
 		const float* a=&D->fac_kd[16ull*k]; k++;
@@ -1487,7 +1496,8 @@ static void bericht_klassen(LBM_Domain* D, const std::vector<Facette>& F, const 
 			ph_ges[b_]++; ph_n++; ph_s+=r_;
 			const float am_=fmax(fabs(f.nx),fmax(fabs(f.ny),fabs(f.nz)));
 			if(f.eigene_links==5u&&am_<=0.99984770f&&(int)lround(100.0f*f.yw)!=50) { ph_ziel[b_]++; ph_zn++; ph_zs+=r_; }
-			fp << f.n << "," << f.eigene_links << "," << f.yw << "," << f.nx << "," << f.ny << "," << f.nz << "," << a[7] << "," << r_ << "\n"; }
+			fp << f.n << "," << f.eigene_links << "," << f.yw << "," << f.nx << "," << f.ny << "," << f.nz << "," << a[7] << "," << r_;
+			fp << "," << a[0]/a[7] << "," << a[8]/a[7] << "," << a[9]/a[7] << "," << (rang_da?(uint)s_rang_je_fid[k-1ull]:255u) << "\n"; } // ★ 28.09.: k wurde oben schon erhoeht -> k-1 ist die fid dieser Facette
 		// ★ NULLBEWEIS A-1 (05.09.): achsparallele Facette MIT 5er-Linkmenge -> S1 = (0,0,+-1/6), t1.n = 0 bitgenau
 		// -> A, |A|, C muessen BITGENAU 0.0f sein. Nur diese Konfiguration (die 53ceb50-Lektion: der 0,99-Eimer
 		// enthaelt 4-Link-Facetten mit zu Recht nichtverschwindendem S1_t). Gezaehlt, nicht gemittelt.
@@ -3496,6 +3506,8 @@ static void zensus_statische_klassen(LBM& L, const std::vector<Facette>& FF, con
 	auto wq = [](const uint i) { return i==0u ? 1.0/3.0 : (i<7u ? 1.0/18.0 : 1.0/36.0); };
 	ulong n_rang[3]={0,0,0}, n_entk=0ull, n_gek=0ull, n_uebersprungen=0ull, n_ohne_link=0ull;
 	ulong fid_zaehler=0ull, n_marke=0ull; double yw_rang0_summe=0.0, yw_rang0_q=0.0; ulong n_rang0_yw=0ull; // ★ 22.09. S0: Rang-0-Marke + zwei unabhaengige Ist=Soll-Proben (Entscheid R2)
+	s_rang_je_fid.clear();
+	for(const Facette& f_ : FF) if(f_.klasse==0u) s_rang_je_fid.push_back((uchar)255u);
 	std::vector<std::pair<ulong,float>> marken; // (fid, 1.0f) -- erst nach der Schleife in fac_geo geschrieben, damit die Schleife unveraendert bleibt
 	ulong n_links[20]; for(uint i=0u;i<20u;i++) n_links[i]=0ull;
 	ulong n_verh[8]; for(uint i=0u;i<8u;i++) n_verh[i]=0ull; // lmin/lmax: <1e-9,<1e-7,<2.5e-5,<1e-3,<1e-2,<0.1,<0.5,>=0.5
@@ -3655,6 +3667,7 @@ static void zensus_statische_klassen(LBM& L, const std::vector<Facette>& FF, con
 		double lmax_e=0.0;
 		const uint rg_roh = klassifiziere(Groh, nullptr, nullptr, nullptr);
 		const uint rg = klassifiziere(G, &entkoppelt, &verh, &lmax_e);
+		if(fid_lauf<(ulong)s_rang_je_fid.size()) s_rang_je_fid[fid_lauf]=(uchar)rg;
 		wanderung[rg_roh][rg]++;
 		{	const double amax = fmax(fabs(nv[0]), fmax(fabs(nv[1]), fabs(nv[2])));
 			const uint ab = amax>=0.99 ? 5u : (amax>=0.95 ? 4u : (amax>=0.85 ? 3u : (amax>=0.75 ? 2u : (amax>=0.65 ? 1u : 0u))));
