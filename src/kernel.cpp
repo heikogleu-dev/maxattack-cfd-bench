@@ -3335,8 +3335,17 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		if(r1q_marke&&r1q_quelle) {
 			const float r1q_z1 = -def_fac_tau*twe;
 			const float r1q_q = 1.0f-r1q_a*r1q_a-r1q_b*r1q_b;
+)+"#ifdef FAC_R1Q_VR"+R(
+			// ★ 28.09. V_R (CFD_FAC_R1Q=3): der VOLLE Rest (I-M)R mit R = Z - P, M = Gt/tr = [[a,b],[b,1-a]].
+			// Nach dem PINV-Solve ist phi = P + M*R; ein Rang-2-Solve haette phi = Z. Es fehlt (I-M)R: quer zur
+			// loesbaren Richtung wird der Bounce-Back-Austausch durch das Wandmodellziel ERSETZT -- genau das, was der
+			// Solve an Rang-2-Zellen ohnehin tut. V_Z (nur (I-M)Z) war am Fahrzeug wirkungslos (r1q_f8_vz, 28.09.).
+			const float r1q_m1 = (1.0f-r1q_a)*R1-r1q_b*R2;
+			const float r1q_m2 = r1q_a*R2-r1q_b*R1;
+)+"#else"+R(
 			const float r1q_m1 = r1q_z1*r1q_q;
 			const float r1q_m2 = -r1q_z1*r1q_b;
+)+"#endif"+R( // FAC_R1Q_VR
 			const float r1q_ir = 1.0f/rhon;
 			const float r1q_dux = (r1q_m1*t1x+r1q_m2*t2x)*r1q_ir;
 			const float r1q_duy = (r1q_m1*t1y+r1q_m2*t2y)*r1q_ir;
@@ -3351,9 +3360,11 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 				const uint r1q_bp = (r1q_z1==0.0f) ? 5u : (r1q_pr<0.1f ? 0u : (r1q_pr<1.0f ? 1u : (r1q_pr<10.0f ? 2u : (r1q_pr<100.0f ? 3u : 4u))));
 				if(hits[421u+r1q_bp]<0xF0000000u) atomic_inc(&hits[421u+r1q_bp]);
 				if(r1q_dl>0.5f*ut*1.0001f&&hits[427]<0xF0000000u) atomic_inc(&hits[427]);
+				// ★ 28.09.: unter V_Z ist 427 ein Stolperdraht (Soll 0), unter V_R das TOR -- dieselbe Schranke wie tw_max = 0,5*rho*ut.
 				if(fabs(r1q_dux*nx+r1q_duy*ny+r1q_duz*nz)>1.0E-3f*r1q_dl+1.0E-12f&&hits[431]<0xF0000000u) atomic_inc(&hits[431]);
 			}
 )+"#ifdef FAC_R1Q_AN"+R(
+			if(!(r1q_dl>0.5f*ut*1.0001f)) {
 			const float r1q_fw1 = fwx*t1x+fwy*t1y+fwz*t1z;
 			const float r1q_fw2 = fwx*t2x+fwy*t2y+fwz*t2z;
 			const float r1q_fwb = fabs(fwx)+fabs(fwy)+fabs(fwz);
@@ -3371,6 +3382,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 				const float r1q_d1 = (fwx*t1x+fwy*t1y+fwz*t1z)-r1q_fw1+r1q_m1;
 				const float r1q_d2 = (fwx*t2x+fwy*t2y+fwz*t2z)-r1q_fw2+r1q_m2;
 				if(fabs(r1q_d1)+fabs(r1q_d2)>1.0E-2f*r1q_mb+4.8E-7f*r1q_fwb&&hits[430]<0xF0000000u) atomic_inc(&hits[430]);
+			}
 			}
 )+"#endif"+R( // FAC_R1Q_AN
 		}

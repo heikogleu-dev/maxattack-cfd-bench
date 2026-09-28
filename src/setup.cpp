@@ -888,7 +888,9 @@ static void pruefe_rek_vorbedingungen(const string& ort, const bool hat_zensus) 
 static void pruefe_r1q_vorbedingungen(const string& ort) {
 	const uint r1q = env_u("CFD_FAC_R1Q", 0u);
 	if(r1q==0u) return;
-	if(r1q>2u) print_error("CFD_FAC_R1Q kennt 0 (aus), 1 (messen: rechnen und zaehlen, nichts anwenden) und 2 (anwenden).");
+	if(r1q>3u) print_error("CFD_FAC_R1Q kennt 0 (aus), 1 (messen: rechnen und zaehlen, nichts anwenden), 2 (V_Z: nur der Modellanteil (I-M)Z) und 3 (V_R: voller Rest (I-M)(Z-P) -- quer zur loesbaren Richtung Wandmodell statt Bounce-Back, wie an Rang-2-Zellen).");
+	if(env_u("CFD_FAC_SATGATE", 0u)==0u) print_error("["+ort+"] CFD_FAC_R1Q braucht CFD_FAC_SATGATE=1: ohne SATGATE werden s1/s2 geklemmt statt verworfen, der PINV-Zweig praegt dann G~*s_geklemmt auf, der Rest wird aber aus dem UNgeklemmten M*R gerechnet -- still falsch (Pruefbefund M2, 28.09.).");
+	if(env_u("CFD_FAC_MASSE_ALLE", 0u)>0u) print_error("["+ort+"] CFD_FAC_R1Q + CFD_FAC_MASSE_ALLE: dort gilt der ROH-Rang ohne ALPHA2-Downdate, die Marke waere eine andere Menge (Pruefbefund N4).");
 	if(env_u("CFD_FACETTEN", 0u)<3u) print_error("["+ort+"] CFD_FAC_R1Q braucht CFD_FACETTEN>=3 (iMEM) -- fac_r1q_on traegt s_fac_imem als Bedingung.");
 	if(env_u("CFD_FAC_PINV", 0u)==0u) print_error("["+ort+"] CFD_FAC_R1Q braucht CFD_FAC_PINV=1: nur der PINV-Zweig setzt die Richtungsgroessen a, b. Ohne ihn blieben sie 0, q waere 1 und die Quelle speiste das VOLLE Ziel ein -- still falsch.");
 	if(env_u("CFD_FAC_ALPHA", 0u)<2u) print_error("["+ort+"] CFD_FAC_R1Q braucht CFD_FAC_ALPHA>=2: der statische Rang der Marke ist der Rang NACH dem ALPHA2-Downdate.");
@@ -902,7 +904,8 @@ static void pruefe_r1q_vorbedingungen(const string& ort) {
 #ifndef D3Q19
 	print_error("["+ort+"] CFD_FAC_R1Q ist nur fuer D3Q19 gebaut (fhn[0..18]).");
 #endif
-	print_info("["+ort+"] RANG-1-QUERREST (CFD_FAC_R1Q="+to_string(r1q)+"): "+string(r1q>=2u?"ANWENDUNG -- der Rest des Wandmodellziels wird an Lage-1-Rang-1-Zellen als Zellquelle eingespeist und als Wandreibung gebucht.":"MESSMODUS -- Rest rechnen und zaehlen, NICHTS anwenden (muss bitgleich zum Arm ohne R1Q sein)."));
+	if(r1q>=2u) print_info("["+ort+"] R1Q ANSAGE (Pruefbefund N5): die Quelle wird als Wandreibung in fac_tau gebucht -- cd_bericht.csv/cd_facetten.csv enthalten sie, forces.csv (object_force) NICHT. Die beiden laufen um die Summe der Quelle auseinander; das ist gewollt, kein Bilanzfehler.");
+	print_info("["+ort+"] RANG-1-QUERREST (CFD_FAC_R1Q="+to_string(r1q)+"): "+string(r1q>=3u?"V_R -- ":(r1q==2u?"V_Z -- ":""))+string(r1q>=2u?"ANWENDUNG -- der Rest des Wandmodellziels wird an Lage-1-Rang-1-Zellen als Zellquelle eingespeist und als Wandreibung gebucht.":"MESSMODUS -- Rest rechnen und zaehlen, NICHTS anwenden (muss bitgleich zum Arm ohne R1Q sein)."));
 }
 void k_befund(const string& t); // ★ 23.09. Pruefbefund M-1: Vorwaertsdeklaration -- die Definition steht weiter unten, die Sammelform wird hier aber schon gebraucht
 // ★ 28.09.2026 R1Q-ABNAHME am Laufende. Slots (Legende lbm.cpp): [408] Nenner (markierte Besuche am Anwendungspunkt),
@@ -939,7 +942,10 @@ static void pruefe_r1q_wirkpfad(LBM_Domain* D, const ulong t_ende, const string&
 		print_info("["+ort+"] R1Q q = 1-a^2-b^2 (Anteil des Ziels in t1, der dem Rang-1-Solve fehlt): <0,1 "+to_string((float)(100.0*H[415]/d),1u)+" % | 0,1-0,3 "+to_string((float)(100.0*H[416]/d),1u)+" % | 0,3-0,5 "+to_string((float)(100.0*H[417]/d),1u)+" % | 0,5-0,7 "+to_string((float)(100.0*H[418]/d),1u)+" % | 0,7-0,9 "+to_string((float)(100.0*H[419]/d),1u)+" % | >=0,9 "+to_string((float)(100.0*H[420]/d),1u)+" %");
 		print_info("["+ort+"] R1Q |p_perp|/|Z1| (BB-Austausch quer zur loesbaren Richtung gegen das Ziel, NUR gemessen): <0,1 "+to_string((float)(100.0*H[421]/d),1u)+" % | 0,1-1 "+to_string((float)(100.0*H[422]/d),1u)+" % | 1-10 "+to_string((float)(100.0*H[423]/d),1u)+" % | 10-100 "+to_string((float)(100.0*H[424]/d),1u)+" % | >=100 "+to_string((float)(100.0*H[425]/d),1u)+" % | Ziel 0 "+to_string((float)(100.0*H[426]/d),1u)+" %");
 	}
-	if(H[427]>0u) k_befund("["+ort+"] R1Q: Slot 427 = "+to_string((ulong)H[427])+" -- |du| > 0,5*ut. Strukturell ausgeschlossen (|m| <= |Z1| <= 0,5*rho*ut); ein Ausschlag heisst, die tw_max-Klemme fehlt oder rho ist falsch.");
+	const bool vr = D->fac_r1q_vr_jit;
+	if((env_u("CFD_FAC_R1Q",0u)>=3u)!=vr) k_befund("["+ort+"] R1Q: CFD_FAC_R1Q="+to_string(env_u("CFD_FAC_R1Q",0u))+", aber '#define FAC_R1Q_VR' steht "+string(vr?"":"NICHT ")+"im uebersetzten Kernel.");
+	if(vr) print_info("["+ort+"] R1Q V_R-TOR [427]: "+to_string((ulong)H[427])+" von "+to_string(quelle)+" berechneten Besuchen ("+to_string(quelle>0ull?(float)(100.0*(double)H[427]/(double)quelle):0.0f,2u)+" %) mit |du| > 0,5*ut NICHT angewandt (Bounce-Back bleibt, wie SATGATE).");
+	else if(H[427]>0u) k_befund("["+ort+"] R1Q: Slot 427 = "+to_string((ulong)H[427])+" -- |du| > 0,5*ut. Unter V_Z strukturell ausgeschlossen (|m| <= |Z1| <= 0,5*rho*ut); ein Ausschlag heisst, die tw_max-Klemme fehlt oder rho ist falsch.");
 	if(H[431]>0u) k_befund("["+ort+"] R1Q: Slot 431 = "+to_string((ulong)H[431])+" -- die Quelle traegt einen NORMALANTEIL. du muss tangential stehen.");
 	if(an) {
 		if(H[428]>0u) k_befund("["+ort+"] R1Q: Slot 428 = "+to_string((ulong)H[428])+" -- Sum c Df != rho*du. Die Einspeisung trifft den Sollimpuls nicht.");
