@@ -904,7 +904,7 @@ static void pruefe_r1q_vorbedingungen(const string& ort) {
 #ifndef D3Q19
 	print_error("["+ort+"] CFD_FAC_R1Q ist nur fuer D3Q19 gebaut (fhn[0..18]).");
 #endif
-	if(r1q>=2u) print_info("["+ort+"] R1Q ANSAGE (Pruefbefund N5): die Quelle wird als Wandreibung in fac_tau gebucht -- cd_bericht.csv/cd_facetten.csv enthalten sie, forces.csv (object_force) NICHT. Die beiden laufen um die Summe der Quelle auseinander; das ist gewollt, kein Bilanzfehler.");
+	if(r1q>=2u) print_info("["+ort+"] R1Q ANSAGE (Pruefbefund N5): die Quelle wird als Wandreibung in fac_tau gebucht -- sie steht NUR in cd_facetten.csv (cd_reib/cz_reib). cd_bericht.csv (cd_rest/cz_rest) ist der Druckpfad aus object_force und enthaelt sie NICHT: eine Aenderung von cz_rest ist eine echte Druckaenderung im Feld. NIE die Quellsumme zu cz_rest addieren (Lehre 16.09.; Pruefbefund M2 vom 28.09. berichtigt die erste Fassung dieser Ansage).");
 	print_info("["+ort+"] RANG-1-QUERREST (CFD_FAC_R1Q="+to_string(r1q)+"): "+string(r1q>=3u?"V_R -- ":(r1q==2u?"V_Z -- ":""))+string(r1q>=2u?"ANWENDUNG -- der Rest des Wandmodellziels wird an Lage-1-Rang-1-Zellen als Zellquelle eingespeist und als Wandreibung gebucht.":"MESSMODUS -- Rest rechnen und zaehlen, NICHTS anwenden (muss bitgleich zum Arm ohne R1Q sein)."));
 }
 void k_befund(const string& t); // ★ 23.09. Pruefbefund M-1: Vorwaertsdeklaration -- die Definition steht weiter unten, die Sammelform wird hier aber schon gebraucht
