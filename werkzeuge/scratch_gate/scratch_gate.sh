@@ -123,11 +123,13 @@ g++ -O1 "$HIER/gen_main.cpp" "$T/kernel.o" -o "$T/gen"
 "$T/gen" datei "$HIER/defs_prod8_nah_2809_r1q4.txt"    "$T/n2809q4.cl"  >/dev/null
 "$T/gen" datei "$HIER/defs_prod8_nah_2809_r1q4_ok.txt" "$T/n2809q4k.cl" >/dev/null
 "$T/gen" datei "$HIER/defs_prod8_fern_2809.txt"        "$T/f2809.cl"    >/dev/null
+# ★ 28.09.2026 spaet (Pruefbefund D-N3): Messmodus R1Q=1 mit echten Defines (= n2809 + "#define FAC_R1Q", so emittiert lbm.cpp Stufe 1).
+"$T/gen" datei "$HIER/defs_prod8_nah_2809_r1q1.txt"    "$T/n2809q1.cl"  >/dev/null
 
 rc=0
 neu_bekannt=""
 for dev in 0x7d67 0xe223; do
-  for arm in e1p1 e1p0 e0p1 e0p0 e1p1r e1p0r e0p1r e0p0r e1p1s e1p1rs e1p1su e1p1rsu e1p1ruR e1p1uR prod8nah prod8fern prod8nahh3 prod8nahp1 prod8nahp2 prod8fernp2 prod8fernp1 prod8nahp2fh1 prod8nahp1h3 prod8nahub prod8fernub prod8nahp2ub prod8naht prod8nahp2ubr prod8fernp2ubr prod8naha prod8nahA prod8nahM prod8nahr1q1 prod8nahr1q4 n2809 n2809q4 n2809q4k f2809; do
+  for arm in e1p1 e1p0 e0p1 e0p0 e1p1r e1p0r e0p1r e0p0r e1p1s e1p1rs e1p1su e1p1rsu e1p1ruR e1p1uR prod8nah prod8fern prod8nahh3 prod8nahp1 prod8nahp2 prod8fernp2 prod8fernp1 prod8nahp2fh1 prod8nahp1h3 prod8nahub prod8fernub prod8nahp2ub prod8naht prod8nahp2ubr prod8fernp2ubr prod8naha prod8nahA prod8nahM prod8nahr1q1 prod8nahr1q4 n2809 n2809q1 n2809q4 n2809q4k f2809; do
     ausgabe=$("$HIER/igc_offline.sh" "$T/$arm.cl" "$dev" ALLE || true)
     # ★ 11.09.2026: BAUFEHLER IST NICHT SCRATCH. Vorher fiel ein gescheiterter Bau in beide
     # Gates, weil die Zeile dann schlicht kein "private_size=0" enthielt -- das Gate meldete

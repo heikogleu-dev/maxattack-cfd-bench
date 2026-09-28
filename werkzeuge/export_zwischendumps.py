@@ -19,7 +19,9 @@ for d in sorted(glob.glob(os.path.join(EX, "*/"))):
         nah = os.path.join(d, f"feld_nah_{t:06d}ms.vtk"); fern = os.path.join(d, f"feld_fern_{t:06d}ms.vtk")
         band = os.path.join(d, f"dach_band_{t:06d}ms.npz")
         ok = True
-        if os.path.exists(nah) and not os.path.exists(band):
+        # ★ 28.09. Pruefbefund D-N2: dieselbe Veraltet-Regel wie dach_statistik.py -- ein wiederverwendeter Laufname hinterliesse sonst
+        # ein ALTES Band neben einem geloeschten NEUEN Dump, und nach dem Loeschen kann niemand mehr erkennen, dass das Band veraltet ist.
+        if os.path.exists(nah) and (not os.path.exists(band) or os.path.getmtime(band) < os.path.getmtime(nah)):
             if LOS:
                 r = subprocess.run([sys.executable, FXB, nah, band], capture_output=True, text=True)
                 ok = (r.returncode == 0 and os.path.exists(band))
