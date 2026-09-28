@@ -3373,7 +3373,8 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	}
 )+"#endif"+R( // FACETTEN_ELIBB
 )+"#ifdef FAC_R1Q"+R(
-	// ★★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q). Hier stehen P, Pass 2, phi und fw fest; fhn wird danach
+	// ★★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q; Stufen: 1 messen, 2 V_Z = Formel direkt darunter, 3 V_R = (I-M)R, 4 = V_R mit R' = R + A,
+	// siehe #ifdef FAC_R1Q_VR/FAC_R1Q_OHNE_DRUCK im Block). Hier stehen P, Pass 2, phi und fw fest; fhn wird danach
 	// in dieser Funktion nicht mehr gelesen, und die Kollision laeuft im SELBEN Schritt auf u+du.
 	// Ziel Z = (Z1, 0) in (t1, t2), Z1 = -def_fac_tau*twe. Der PINV-Zweig praegt G~*s_Z = Z1*(a^2+b^2, b) auf
 	// (a = Gt11/tr, b = Gt12/tr, Gt22/tr = 1-a). Es fehlt m = (Z1*(1-a^2-b^2), -Z1*b): die t1-Komponente ist

@@ -5,14 +5,16 @@ Heiko 28.09.2026: mit 3 Momentanfeldern lag die R1Q=4-Verbesserung am Rauschnive
 Abloeseort). Hier je Lauf JEDER feld_nah_*ms.vtk ab t_ab einzeln ausgewertet (fx_band.py -> fx_profil2.py mit genau
 einem Band -> prof2_<lauf>_t<ms>.npz), dann je Groesse Mittel, Standardfehler und die Differenz Arm - Bezug in
 Einheiten ihres kombinierten Standardfehlers.
-Groessen (Definitionen WORTGLEICH aus bericht3.py / zonen_h.py, Band +-40 mm um die Fahrzeug-Mittelebene):
+Groessen (x_s, H, d99 wie bericht3.py / zonen_h.py; Band +-40 mm um die Fahrzeug-Mittelebene):
   x_s      Abloeseort: Beginn der durchgehenden Rueckstroemung (u_x < 0, erste Fluidzelle, +-24 mm geglaettet) bis x = 3,62 m;
            ohne Rueckstroemung bis dort -> 3,62 (Zensur, gezaehlt)
   H_pl     H = delta*/theta, Median ueber das Dachplateau x 2,30-2,90   (OF13 1,174)
   H_sp     dito Saugspitze x 2,00-2,30
   d99_pl   delta99 Median Dachplateau [mm]                             (OF13 29-39 mm)
   ut25/29  utg (geglaettet +-24 mm) auf dem Wandstrahl bei s = 4 mm (wie bericht3 Tabelle D), x = 2,50 / 2,90 m [m/s]     (OF13 24-32 / 20-28 m/s bei 2-8 mm)
-  neg      Anteil u_x < 0 in der ersten Fluidzelle ueber x 2,9-3,6 m   (Rueckstromflaeche am hinteren Dach)
+  neg      x-Anteil der Stationen 2,9-3,6 m, an denen das BANDGEMITTELTE u_x der ersten Fluidzelle < 0 ist (nicht negfrac)
+  ACHTUNG (Pruefbefund C-M4): x_s ist auf Einzelschnappschuessen ein grobes, zensiertes Kriterium -- als Abloesebeleg nur
+  zusammen mit neg lesen; belastbar sind H und u_t.
 """
 import sys, os, glob, subprocess
 import numpy as np
@@ -41,17 +43,23 @@ def groessen(npz):
                 ut25=at("utg", 2.50), ut29=at("utg", 2.90), neg=float(np.mean(ux[m] < 0))), zens
 
 def lauf(name, t_ab):
+    # ★ 28.09. Pruefbefund C-M3: die Zwischendumps sind seit dem Aufraeumen (export_zwischendumps.py) weg, die Dachbaender
+    # dach_band_<t>ms.npz sind geblieben -- deshalb ueber die VEREINIGUNG von Baendern und VTKs aufzaehlen. Caches werden neu
+    # gebaut, wenn sie aelter sind als ihre Quelle (ein wiederverwendeter Laufname lieferte sonst still alte Ergebnisse).
     ex = os.path.join(ROOT, "export", name)
-    vs = sorted(glob.glob(os.path.join(ex, "feld_nah_*ms.vtk")))
+    zeiten = {os.path.basename(v)[9:15] for v in glob.glob(os.path.join(ex, "feld_nah_*ms.vtk"))}
+    zeiten |= {os.path.basename(b)[10:16] for b in glob.glob(os.path.join(ex, "dach_band_*ms.npz"))}
     R = []; nz = 0; ts = []
-    for v in vs:
-        tms = os.path.basename(v)[9:15]
+    for tms in sorted(zeiten):
         if int(tms)/1000.0 < t_ab: continue
+        v = os.path.join(ex, f"feld_nah_{tms}ms.vtk")
         band = os.path.join(ex, f"dach_band_{tms}ms.npz")
-        if not os.path.exists(band): subprocess.run([sys.executable, os.path.join(D, "fx_band.py"), v, band], check=True, capture_output=True)
+        if os.path.exists(v) and (not os.path.exists(band) or os.path.getmtime(band) < os.path.getmtime(v)):
+            subprocess.run([sys.executable, os.path.join(D, "fx_band.py"), v, band], check=True, capture_output=True)
         pn = f"{name}_t{tms}"
         pf = os.path.join(D, f"prof2_{pn}.npz")
-        if not os.path.exists(pf): subprocess.run([sys.executable, os.path.join(D, "fx_profil2.py"), pn, band], check=True, capture_output=True)
+        if not os.path.exists(pf) or os.path.getmtime(pf) < os.path.getmtime(band):
+            subprocess.run([sys.executable, os.path.join(D, "fx_profil2.py"), pn, band], check=True, capture_output=True)
         g, z = groessen(pf); R.append(g); nz += int(z); ts.append(int(tms))
     return R, nz, ts
 

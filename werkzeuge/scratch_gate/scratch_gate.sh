@@ -25,11 +25,11 @@ REPO="$(cd "$HIER/../.." && pwd)"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 # ── BEKANNTE, AUSDRUECKLICH ERKLAERTE ABWEICHUNGEN ────────────────────────────────────
-# Format: "<kernelname>:<private>:<spill>". Nur exakt diese Werte gelten als bekannt --
+# Format: "<arm>/<geraet>/<kernelname>:<private>:<spill>" (★ 28.09. Pruefbefund C-M2: vorher nur Kernelname -- eine Ausnahme galt dann in JEDEM Arm und auf beiden Geraeten). Nur exakt diese Werte gelten als bekannt --
 # waechst die Zahl, schlaegt das Gate zu. Ein Eintrag hier ist eine SCHULD, kein Freibrief:
 # er gehoert entfernt, sobald der Befund behoben ist, und er braucht immer eine Begruendung.
 #
-#   (leer) — der Eintrag fac_nachbar_ab:7296:0 / :3648:0 wurde am 11.09.2026 behoben und
+#   Frueher (leer) — der Eintrag fac_nachbar_ab:7296:0 / :3648:0 wurde am 11.09.2026 behoben und
 #   entfernt: der laufzeitindizierte c(ib)-Zugriff in kernel.cpp ist durch eine Mitschrift
 #   in der Schleife ersetzt. Das Gate hat den Eintrag selbst als veraltet gemeldet.
 #   stream_collide:0:64 (B70 0xe223) / stream_collide:0:224 (iGPU 0x7d67) -- NUR im Arm prod8nahr1q4 (CFD_FAC_R1Q=4, Einspeisung der
@@ -38,7 +38,7 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 #   paarweise Form (Richtung/Gegenrichtung teilen c.du und c.s) senkt auf 64/224 B. Gemessene Kosten am 8-mm-Fahrzeug B70 mit der
 #   192-B-Form: Wanduhr 7:45 gegen 7:40 min (r1q_f8_vr4_7 gegen r1q_f8_b7, je ein Lauf). SCHULD: vor einem Standard-Umstieg auf R1Q
 #   die Einspeisung aus apply_facette_imem nach stream_collide (nach dem Aufruf, du als float3 zurueckgeben) verlegen und neu messen.
-BEKANNT="stream_collide:0:64 stream_collide:0:224"
+BEKANNT="prod8nahr1q4/0xe223/stream_collide:0:64 prod8nahr1q4/0x7d67/stream_collide:0:224"
 
 g++ -O1 -c "$REPO/src/kernel.cpp" -o "$T/kernel.o"
 g++ -O1 "$HIER/gen_main.cpp" "$T/kernel.o" -o "$T/gen"
@@ -131,9 +131,9 @@ for dev in 0x7d67 0xe223; do
       pv=$(echo "$zeile" | grep -oE 'private_size=[0-9]+' | cut -d= -f2)
       sp=$(echo "$zeile" | grep -oE 'spill_size=[0-9]+'   | cut -d= -f2)
       if [ "${pv:-0}" = "0" ] && [ "${sp:-0}" = "0" ]; then continue; fi
-      if echo " $BEKANNT " | grep -q " $kn:$pv:$sp "; then
+      if echo " $BEKANNT " | grep -q " $arm/$dev/$kn:$pv:$sp "; then
         echo "    bekannt: $kn private=$pv spill=$sp ($arm/$dev) -- siehe BEKANNT-Liste im Kopf"
-        neu_bekannt="$neu_bekannt $kn"
+        neu_bekannt="$neu_bekannt $arm/$dev/$kn:$pv:$sp"
         continue
       fi
       echo ">>> SCRATCH/SPILL-GATE VERLETZT: $kn private=$pv spill=$sp ($arm/$dev)"
@@ -152,8 +152,7 @@ done
 
 # Eine BEKANNT-Zeile, die nie zutrifft, ist behoben oder falsch -- beides gehoert gemeldet.
 for eintrag in $BEKANNT; do
-  kn=${eintrag%%:*}
-  case " $neu_bekannt " in *" $kn "*) ;; *)
+  case " $neu_bekannt " in *" $eintrag "*) ;; *)
     echo ">>> BEKANNT-LISTE VERALTET: '$eintrag' trifft nirgends mehr -- Zeile aus dem Kopf entfernen"; rc=1 ;;
   esac
 done

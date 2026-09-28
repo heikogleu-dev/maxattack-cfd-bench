@@ -459,11 +459,13 @@ vehicle, judged on the boundary-layer field at the roof (at 8 mm the forces are 
   | shape factor H, roof plateau | 1.61 | **1.51** | −0.10 (4.4 SE) | 1.17 |
   | shape factor H, suction peak | 2.33 | **1.95** | −0.38 (2.9 SE) | – |
   | near-wall u_t at x = 2.5 m | 6.6 m/s | **8.9 m/s** | +2.3 (2.9 SE) | 24–32 m/s |
-  | separation point | 3.36 m | 3.51 m | +0.15 (1.4 SE, not significant) | 3.63 m |
   | δ99, roof plateau | 149 mm | 147 mm | none | 29–39 mm |
 
-  The direction is right; the gap to the reference is still large. SE is a lower bound — consecutive
-  snapshots are correlated.
+  The direction is right for the shape factor and the near-wall velocity; the gap to the reference is still
+  large. SE is a lower bound — consecutive snapshots are correlated. The separation point is **not** a usable
+  indicator on single snapshots: the "continuous reverse flow" criterion is censored in 2 of 7 baseline
+  snapshots, and the reverse-flow share on the rear roof (x 2.9–3.6 m) moves the other way (0.45 → 0.54,
+  0.8 SE). Neither counts as evidence either way.
 
 Next: a full code audit of the mechanism, then a 4 mm production run with it. A diagnosis channel with
 the flow driven *across* the steps (the existing tilted channel drives it along them and therefore cannot
