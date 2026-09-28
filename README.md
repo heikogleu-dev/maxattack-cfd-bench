@@ -381,6 +381,7 @@ reconstructing one by hand once cost a full morning of measurements.
 | ✅ | **Wall-cell reconstruction** | built, force-booked, booking defect corrected and accepted |
 | 🚧 | **…at 4 mm** | **never run there** — effect on Cz is unmeasured |
 | 🚧 | **…amplitude derived** | still a hand-set knob — next build step |
+| 🚧 | **Rank-1 wall cells** | the wall model acts in one direction only — *the current open problem, see below* |
 
 </div>
 
@@ -406,6 +407,55 @@ bit-identical across it, in both signs of the amplitude.
    dialled, and until the wall-model target sets the injected momentum itself, this is a probe
    rather than a model. That derivation is the next build step, and it is larger than anything
    behind it.
+
+### The open problem, made visible: rank-1 wall cells on gently sloping surfaces
+
+<div align="center">
+
+![Tangential rank of the first wall layer on the vehicle, 8 mm](docs/oberflaeche_rang_0-2.png)
+
+*Tangential rank of every **first-layer** wall cell (a fluid cell with at least one face neighbour in the
+solid), projected onto the faceted surface. Green = rank 2, yellow = rank 1, red = rank 0.
+**Coarse resolution: this is the 8 mm grid.** At 4 mm the terraces are narrower and the pattern finer;
+the mechanism is the same.*
+
+</div>
+
+A voxelised sloping surface is a staircase. The flat terraces are **rank 2**: the wall model can impose
+shear in both tangential directions. Every **step edge is rank 1**: its wall links span only the
+direction *along the edge*. On the roof, the bonnet and the rear screen these edges form rings like
+contour lines. Where the rings run *across* the flow — exactly at the windscreen-to-roof and
+roof-to-rear transitions, where the boundary layer separates too early — the wall model can only act
+spanwise. In the flow direction those cells are plain bounce-back.
+
+Measured on the 8 mm vehicle (first layer only):
+
+| | windscreen | roof | rear |
+|---|---|---|---|
+| share of first-layer cells with rank 1 | 34 % | 43 % | 48 % |
+| median \|cos\| between the one solvable direction and the flow | 0.19–0.24 | 0.61–0.72 | 0.43–0.60 |
+
+At the windscreen the model therefore reaches only 4–6 % of the streamwise wall shear on a third of the
+wall layer. These cells almost never fall back (0.5–2.5 %) — they are *served*, just in the wrong
+direction, which is why they went unnoticed. Rank 1 concentrates on gentle slopes: 61 % of the rank-1
+cells are tilted 5–20° against the nearest grid axis. Rank 0 is practically absent from the first layer
+(251 of 577 355 cells); the single-link cells the reconstruction above targets are edge-touching cells of
+the *second* layer, not the wall layer itself.
+
+**What is being tried.** Restore the missing tangential direction as a mass-free cell source whose
+amplitude comes from the wall model of the same cell — no hand-set knob. Three variants on the 8 mm
+vehicle, judged on the boundary-layer field at the roof (at 8 mm the forces are not an indicator):
+
+- *model target only* — no measurable effect (the source is small against bounce-back and below the
+  FP16 storage quantum);
+- *full rank-2 equivalent* — the boundary layer on the roof plateau becomes as thin as in the reference
+  (δ99 28 mm vs 148 mm, reference 29–39 mm), but the near-wall flow collapses further aft and
+  separation moves **0.4 m upstream**;
+- *the same without the isotropic pressure part of the bounce-back exchange* — the near-wall velocity at
+  the roof front rises by 50 % without the collapse; separation point and shape factor move toward the
+  reference, **but still within the scatter of three field snapshots**.
+
+Next: more field snapshots per arm to separate effect from scatter, then 4 mm.
 
 The measurements behind every claim above — including the arms that were rejected — live in the
 project's working notes and the run archive, which are kept out of this repository on purpose: they
