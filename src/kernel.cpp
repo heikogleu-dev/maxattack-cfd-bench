@@ -1994,76 +1994,136 @@ float3 elibb_rekonstruiere(float* fhn, const uxx* j, const global uchar* flags, 
 // (dieselbe Form wie der FAC_REK-Block: Df = f_eq(rho,u+du) - f_eq(rho,u), s = 2u + du). Eigene Funktion,
 // damit der REK-Block Zeichen fuer Zeichen unveraendert bleibt. Aufruf nur weiter unten (C99).
 float4 r1q_einspeisen(float* fhn, const float rhon, const float uxn, const float uyn, const float uzn, const float dux, const float duy, const float duz) {
-	// ★ Rueckgabe: (Sum c_x Df, Sum c_y Df, Sum c_z Df, Sum Df), gebildet aus den INKREMENTEN selbst -- nicht als
-	// Differenz zweier fp32-Summen ueber fhn (deren Rundung bis ~3e-6*Sum|f| ueberdeckte jeden Fehler dieser Groesse;
-	// CPU-Stufe 28.09.: Slot 429 feuerte an 0,3 % bei korrektem Code). So sind die Proben 428/429 streng.
+	// ★ Rueckgabe: (Sum c_x Df, Sum c_y Df, Sum c_z Df, Sum Df) aus den INKREMENTEN (nicht als fp32-Summendifferenz ueber fhn;
+	// CPU-Stufe 28.09.: die Differenzform liess Slot 429 bei korrektem Code feuern).
+	// ★ 28.09. abends, Audit A M1 (Scratch-Gate: stream_collide spill 192 B B70 / 256 B iGPU im R1Q=4-Arm): PAARWEISE Form.
+	// Richtung c und Gegenrichtung -c teilen sich cd = c.du und cs = c.s; mit p = 4,5*cd*cs + h3 gilt
+	// Df(+c) = w*rho*(3*cd + p), Df(-c) = w*rho*(-3*cd + p) -- dieselbe Delta-Form wie der FAC_REK-Block, nur je Paar
+	// ausgewertet, damit je Paar drei Zwischenwerte leben statt zwoelf gemeinsamer. Gemessen: B70 192 -> 64 B, iGPU 256 -> 224 B.
+	// D3Q19-Paare wie im REK-Block: (1,2) x, (3,4) y, (5,6) z, (7,8) +x+y, (9,10) +x+z, (11,12) +y+z, (13,14) +x-y, (15,16) +x-z, (17,18) +y-z.
 	const float sx = fma(2.0f, uxn, dux);
 	const float sy = fma(2.0f, uyn, duy);
 	const float sz = fma(2.0f, uzn, duz);
 	const float h3 = -1.5f*fma(sx, dux, fma(sy, duy, sz*duz));
-	const float wr_s = def_ws*rhon;
-	const float wr_e = def_we*rhon;
-	const float d3x = 3.0f*dux;
-	const float d3y = 3.0f*duy;
-	const float d3z = 3.0f*duz;
-	const float s3x = 3.0f*sx;
-	const float s3y = 3.0f*sy;
-	const float s3z = 3.0f*sz;
-	const float dxy = d3x+d3y;
-	const float sxy = s3x+s3y;
-	const float dxz = d3x+d3z;
-	const float sxz = s3x+s3z;
-	const float dyz = d3y+d3z;
-	const float syz = s3y+s3z;
-	const float dxmy = d3x-d3y;
-	const float sxmy = s3x-s3y;
-	const float dxmz = d3x-d3z;
-	const float sxmz = s3x-s3z;
-	const float dymz = d3y-d3z;
-	const float symz = s3y-s3z;
-	const float d0 = def_w0*rhon*h3;
-	const float d1 = wr_s*fma(d3x, fma(0.5f, s3x, 1.0f), h3);
-	const float d2 = wr_s*fma(-d3x, fma(-0.5f, s3x, 1.0f), h3);
-	const float d3 = wr_s*fma(d3y, fma(0.5f, s3y, 1.0f), h3);
-	const float d4 = wr_s*fma(-d3y, fma(-0.5f, s3y, 1.0f), h3);
-	const float d5 = wr_s*fma(d3z, fma(0.5f, s3z, 1.0f), h3);
-	const float d6 = wr_s*fma(-d3z, fma(-0.5f, s3z, 1.0f), h3);
-	const float d7 = wr_e*fma(dxy, fma(0.5f, sxy, 1.0f), h3);
-	const float d8 = wr_e*fma(-dxy, fma(-0.5f, sxy, 1.0f), h3);
-	const float d9 = wr_e*fma(dxz, fma(0.5f, sxz, 1.0f), h3);
-	const float d10 = wr_e*fma(-dxz, fma(-0.5f, sxz, 1.0f), h3);
-	const float d11 = wr_e*fma(dyz, fma(0.5f, syz, 1.0f), h3);
-	const float d12 = wr_e*fma(-dyz, fma(-0.5f, syz, 1.0f), h3);
-	const float d13 = wr_e*fma(dxmy, fma(0.5f, sxmy, 1.0f), h3);
-	const float d14 = wr_e*fma(-dxmy, fma(-0.5f, sxmy, 1.0f), h3);
-	const float d15 = wr_e*fma(dxmz, fma(0.5f, sxmz, 1.0f), h3);
-	const float d16 = wr_e*fma(-dxmz, fma(-0.5f, sxmz, 1.0f), h3);
-	const float d17 = wr_e*fma(dymz, fma(0.5f, symz, 1.0f), h3);
-	const float d18 = wr_e*fma(-dymz, fma(-0.5f, symz, 1.0f), h3);
-	fhn[0] += d0;
-	fhn[1] += d1;
-	fhn[2] += d2;
-	fhn[3] += d3;
-	fhn[4] += d4;
-	fhn[5] += d5;
-	fhn[6] += d6;
-	fhn[7] += d7;
-	fhn[8] += d8;
-	fhn[9] += d9;
-	fhn[10] += d10;
-	fhn[11] += d11;
-	fhn[12] += d12;
-	fhn[13] += d13;
-	fhn[14] += d14;
-	fhn[15] += d15;
-	fhn[16] += d16;
-	fhn[17] += d17;
-	fhn[18] += d18;
-	// D3Q19-Reihenfolge wie im REK-Block: 7 (+,+,0), 9 (+,0,+), 11 (0,+,+), 13 (+,-,0), 15 (+,0,-), 17 (0,+,-).
-	const float jx = d1-d2+d7-d8+d9-d10+d13-d14+d15-d16;
-	const float jy = d3-d4+d7-d8+d11-d12-d13+d14+d17-d18;
-	const float jz = d5-d6+d9-d10+d11-d12-d15+d16-d17+d18;
-	const float m = ((d0+d1+d2)+(d3+d4+d5+d6))+((d7+d8+d9+d10)+(d11+d12+d13+d14))+((d15+d16)+(d17+d18));
+	float jx = 0.0f;
+	float jy = 0.0f;
+	float jz = 0.0f;
+	float m = def_w0*rhon*h3;
+	fhn[0] += m;
+	{
+		const float cd = dux;
+		const float cs = sx;
+		const float wr = def_ws*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[1] += dp;
+		fhn[2] += dm;
+		m += dp+dm;
+		jx += dp-dm;
+	}
+	{
+		const float cd = duy;
+		const float cs = sy;
+		const float wr = def_ws*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[3] += dp;
+		fhn[4] += dm;
+		m += dp+dm;
+		jy += dp-dm;
+	}
+	{
+		const float cd = duz;
+		const float cs = sz;
+		const float wr = def_ws*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[5] += dp;
+		fhn[6] += dm;
+		m += dp+dm;
+		jz += dp-dm;
+	}
+	{
+		const float cd = dux+duy;
+		const float cs = sx+sy;
+		const float wr = def_we*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[7] += dp;
+		fhn[8] += dm;
+		m += dp+dm;
+		jx += dp-dm;
+		jy += dp-dm;
+	}
+	{
+		const float cd = dux+duz;
+		const float cs = sx+sz;
+		const float wr = def_we*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[9] += dp;
+		fhn[10] += dm;
+		m += dp+dm;
+		jx += dp-dm;
+		jz += dp-dm;
+	}
+	{
+		const float cd = duy+duz;
+		const float cs = sy+sz;
+		const float wr = def_we*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[11] += dp;
+		fhn[12] += dm;
+		m += dp+dm;
+		jy += dp-dm;
+		jz += dp-dm;
+	}
+	{
+		const float cd = dux-duy;
+		const float cs = sx-sy;
+		const float wr = def_we*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[13] += dp;
+		fhn[14] += dm;
+		m += dp+dm;
+		jx += dp-dm;
+		jy -= dp-dm;
+	}
+	{
+		const float cd = dux-duz;
+		const float cs = sx-sz;
+		const float wr = def_we*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[15] += dp;
+		fhn[16] += dm;
+		m += dp+dm;
+		jx += dp-dm;
+		jz -= dp-dm;
+	}
+	{
+		const float cd = duy-duz;
+		const float cs = sy-sz;
+		const float wr = def_we*rhon;
+		const float p = fma(4.5f*cd, cs, h3);
+		const float dp = wr*fma(3.0f, cd, p);
+		const float dm = wr*fma(-3.0f, cd, p);
+		fhn[17] += dp;
+		fhn[18] += dm;
+		m += dp+dm;
+		jy += dp-dm;
+		jz -= dp-dm;
+	}
 	return (float4)(jx, jy, jz, m);
 }
 )+"#endif"+R( // FAC_R1Q_AN

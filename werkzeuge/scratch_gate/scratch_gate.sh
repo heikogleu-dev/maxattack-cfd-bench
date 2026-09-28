@@ -32,7 +32,13 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 #   (leer) — der Eintrag fac_nachbar_ab:7296:0 / :3648:0 wurde am 11.09.2026 behoben und
 #   entfernt: der laufzeitindizierte c(ib)-Zugriff in kernel.cpp ist durch eine Mitschrift
 #   in der Schleife ersetzt. Das Gate hat den Eintrag selbst als veraltet gemeldet.
-BEKANNT=""
+#   stream_collide:0:64 (B70 0xe223) / stream_collide:0:224 (iGPU 0x7d67) -- NUR im Arm prod8nahr1q4 (CFD_FAC_R1Q=4, Einspeisung der
+#   Zellquelle r1q_einspeisen spaet in apply_facette_imem, wo fhn, fw, t1/t2 und die PINV-Groessen gleichzeitig leben). Eingetragen
+#   28.09.2026 abends als BEWUSSTE Lockerung nach Eingrenzung: ohne Einspeisung 0 B; die urspruengliche Form hatte 192/256 B, die
+#   paarweise Form (Richtung/Gegenrichtung teilen c.du und c.s) senkt auf 64/224 B. Gemessene Kosten am 8-mm-Fahrzeug B70 mit der
+#   192-B-Form: Wanduhr 7:45 gegen 7:40 min (r1q_f8_vr4_7 gegen r1q_f8_b7, je ein Lauf). SCHULD: vor einem Standard-Umstieg auf R1Q
+#   die Einspeisung aus apply_facette_imem nach stream_collide (nach dem Aufruf, du als float3 zurueckgeben) verlegen und neu messen.
+BEKANNT="stream_collide:0:64 stream_collide:0:224"
 
 g++ -O1 -c "$REPO/src/kernel.cpp" -o "$T/kernel.o"
 g++ -O1 "$HIER/gen_main.cpp" "$T/kernel.o" -o "$T/gen"
@@ -98,10 +104,16 @@ g++ -O1 "$HIER/gen_main.cpp" "$T/kernel.o" -o "$T/gen"
 "$T/gen" datei "$HIER/defs_prod8_nah.txt"  "$T/prod8nahp2ubr.cl" pos2ur  >/dev/null
 "$T/gen" datei "$HIER/defs_prod8_fern.txt" "$T/prod8fernp2ubr.cl" pos2ur >/dev/null
 
+# ★ 28.09.2026 R1Q (Audit A, M1 -- Bedingung vor 4 mm): Produktionsdefines des Nahfelds + CFD_FAC_R1Q. r1q1 = Messmodus
+# (FAC_R1Q), r1q4 = Anwendung V_R ohne Druckanteil (FAC_R1Q + _AN + _VR + _OHNE_DRUCK). Neu im Kernel: r1q_einspeisen bekommt das
+# private fhn per Zeiger, r1q_pinv/a/b bleiben ueber Pass 2 hinweg live. Die defs-Dateien sind defs_prod8_nah.txt + diese Zeilen.
+"$T/gen" datei "$HIER/defs_prod8_nah_r1q1.txt" "$T/prod8nahr1q1.cl" >/dev/null
+"$T/gen" datei "$HIER/defs_prod8_nah_r1q4.txt" "$T/prod8nahr1q4.cl" >/dev/null
+
 rc=0
 neu_bekannt=""
 for dev in 0x7d67 0xe223; do
-  for arm in e1p1 e1p0 e0p1 e0p0 e1p1r e1p0r e0p1r e0p0r e1p1s e1p1rs e1p1su e1p1rsu e1p1ruR e1p1uR prod8nah prod8fern prod8nahh3 prod8nahp1 prod8nahp2 prod8fernp2 prod8fernp1 prod8nahp2fh1 prod8nahp1h3 prod8nahub prod8fernub prod8nahp2ub prod8naht prod8nahp2ubr prod8fernp2ubr prod8naha prod8nahA prod8nahM; do
+  for arm in e1p1 e1p0 e0p1 e0p0 e1p1r e1p0r e0p1r e0p0r e1p1s e1p1rs e1p1su e1p1rsu e1p1ruR e1p1uR prod8nah prod8fern prod8nahh3 prod8nahp1 prod8nahp2 prod8fernp2 prod8fernp1 prod8nahp2fh1 prod8nahp1h3 prod8nahub prod8fernub prod8nahp2ub prod8naht prod8nahp2ubr prod8fernp2ubr prod8naha prod8nahA prod8nahM prod8nahr1q1 prod8nahr1q4; do
     ausgabe=$("$HIER/igc_offline.sh" "$T/$arm.cl" "$dev" ALLE || true)
     # ★ 11.09.2026: BAUFEHLER IST NICHT SCRATCH. Vorher fiel ein gescheiterter Bau in beide
     # Gates, weil die Zeile dann schlicht kein "private_size=0" enthielt -- das Gate meldete
