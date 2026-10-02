@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: FluidX3D upstream issues
+    url: https://github.com/ProjectPhysX/FluidX3D/issues
+    about: For bugs in original FluidX3D (not in this modified version)
+  - name: Intel Compute Runtime issues
+    url: https://github.com/intel/compute-runtime/issues
+    about: For OpenCL / Level Zero driver bugs on Intel GPUs
+  - name: Linux xe driver issues
+    url: https://gitlab.freedesktop.org/drm/xe/kernel/-/issues
+    about: For GPU hangs, resets and kernel-driver bugs on Intel Xe GPUs

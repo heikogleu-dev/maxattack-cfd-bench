@@ -1,0 +1,65 @@
+name: Bug Report / Different Result
+description: Report a crash, a GPU hang, a wrong result or a different measurement
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Real reproduction data is genuinely useful —
+        please be specific. This is a modified version of FluidX3D; bugs in original FluidX3D belong upstream.
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU(s), CPU, RAM
+      placeholder: "Intel Arc Pro B70 + iGPU / Core Ultra 9 285K / 96 GB DDR5"
+    validations:
+      required: true
+
+  - type: input
+    id: software
+    attributes:
+      label: Software versions
+      description: Linux kernel, xe driver, Intel Compute Runtime, compiler
+      placeholder: "Kernel 7.0.0-34, Compute Runtime 26.x, g++ 15"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: "git log -1 --format=%h"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Crash, hang, wrong result, performance change, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The exact CFD_* line (series file) and the device
+      render: shell
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant run-log lines (action-path counters, errors) and journalctl -k lines for GPU events
+      render: shell

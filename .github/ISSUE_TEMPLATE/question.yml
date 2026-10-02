@@ -1,0 +1,29 @@
+name: Question / Discussion
+description: Ask about results, configuration, or running the solver on Intel Arc
+title: "[Q]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For questions about results, the wall model, the two-domain setup or running on Battlemage.
+        For confirmed bugs or different measurements, use the bug report template.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Your hardware (if relevant)
+      placeholder: "Intel Arc Pro B70 / B580 / A770 / other"
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: What you have tried, related README sections, links to your own runs
