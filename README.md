@@ -451,7 +451,8 @@ vehicle, judged on the boundary-layer field at the roof (at 8 mm the forces are 
 - *full rank-2 equivalent* — the boundary layer on the roof plateau becomes as thin as in the reference
   (δ99 28 mm vs 148 mm, reference 29–39 mm), but the near-wall flow collapses further aft: the reverse-flow
   fraction of the first cell at x = 2.9–3.6 m doubles (0.41 → 0.83, +3.4 SE, three snapshots each against the
-  *model target only* run), and on the time-averaged profile separation moves **0.4 m upstream** (2.96 vs 3.34 m);
+  *model target only* run), and on the evaluated mid-plane profile separation lies at 2.96 m against 3.34 m in the baseline run (the *model
+  target only* run shows no continuous first-cell reverse flow there);
 - *the same without the isotropic pressure part of the bounce-back exchange* — the first variant that
   moves the field the right way. Seven field snapshots per arm (0.30–0.74 s), mid-plane:
 

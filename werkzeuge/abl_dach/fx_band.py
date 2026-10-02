@@ -92,10 +92,14 @@ def main():
             RHO[z] = np.frombuffer(f.read(ny*Nx*4), dtype=">f4").reshape(ny, Nx)
             f.seek(d["off_flags"] + basis)
             FL[z] = np.frombuffer(f.read(ny*Nx), dtype=np.uint8).reshape(ny, Nx)
-    np.savez_compressed(out, u=U, rho=RHO, flags=FL,
+    # ★ 02.10. Pruefbefund E-N1: atomar schreiben -- ein abgebrochener Schreibvorgang hinterliess sonst ein abgeschnittenes Band, das
+    # NEUER als der Dump ist; export_zwischendumps.py haette den Dump danach geloescht.
+    tmp = out + ".tmp.npz"
+    np.savez_compressed(tmp, u=U, rho=RHO, flags=FL,
                         dims=np.array([Nx, Ny, Nz]), orig=np.array([x0, y0, z0]),
                         dx=dx, ja=ja, jb=jb, jy0=jy0, y_versatz_m=yv, y_mitte_index=m, y_versatz_quelle=q_yv,
                         u_lat=ul, u_lat_quelle=q_ul)
+    os.replace(tmp, out)
     print("geschrieben:", out, os.path.getsize(out)//1048576, "MB")
 
 main()
