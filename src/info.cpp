@@ -19,6 +19,24 @@ void Info::update(const double dt) {
 	this->runtime_lbm += dt; // skip first step since it is likely slower than average
 	this->runtime_total = clock.stop();
 }
+// ★ 03.10.2026 (Heiko: Leistungsanzeige je GPU ehrlich). Im fahrzeug_dd-Fall zeigte die Laufzeile info.lbm = das zuletzt
+// per run(0) initialisierte LBM, also das FERNfeld (N_fern, t_fern), waehrend info.update() nur aus lbm_f.run() kam, also mit
+// der NAHfeld-Schrittzeit: MLUPs = N_fern / t_nah. Dazu setzte run_async() in jedem Aussenschritt die Zaehler zurueck.
+// lauf_binden() setzt Gitter, Schrittzaehler und Uhren in EINEM Zug unter dem Druck-Lock -- die Anzeige sieht nie einen
+// halb gesetzten Stand. Danach misst die Zeile genau EINE Domaene mit IHRER Schrittzeit.
+void Info::lauf_binden(LBM* lbm, const ulong total_steps) {
+	allow_printing.lock();
+	this->lbm = lbm;
+	this->steps = total_steps;
+	this->steps_last = lbm->get_t();
+	this->runtime_lbm = 0.0;
+	this->runtime_lbm_timestep_smooth = 1.0;
+	this->runtime_lbm_timestep_last = 1.0;
+	this->runtime_total = 0.0;
+	this->runtime_total_last = 0.0;
+	clock.start();
+	allow_printing.unlock();
+}
 double Info::time() const { // returns either elapsed time or remaining time
 	if(lbm==nullptr) return 0.0;
 	return steps==max_ulong ? runtime_total : ((double)steps/(double)max(lbm->get_t()-steps_last, 1ull)-1.0)*(runtime_total-runtime_total_last); // time estimation on average so far
@@ -120,7 +138,7 @@ void Info::print_update() const {
 	info.allow_printing.lock();
 	reprint(
 		"|"+alignr(8, to_uint((double)lbm->get_N()*1E-6/runtime_lbm_timestep_smooth))+" |"+ // MLUPs
-		alignr(7, to_uint((double)lbm->get_N()*(double)(bandwidth_bytes_per_cell_device()-(lbm->lbm_domain[0]->rho_rand_on ? (uint)sizeof(rhoxx) : 0u))*1E-9/runtime_lbm_timestep_smooth))+" GB/s |"+ // memory bandwidth
+		alignr(7, to_uint((double)lbm->get_N()*(double)bpz_konv(*lbm)*1E-9/runtime_lbm_timestep_smooth))+" GB/s |"+ // memory bandwidth (★ 03.10.2026 bpz_konv = Upstream-Konvention, keine Messung)
 		alignr(10, to_uint(1.0/runtime_lbm_timestep_smooth))+" | "+ // steps/s
 		(steps==max_ulong ? alignr(17, lbm->get_t()) : alignr(12, lbm->get_t())+" "+print_percentage((float)(lbm->get_t()-steps_last)/(float)steps))+" | "+ // current step
 		alignr(19, print_time(time()))+" |" // either elapsed time or remaining time

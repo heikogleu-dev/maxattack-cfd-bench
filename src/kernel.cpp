@@ -52,6 +52,27 @@ string opencl_c_container() { return R( // ########################## begin of O
 	const float x1=p.x, y1=p.y, z1=p.z, x0=1.0f-x1, y0=1.0f-y1, z0=1.0f-z1; // calculate interpolation factors
 	return (x0*y0*z0)*v[0]+(x1*y0*z0)*v[1]+(x1*y0*z1)*v[2]+(x0*y0*z1)*v[3]+(x0*y1*z0)*v[4]+(x1*y1*z0)*v[5]+(x1*y1*z1)*v[6]+(x0*y1*z1)*v[7]; // perform trilinear interpolation
 }
+)+"#ifdef FLAGS4"+R(
+)+R(uchar fl(const global uchar* flags, const uxx n) { // ★ 05.10.2026 FLAGS4 F3 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md C.1/C.4): EINZIGE Lesestelle der Zellflags; Zelle n in Byte n>>1, Nibble n&1 (gerade Zelle unten), dec(c) = (c&0x03)|((c&0x0C)<<4)
+	const uint b = (uint)flags[n>>1];
+	const uint c = ((uint)n&1u) ? (b>>4) : (b&0x0Fu); // ★ 05.10.2026 F3b: Auswahl statt variabler Verschiebung (b>>((n&1)<<2)) -- die kostete auf der B70 1984 B Register-Spill in stream_collide (Nahfeld -9 % MLUPS, ocloc offline bestaetigt; diese Form: 0 B)
+	return (uchar)((c&0x03u)|((c&0x0Cu)<<4));
+}
+)+R(void st_fl(global uchar* flags, const uxx n, const uchar v) { // ★ FLAGS4 F3: EINZIGE Schreibstelle; zwei Zellen teilen ein Byte, acht ein uint-Wort -- deshalb atomar auf dem Wort, jede Zelle fasst nur ihr eigenes Nibble an
+	volatile global uint* w = (volatile global uint*)flags+(n>>3);
+	const uint s = ((uint)n&7u)<<2;
+	const uint c = ((uint)v&0x03u)|(((uint)v>>4)&0x0Cu);
+	atomic_and(w, ~(0x0Fu<<s));
+	atomic_or(w, c<<s);
+}
+)+"#else"+R( // FLAGS4
+)+R(uchar fl(const global uchar* flags, const uxx n) { // ★ 05.10.2026 FLAGS4 F1: EINZIGE Lesestelle der Zellflags im kompilierten Code; ein Byte je Zelle (wie bisher)
+	return flags[n];
+}
+)+R(void st_fl(global uchar* flags, const uxx n, const uchar v) { // ★ 05.10.2026 FLAGS4 F2: EINZIGE Schreibstelle der Zellflags im kompilierten Code; ein Byte je Zelle (wie bisher)
+	flags[n] = v;
+}
+)+"#endif"+R( // FLAGS4
 
 
 
@@ -838,6 +859,64 @@ string opencl_c_container() { return R( // ########################## begin of O
 	return (uxx)def_RR_N;
 }
 )+"#endif"+R( // RHO_RAND
+)+"#ifdef U_RAND"+R(
+// ★ 04.10.2026 U_RAND (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.4): u liegt KOMPAKT im u-Puffer selbst -- vorn ein Kopf aus uint-Woertern
+// (URK_*, Belegung in lbm.hpp namespace ur_k, einzige Quelle), danach je Komponente US Slots: R1 | A | V (Ausgabe) | Papierkorb.
+// (★ 05.10.2026 Korrektur C-N8: Segment C ist entfallen, die N2F-Bloecke liegen in A -- hier stand "R1 | A | C | V".)
+// Weil der Kopf im Puffer liegt, braucht KEIN Kernel fuer den Pufferzugriff einen neuen Parameter (Werkzeugfalle 4). Die Papierkorb-
+// Zaehler (Slot 484) brauchen dagegen den Zaehlerpuffer: schale_extract, apply_pressure_outlet, fac_nachbar_ab und sgs_fdwand ohne SISM
+// haben ihn seit 05.10.2026 (Korrektur A-M1/C-M1) als eigenen Parameter.
+// Vorrang R1 > A > Papierkorb. Die Helfer stehen hier, hinter coordinates() und VOR jedem Aufrufer (C99, Werkzeugfalle 23).
+// Der Pufferparameter heisst bewusst ub und nicht u: der u-Typ-Zensus (lbm.cpp) zaehlt "global velxx* u" wortgenau, Soll 21 (★ C-N8: hier stand 20).
+)+R(uint ur_k(const global velxx* ub, const uint w) { // Kopfwort w
+	return ((const global uint*)ub)[w];
+}
+)+R(uxx ur_r1(const uxx n, const uint3 c) { // R1-Index, ausdrucksgleich zu rr_idx (RHO_RAND) und rr_idx_host; NUR fuer Zellen in R1
+	const uxx a = (uxx)def_Nx*(uxx)def_Ny;
+	if(c.z<2u) return n;
+	if(c.z+2u>=def_Nz) return 2u*a+(n-(uxx)(def_Nz-2u)*a);
+	const uxx r0 = 4u*a+(uxx)(c.z-2u)*(uxx)(4u*def_Nx+4u*(def_Ny-4u));
+	if(c.y<2u) return r0+(uxx)c.x+(uxx)c.y*(uxx)def_Nx;
+	if(c.y+2u>=def_Ny) return r0+2u*(uxx)def_Nx+(uxx)c.x+(uxx)(c.y+2u-def_Ny)*(uxx)def_Nx;
+	if(c.x<2u) return r0+4u*(uxx)def_Nx+4u*(uxx)(c.y-2u)+(uxx)c.x;
+	return r0+4u*(uxx)def_Nx+4u*(uxx)(c.y-2u)+(uxx)(c.x+4u-def_Nx);
+}
+)+R(uxx ur_idx(const global velxx* ub, const uxx n) { // Zelle -> Slot (R1, sonst A); ohne Slot der Papierkorb. Die N2F-Bloecke liegen in A (Bauabweichung, kein Segment C)
+	const uint3 c = coordinates(n);
+	if(c.x<2u||c.x+2u>=def_Nx||c.y<2u||c.y+2u>=def_Ny||c.z<2u||c.z+2u>=def_Nz) return ur_r1(n, c);
+	const global uint* k = (const global uint*)ub;
+	const uint ax = c.x-k[URK_AX0];
+	const uint ay = c.y-k[URK_AY0];
+	const uint az = c.z-k[URK_AZ0];
+	if(ax<k[URK_ANX]&&ay<k[URK_ANY]&&az<k[URK_ANZ]) {
+		const uint b = ax+(ay+az*k[URK_ANY])*k[URK_ANX];
+		if(k[URK_AMASK]==0u) return (uxx)k[URK_R1N]+(uxx)b;
+		const uint mo = k[URK_AMOFF]+2u*(b>>5);
+		const uint m = k[mo];
+		const uint bit = b&31u;
+		if(((m>>bit)&1u)!=0u) return (uxx)k[URK_R1N]+(uxx)(k[mo+1u]+popcount(m&((1u<<bit)-1u)));
+	}
+	return (uxx)k[URK_P];
+}
+)+R(ulong ur_o(const global velxx* ub, const uint kk) { // Datenbeginn der Komponente kk, in velxx-Woertern
+	return (ulong)ur_k(ub, URK_DOFF)+(ulong)kk*(ulong)ur_k(ub, URK_US);
+}
+)+R(float ur_ld(const global velxx* ub, const uxx s, const uint kk) { // Komponente kk am Slot s
+	return load_u(ub, ur_o(ub, kk)+(ulong)s);
+}
+)+R(void ur_st3(global velxx* ub, const uxx s, const float3 v) { // drei Komponenten an Slot s
+	const ulong o = (ulong)ur_k(ub, URK_DOFF);
+	const ulong us = (ulong)ur_k(ub, URK_US);
+	store_u(ub, o+(ulong)s, v.x);
+	store_u(ub, o+us+(ulong)s, v.y);
+	store_u(ub, o+2ul*us+(ulong)s, v.z);
+}
+)+R(float ur_ld_init(const global velxx* ub, const uxx n, const uint kk, const uchar flagsn) { // initialize: ungespeicherte Zelle liest die Init-Regel (Plan B.5)
+	const uxx s = ur_idx(ub, n);
+	if(s<(uxx)ur_k(ub, URK_P)) return ur_ld(ub, s, kk);
+	return load_u(ub, (ulong)(UR_REGEL_VX+((flagsn&TYPE_BO)==TYPE_S ? 3u : 0u)+kk));
+}
+)+"#endif"+R( // U_RAND
 )+R(float3 position(const uint3 xyz) { // 3D coordinates to 3D position
 	return (float3)((float)xyz.x+0.5f-0.5f*(float)def_Nx, (float)xyz.y+0.5f-0.5f*(float)def_Ny, (float)xyz.z+0.5f-0.5f*(float)def_Nz);
 }
@@ -1277,14 +1356,37 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 )+"#endif"+R( // VOLUME_FORCE
 
 )+"#ifdef MOVING_BOUNDARIES"+R(
+)+"#ifdef U_RAND"+R(
+// ★ 04.10.2026 U_RAND: gleiche Signatur, gleicher Ausdruck je Link -- nur der Index des Solidnachbarn geht ueber ur_idx (Kopf im Puffer).
+// Die Lesemenge (alle Solidnachbarn einer TYPE_MS-Zelle) ist im U-Zensus Teil von E bzw. R1 (pruefe_u_rand_c0, Leser "ms_solidnb").
+// ★ 05.10.2026 Korrektur A-M1/C-M1: KEIN Laufzeitzaehler hier. Eine Fassung mit Papierkorb-Zaehlung (Rueckgabe -> Flag -> Atomic im
+// U_RAND-Schreibblock) kostete stream_collide auf der iGPU 1600 B Spill (offline ocloc 0x7d67, 05.10.; ohne: 0 B). Die Lesemenge ist nach
+// initialize STATISCH (TYPE_MS aendert sich unter U_RAND nicht mehr: update_moving_boundaries und bewegte Voxelisierung sind gesperrt,
+// C-M2) -- deshalb prueft der Host sie einmal gegen die Geraete-Flags nach initialize (berichte_u_rand, "MS-Solidnachbarn ohne Slot").
+)+R(void apply_moving_boundaries(float* fhn, const uxx* j, const global velxx* u, const global uchar* flags) { // apply Dirichlet velocity boundaries if necessary (Krueger p.180, rho_solid=1)
+	uxx ji; // reads velocities of only neighboring boundary cells, which do not change during simulation
+	const ulong o0 = ur_o(u, 0u);
+	const ulong o1 = ur_o(u, 1u);
+	const ulong o2 = ur_o(u, 2u);
+	// Ausrollen ERZWINGEN: mit dem eingebetteten ur_idx waechst der Rumpf ueber IGCs Unroll-Budget, j[] wuerde laufzeitindiziert und
+	// speicherheimisch (Werkzeugfalle 10, offline gemessen 04.10.: stream_collide private 3648/7296 B ohne Hinweis). 9 = (19-1)/2 (D3Q27: 13).
+	__attribute__((opencl_unroll_hint(13)))
+	for(uint i=1u; i<def_velocity_set; i+=2u) { // loop is entirely unrolled by compiler, no unnecessary memory access is happening
+		const float w6 = -6.0f*w(i); // w6 = -2*w_i*rho_wall/c^2, w(i) = w(i+1) if i is odd, rho_wall is assumed as rho_avg=1 (necessary choice to assure mass conservation)
+		if((fl(flags, j[i+1u])&TYPE_BO)==TYPE_S) { ji = (uxx)ur_idx(u, j[i+1u]); fhn[i   ] = fma(w6, c(i+1u)*load_u(u, o0+(ulong)ji)+c(def_velocity_set+i+1u)*load_u(u, o1+(ulong)ji)+c(2u*def_velocity_set+i+1u)*load_u(u, o2+(ulong)ji), fhn[i   ]); } // boundary
+		if((fl(flags, j[i   ])&TYPE_BO)==TYPE_S) { ji = (uxx)ur_idx(u, j[i   ]); fhn[i+1u] = fma(w6, c(i   )*load_u(u, o0+(ulong)ji)+c(def_velocity_set+i   )*load_u(u, o1+(ulong)ji)+c(2u*def_velocity_set+i   )*load_u(u, o2+(ulong)ji), fhn[i+1u]); }
+	}
+} // apply_moving_boundaries()
+)+"#else"+R( // U_RAND
 )+R(void apply_moving_boundaries(float* fhn, const uxx* j, const global velxx* u, const global uchar* flags) { // apply Dirichlet velocity boundaries if necessary (Krueger p.180, rho_solid=1)
 	uxx ji; // reads velocities of only neighboring boundary cells, which do not change during simulation
 	for(uint i=1u; i<def_velocity_set; i+=2u) { // loop is entirely unrolled by compiler, no unnecessary memory access is happening
 		const float w6 = -6.0f*w(i); // w6 = -2*w_i*rho_wall/c^2, w(i) = w(i+1) if i is odd, rho_wall is assumed as rho_avg=1 (necessary choice to assure mass conservation)
-		ji = j[i+1u]; fhn[i   ] = (flags[ji]&TYPE_BO)==TYPE_S ? fma(w6, c(i+1u)*load_u(u, ji)+c(def_velocity_set+i+1u)*load_u(u, def_N+(ulong)ji)+c(2u*def_velocity_set+i+1u)*load_u(u, 2ul*def_N+(ulong)ji), fhn[i   ]) : fhn[i   ]; // boundary : regular
-		ji = j[i   ]; fhn[i+1u] = (flags[ji]&TYPE_BO)==TYPE_S ? fma(w6, c(i   )*load_u(u, ji)+c(def_velocity_set+i   )*load_u(u, def_N+(ulong)ji)+c(2u*def_velocity_set+i   )*load_u(u, 2ul*def_N+(ulong)ji), fhn[i+1u]) : fhn[i+1u];
+		ji = j[i+1u]; fhn[i   ] = (fl(flags, ji)&TYPE_BO)==TYPE_S ? fma(w6, c(i+1u)*load_u(u, ji)+c(def_velocity_set+i+1u)*load_u(u, def_N+(ulong)ji)+c(2u*def_velocity_set+i+1u)*load_u(u, 2ul*def_N+(ulong)ji), fhn[i   ]) : fhn[i   ]; // boundary : regular
+		ji = j[i   ]; fhn[i+1u] = (fl(flags, ji)&TYPE_BO)==TYPE_S ? fma(w6, c(i   )*load_u(u, ji)+c(def_velocity_set+i   )*load_u(u, def_N+(ulong)ji)+c(2u*def_velocity_set+i   )*load_u(u, 2ul*def_N+(ulong)ji), fhn[i+1u]) : fhn[i+1u];
 	}
 } // apply_moving_boundaries()
+)+"#endif"+R( // U_RAND
 )+"#endif"+R( // MOVING_BOUNDARIES
 
 )+"#ifdef SURFACE"+R(
@@ -1536,6 +1638,37 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 	}
 )+"#endif"+R( // SPARSE_TILES
 }
+)+"#ifdef ZELLBASEN"+R(
+// ★ 05.10.2026 BYTE-ZELLBASEN (CFD_ZELLBASEN, Vorgabe 1; PLAN-ZELLBASEN-2026-10-05.md, Messarm 6 aus TILING-AUFHOLEN-2026-10-05.md):
+// nur stream_collide. Je Zelle EINMAL cb = sizeof(fpxx)*j (uint), je fi-Zugriff nur noch Richtungsversatz (JIT-Konstante) + cb, also
+// eine 64-Bit-Addition statt mov/add.q/shl.q/add.q in index_f. Dieselben Byteadressen wie index_f -> bitgleich, solange
+// sizeof(fpxx)*N < 2^32 (Host-Sperre lbm.cpp, sonst kein Define). Host emittiert ZELLBASEN nur fuer D3Q19 ohne SPARSE_TILES.
+// cb[0] = eigene Zelle, cb[(i+1)/2] = Nachbar j[i] (i ungerade) -- die Esoteric-Pull-Zugriffe von load_f/store_f in derselben Reihenfolge.
+float zb_ld(const global fpxx* fi, const ulong dofs, const uint cb) {
+	return load((const global fpxx*)((const global uchar*)fi+dofs+(ulong)cb), 0u);
+}
+void zb_st(global fpxx* fi, const ulong dofs, const uint cb, const float v) {
+	store((global fpxx*)((global uchar*)fi+dofs+(ulong)cb), 0u, v);
+}
+void zb_basen(const uxx* j, uint* cb) { // j[0] = n (neighbors() setzt j[0] = n)
+	cb[0] = (uint)sizeof(fpxx)*(uint)j[0];
+	for(uint i=1u; i<def_velocity_set; i+=2u) cb[(i+1u)/2u] = (uint)sizeof(fpxx)*(uint)j[i];
+}
+void load_f_zb(float* fhn, const global fpxx* fi, const ulong t, const uint* cb) { // wie load_f (dichter Pfad)
+	fhn[0] = zb_ld(fi, 0ul, cb[0]); // Esoteric-Pull
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		fhn[i   ] = zb_ld(fi, (ulong)sizeof(fpxx)*(ulong)(t%2ul ? i    : i+1u)*(ulong)def_N, cb[0]);
+		fhn[i+1u] = zb_ld(fi, (ulong)sizeof(fpxx)*(ulong)(t%2ul ? i+1u : i   )*(ulong)def_N, cb[(i+1u)/2u]);
+	}
+}
+void store_f_zb(const float* fhn, global fpxx* fi, const ulong t, const uint* cb) { // wie store_f (dichter Pfad)
+	zb_st(fi, 0ul, cb[0], fhn[0]); // Esoteric-Pull
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		zb_st(fi, (ulong)sizeof(fpxx)*(ulong)(t%2ul ? i+1u : i   )*(ulong)def_N, cb[(i+1u)/2u], fhn[i   ]);
+		zb_st(fi, (ulong)sizeof(fpxx)*(ulong)(t%2ul ? i    : i+1u)*(ulong)def_N, cb[0], fhn[i+1u]);
+	}
+}
+)+"#endif"+R( // ZELLBASEN
 
 )+"#ifdef SURFACE"+R(
 )+R(void load_f_outgoing(const uxx n, float* fon, const global fpxx* fi, const uxx* j, const ulong t) { // load outgoing DDFs, even: 1:1 like stream-out odd, odd: 1:1 like stream-out even
@@ -1571,33 +1704,65 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 	// die Daten einer echten aktiven Tile. Genau daran ist der erste T=8-Lauf divergiert (Cd 18.4).
 	if(is_dead_tile(n, tile_slot)) return;
 )+"#endif"+R(
-	uchar flagsn = flags[n];
+	uchar flagsn = fl(flags, n);
 	const uchar flagsn_bo = flagsn&TYPE_BO; // extract boundary flags
 	uxx j[def_velocity_set]; // neighbor indices
 	neighbors(n, j); // calculate neighbor indices
 	uchar flagsj[def_velocity_set]; // cache neighbor flags for multiple readings
-	for(uint i=1u; i<def_velocity_set; i++) flagsj[i] = flags[j[i]];
+	for(uint i=1u; i<def_velocity_set; i++) flagsj[i] = fl(flags, j[i]);
 	if(flagsn_bo==TYPE_S) { // cell is solid
 		bool TYPE_ONLY_S = true; // has only solid neighbors
 		for(uint i=1u; i<def_velocity_set; i++) TYPE_ONLY_S = TYPE_ONLY_S&&(flagsj[i]&TYPE_BO)==TYPE_S;
+)+"#ifdef U_RAND"+R(
+		if(TYPE_ONLY_S) { const uxx us_ = ur_idx(u, n); if(us_<(uxx)ur_k(u, URK_P)) ur_st3(u, us_, (float3)(0.0f, 0.0f, 0.0f)); } // ★ 04.10.2026 U_RAND: nur gespeicherte Zellen; ungespeicherte Solids tragen per Init-Regel ohnehin 0
+)+"#else"+R( // U_RAND
 		if(TYPE_ONLY_S) store3_u(u, n, (float3)(0.0f, 0.0f, 0.0f)); // reset velocity for solid lattice points with only boundary neighbors
+)+"#endif"+R( // U_RAND
 )+"#ifndef MOVING_BOUNDARIES"+R(
 		if(flagsn_bo==TYPE_S) store3_u(u, n, (float3)(0.0f, 0.0f, 0.0f)); // reset velocity for all solid lattice points
 )+"#else"+R( // MOVING_BOUNDARIES
 	} else if(flagsn_bo!=TYPE_E) { // local lattice point is not solid and not equilibrium boundary
 		bool next_to_moving_boundary = false;
+)+"#ifdef U_RAND"+R(
+		__attribute__((opencl_unroll_hint(26))) // ★ 04.10.2026 U_RAND: Ausrollen erzwingen (Werkzeugfalle 10, offline gemessen: initialize private 320 B ohne Hinweis)
+		for(uint i=1u; i<def_velocity_set; i++) {
+			if((flagsj[i]&TYPE_BO)==TYPE_S) { // Speicher oder Init-Regel; Wert nur an Solidnachbarn gebraucht (dieselbe Kurzschlusslogik wie unten)
+				const uxx sj_ = ur_idx(u, j[i]);
+				const bool gesp_ = sj_<(uxx)ur_k(u, URK_P);
+				const float ax_ = gesp_ ? ur_ld(u, sj_, 0u) : load_u(u, (ulong)(UR_REGEL_VX+3u));
+				const float ay_ = gesp_ ? ur_ld(u, sj_, 1u) : load_u(u, (ulong)(UR_REGEL_VX+4u));
+				const float az_ = gesp_ ? ur_ld(u, sj_, 2u) : load_u(u, (ulong)(UR_REGEL_VX+5u));
+				next_to_moving_boundary = next_to_moving_boundary||(ax_!=0.0f||ay_!=0.0f||az_!=0.0f);
+			}
+		}
+)+"#else"+R( // U_RAND
 		for(uint i=1u; i<def_velocity_set; i++) {
 			next_to_moving_boundary = next_to_moving_boundary||((flagsj[i]&TYPE_BO)==TYPE_S&&(load_u(u, j[i])!=0.0f||load_u(u, def_N+(ulong)j[i])!=0.0f||load_u(u, 2ul*def_N+(ulong)j[i])!=0.0f));
 		}
-		flags[n] = flagsn = next_to_moving_boundary ? flagsn|TYPE_MS : flagsn&~TYPE_MS; // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+)+"#endif"+R( // U_RAND
+		flagsn = next_to_moving_boundary ? flagsn|TYPE_MS : flagsn&~TYPE_MS; // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+		st_fl(flags, n, flagsn); // ★ 05.10.2026 FLAGS4 F2: eine Zuweisung je Zeile (vorher flags[n] = flagsn = ...)
 )+"#endif"+R( // MOVING_BOUNDARIES
 	}
 	float feq[def_velocity_set]; // f_equilibrium
+)+"#ifdef U_RAND"+R(
+	// ★ 04.10.2026 U_RAND: u der eigenen Zelle aus dem Speicher oder der Init-Regel (ungespeicherte Zelle). Die Regel ist das gepackte Wort,
+	// das der Host vor dem Upload an jeder ungespeicherten Zelle verlangt (Init-Waechter) -- also exakt das Wort, das der Vollpuffer truege.
+	const float uxi_ = ur_ld_init(u, n, 0u, flagsn);
+	const float uyi_ = ur_ld_init(u, n, 1u, flagsn);
+	const float uzi_ = ur_ld_init(u, n, 2u, flagsn);
+)+"#ifdef RHO_RAND"+R(
+	{ const uxx rr_ = rr_idx(n); calculate_f_eq(rr_<(uxx)def_RR_N ? load_rho(rho, rr_) : 1.0f, uxi_, uyi_, uzi_, feq); }
+)+"#else"+R(
+	calculate_f_eq(load_rho(rho, n), uxi_, uyi_, uzi_, feq);
+)+"#endif"+R( // RHO_RAND
+)+"#else"+R( // U_RAND
 )+"#ifdef RHO_RAND"+R(
 	{ const uxx rr_ = rr_idx(n); calculate_f_eq(rr_<(uxx)def_RR_N ? load_rho(rho, rr_) : 1.0f, load_u(u, n), load_u(u, def_N+(ulong)n), load_u(u, 2ul*def_N+(ulong)n), feq); } // ★ C2b: innen 1,0 = Saat rho_pack(1)
 )+"#else"+R(
 	calculate_f_eq(load_rho(rho, n), load_u(u, n), load_u(u, def_N+(ulong)n), load_u(u, 2ul*def_N+(ulong)n), feq);
 )+"#endif"+R( // RHO_RAND
+)+"#endif"+R( // U_RAND
 )+"#ifdef SURFACE"+R( // automatically generate the interface layer between fluid and gas
 	{ // separate block to avoid variable name conflicts
 		float phin = phi[n];
@@ -1647,18 +1812,22 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 )+R(kernel void update_moving_boundaries(const global velxx* u, global uchar* flags) { // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute update_moving_boundaries() on halo
-	const uchar flagsn = flags[n];
+	const uchar flagsn = fl(flags, n);
 	const uchar flagsn_bo = flagsn&TYPE_BO; // extract boundary flags
 	uxx j[def_velocity_set]; // neighbor indices
 	neighbors(n, j); // calculate neighbor indices
 	uchar flagsj[def_velocity_set]; // cache neighbor flags for multiple readings
-	for(uint i=1u; i<def_velocity_set; i++) flagsj[i] = flags[j[i]];
+	for(uint i=1u; i<def_velocity_set; i++) flagsj[i] = fl(flags, j[i]);
 	if(flagsn_bo!=TYPE_S&&flagsn_bo!=TYPE_E&&!(flagsn&TYPE_T)) { // local lattice point is not solid and not equilibrium boundary and not temperature boundary
 		bool next_to_moving_boundary = false;
 		for(uint i=1u; i<def_velocity_set; i++) {
+)+"#ifdef U_RAND"+R(
+			{ const uxx sj_ = ur_idx(u, j[i]); next_to_moving_boundary = next_to_moving_boundary||((ur_ld(u, sj_, 0u)!=0.0f||ur_ld(u, sj_, 1u)!=0.0f||ur_ld(u, sj_, 2u)!=0.0f)&&(flagsj[i]&TYPE_BO)==TYPE_S); } // ★ 04.10.2026 U_RAND. ★ 05.10.2026 C-M2/C-N9: TOTER CODE unter U_RAND -- LBM::update_moving_boundaries bricht unter U_RAND hart ab (der Papierkorb liest ungespeicherte Solids als 0)
+)+"#else"+R( // U_RAND
 			next_to_moving_boundary = next_to_moving_boundary||((load_u(u, j[i])!=0.0f||load_u(u, def_N+(ulong)j[i])!=0.0f||load_u(u, 2ul*def_N+(ulong)j[i])!=0.0f)&&(flagsj[i]&TYPE_BO)==TYPE_S);
+)+"#endif"+R( // U_RAND
 		}
-		flags[n] = next_to_moving_boundary ? flagsn|TYPE_MS : flagsn&~TYPE_MS; // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+		st_fl(flags, n, (uchar)(next_to_moving_boundary ? flagsn|TYPE_MS : flagsn&~TYPE_MS)); // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
 	}
 } // update_moving_boundaries()
 )+"#endif"+R( // MOVING_BOUNDARIES
@@ -1727,6 +1896,78 @@ float wf_spalding_uplus(const float Y) {
 	return fmin(100.0f, exp(x));
 )+"#endif"+R( // SPALDING_TAB
 } // wf_spalding_uplus()
+)+"#ifdef FAC_REKPI"+R(
+// ★★ 03.10.2026 REK-PI (PLAN-REK-PI.md §2): Spalding VORWAERTS invertiert -- zu gegebenem y+ das u+,
+// dazu D' = dy+/du+ = 1 + e^(-kappa B) kappa (e^(kappa u+) - 1 - kappa u+ - (kappa u+)^2/2). D' ist
+// (nu + nu_t)/nu der Gleichgewichtsschicht (konstante Schubspannung: du+/dy+ = 1/D'), also das nu_eff
+// der Facettenzelle. Konstanten WORTGLEICH zu wf_spalding_uplus (kappa 0,41, e^(-kappa B) 0,104874 mit
+// B = 5,5 -- Befund B5: NICHT 5,2 aus r1q_marken_merkmale.py).
+// Log-Newton wie wf_spalding_uplus, Start min(y+, ln(1+y+)/kappa + B) (viskose Unterschicht bzw.
+// Logschicht). ITERATIONSZAHL 4 IST GEMESSEN, kein Stellknopf: float32 gegen double-Bisektion ueber
+// y+ 1e-2..3e4 (400 Punkte, 03.10.): max |u+/u+_ref - 1| nach 1/2/3/4 Iterationen 4,9e-2 / 2,2e-3 /
+// 3,6e-6 / 9,5e-7 (float-Boden). X <= 100 wie oben (exp-Sicherheit unter -cl-finite-math-only).
+// Aufrufer steht weiter unten (C99, Werkzeugfalle 23).
+float2 rekpi_uplus(const float yp) {
+	const float kap = 0.41f;
+	const float emkB = 0.104874f;
+	const float ypc = fmax(yp, 1e-12f);
+	float x = log(fmax(fmin(ypc, fma(2.4390244f, log(1.0f+ypc), 5.5f)), 1e-12f));
+	for(uint it=0u; it<4u; it++) {
+		const float X = fmin(100.0f, exp(x));
+		const float kX = kap*X;
+		const float ekX = exp(kX);
+		const float S = X + emkB*(ekX-1.0f-kX-0.5f*kX*kX-0.16666667f*kX*kX*kX);
+		const float Sp = 1.0f + emkB*kap*(ekX-1.0f-kX-0.5f*kX*kX);
+		x -= (log(fmax(S, 1e-30f))-log(ypc))*S/(X*Sp);
+	}
+	const float Xe = fmin(100.0f, exp(x));
+	const float kXe = kap*Xe;
+	const float Spe = 1.0f + emkB*kap*(exp(kXe)-1.0f-kXe-0.5f*kXe*kXe);
+	return (float2)(Xe, Spe);
+} // rekpi_uplus()
+)+"#ifdef FAC_REKPI_AN"+R(
+// ★★ 04.10.2026 REK-PI NETTO-IMPULSFLUSS (Pruefbefund NEU, Nachweis fuer H1). Halbraummoment
+//   T_halb = Sum_i (c_i.n)(c_i.e) f_i  ueber c_i.n > 0 (aus = true) bzw. c_i.n < 0 (aus = false).
+// Mit den POST-Kollisions-f der Zelle (aus, Schritt t) plus den im Folgeschritt EINLAUFENDEN f von der
+// Fluidseite (ein, Schritt t+1) ist das exakt der diskrete Tangentialimpulsfluss (e-Impuls in +n), den die
+// Zelle ueber ihre fluidseitigen Links austauscht -- Soll -rho u_tau^2 (n ins Fluid).
+// Paarform D3Q19 wie im Pi-Tausch: Paar (p, -p) traegt fuer beide Glieder dasselbe (c.n)(c.e) = s q; von
+// beiden zaehlt das Glied mit c.n > 0 (aus) bzw. c.n < 0 (ein). Die Gewichtsverschiebung f^ = f - w_i faellt
+// heraus: Sum_Paare w s q = 1/2 c_s^2 (n.e) = 0 fuer e senkrecht n. Keine Schleife, kein Laufzeitindex.
+// Aufrufer stehen weiter unten (C99, Werkzeugfalle 23).
+float rekpi_halbfluss(const float* f, const float nx, const float ny, const float nz, const float ex, const float ey, const float ez, const bool aus) {
+	float T = 0.0f;
+	float s = nx;
+	float q = ex;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[1] : f[2], T);
+	s = ny;
+	q = ey;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[3] : f[4], T);
+	s = nz;
+	q = ez;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[5] : f[6], T);
+	s = nx+ny;
+	q = ex+ey;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[7] : f[8], T);
+	s = nx+nz;
+	q = ex+ez;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[9] : f[10], T);
+	s = ny+nz;
+	q = ey+ez;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[11] : f[12], T);
+	s = nx-ny;
+	q = ex-ey;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[13] : f[14], T);
+	s = nx-nz;
+	q = ex-ez;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[15] : f[16], T);
+	s = ny-nz;
+	q = ey-ez;
+	T = fma(s*q, ((s>0.0f)==aus) ? f[17] : f[18], T);
+	return T;
+} // rekpi_halbfluss()
+)+"#endif"+R( // FAC_REKPI_AN
+)+"#endif"+R( // FAC_REKPI
 )+"#endif"+R( // WANDFUNKTION||FACETTEN
 )+"#ifdef WANDFUNKTION"+R(
 void apply_wall_function(float* fhn, const uxx* j, const global uchar* flags, global uint* wf_hits, const ulong t, const bool zaehle) {
@@ -1742,8 +1983,8 @@ void apply_wall_function(float* fhn, const uxx* j, const global uchar* flags, gl
 	// den BB ADDIERT, doppelzaehlt -- V1s teuerste Fehlerklasse.
 	// Masse: Tausch + antisymmetrisches +- ist exakt erhaltend. Normalimpuls: unberuehrt.
 	// def_wf_tau = 0 ist der Zwischenarm "nur Tausch" (reiner Free-Slip, Schritt 4 des Plans).
-	const bool boden = (flags[j[6]]&TYPE_BO)==TYPE_S; // Solid unter der Zelle (-z)
-	const bool decke = (flags[j[5]]&TYPE_BO)==TYPE_S; // Solid ueber der Zelle (+z)
+	const bool boden = (fl(flags, j[6])&TYPE_BO)==TYPE_S; // Solid unter der Zelle (-z)
+	const bool decke = (fl(flags, j[5])&TYPE_BO)==TYPE_S; // Solid ueber der Zelle (+z)
 	if(!boden&&!decke) return;
 	if(boden&&decke) { if(zaehle&&t%def_zaehl_takt==0ul) atomic_inc(&wf_hits[5]); return; } // Spalt von 1 Zelle: unbehandelt, aber GEZAEHLT
 	float rhon, uxn, uyn, uzn;
@@ -1786,7 +2027,7 @@ void apply_wall_function(float* fhn, const uxx* j, const global uchar* flags, gl
 // Indizes sind an allen Aufrufstellen Literale -- der Uebersetzer inlinet ohne dynamische fhn-Indizierung.
 void fac_paar(float* fhn, const global uchar* flags, const uxx* j, const uint ip, const uint im,
               const uint g1, const uint g2, const float taut, uint* getauscht, float* fkraft) {
-	if(((flags[j[g1]]&TYPE_BO)==TYPE_S)&&((flags[j[g2]]&TYPE_BO)==TYPE_S)) {
+	if(((fl(flags, j[g1])&TYPE_BO)==TYPE_S)&&((fl(flags, j[g2])&TYPE_BO)==TYPE_S)) {
 		const float fp_=fhn[ip]; fhn[ip]=fhn[im]+0.5f*taut; fhn[im]=fp_-0.5f*taut; (*getauscht)++;
 		*fkraft -= taut; // Wandkraft der ANGEWANDTEN Korrektur (Cd-Pfad E5): -tau_t = +def_fac_tau*twe*ut_c/ut
 	}
@@ -1908,7 +2149,7 @@ float3 elibb_rekonstruiere(float* fhn, const uxx* j, const global uchar* flags, 
 	__attribute__((opencl_unroll_hint(18)))
 	for(uint i=1u; i<def_velocity_set; i++) {
 		const uint ib = (i%2u==1u) ? i+1u : i-1u;               // Streaming-Ursprung von fhn[i] ist j[ib]
-		if((flags[j[ib]]&TYPE_BO)!=TYPE_S) continue;             // nur wandstaemmige Links
+		if((fl(flags, j[ib])&TYPE_BO)!=TYPE_S) continue;             // nur wandstaemmige Links
 		const uchar qb = fac_q[18ul*(uxx)fid+(uxx)(ib-1u)];      // q gehoert zum Link ib (Harness B)
 		if(qb==0u) continue;                                     // Ebene schneidet den Link nicht -> implizites BB bleibt
 		if(qb==127u) continue;                                   // q = 0,5: Blende ist Identitaet -- Kurzschluss haelt auch die -0.0-Kante bitgleich
@@ -2159,6 +2400,9 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#ifdef FACETTEN_KDIAG"+R(
                         , global float* fac_kd // ★ Klassen-Diagnostik: 16 float je Facette (u_t, tw, twe, |P1|, s1, phi1, Rueckfall, Besuche, ut_ab, yw_ab, tw_angewandt, besuche_angewandt, [12..15] 05.09. Druckrest A / |A| / Ziel B / Geometrie C, alle nur ueber angewandte Besuche), racefrei (1 Zelle = 1 Facette)
 )+"#endif"+R( // FACETTEN_KDIAG
+)+"#ifdef FAC_REKPI_AN"+R(
+                        , float* rekpi_w // ★ 03.10. REK-PI: privates w_WM = 1/(3 nu_eff + 1/2) an die Kollision (0 = nicht gesetzt; PLAN-REK-PI.md §2, Befund B4)
+)+"#endif"+R( // FAC_REKPI_AN
 )+") {"+R(
 	uxx fbi; if(!f_bbox(n, &fbi)) return (float3)(0.0f,0.0f,0.0f);
 	const uint fid = fac_fid(fac_idx, fbi);
@@ -2205,7 +2449,93 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	// uebersetzte Kernel den Block traegt. Bleibt in #ifdef FAC_REK, der AUS-Arm ist unberuehrt.
 	if(t%def_zaehl_takt==0ul) hits[335] = 0x5245464Bu;
 )+"#endif"+R( // FAC_REK
+)+"#ifdef FAC_REKPI_AN"+R(
+	// ★ 04.10.2026 NETTO-FLUSS-ZAEHLER: der T_aus-Speicher (roff+8) wird an JEDEM Zaehlschritt-Besuch auf "ungueltig"
+	// gesetzt -- VOR dem ut-Tor, damit kein Wert aus einem frueheren Zaehlschritt ueberlebt. stream_collide ueberschreibt
+	// ihn nach der Kollision, wenn die Zelle in DIESEM Schritt gesetzt wurde; gelesen wird er am Schritt danach (Kopf unten).
+	if(t%def_zaehl_takt==0ul) fac_nb[def_nb_stride*(ulong)fid+def_nb_roff+8ul] = -1.0E30f;
+)+"#endif"+R( // FAC_REKPI_AN
 	if(ut<1e-6f) { if(t%def_zaehl_takt==0ul) atomic_inc(&hits[9]); return (float3)(0.0f,0.0f,0.0f); }
+)+"#ifdef FAC_REKPI"+R(
+	// ★★ 03.10.2026 REK-PI, BESTIMMUNG (PLAN-REK-PI.md §2, Befund B2). ALLE Facettenzellen hinter dem ut-Tor,
+	// keine Host-Marke, keine Zone, kein Rang (§5). Referenzpunkt und Wandgesetz kommen aus fac_nachbar_ab des
+	// Vorschritts (Sprungregel; u_tau, u_WM(y_w), nu_eff in roff+5..7 -- dort gerechnet, weil die Rechnung hier
+	// 1408 B Spill auf der B70 kostete). Hier nur noch die SETZUNG:
+	//   du = u_WM t_ref - u_t,l   (VEKTOR: Betrag UND Richtung werden gesetzt, u_n bleibt)
+	// Schranke u_WM < u_t,ref folgt aus yw_ref > y_w (Spalding monoton), keine Klemme noetig.
+	// Unter REKPI=1 (messen) wird hier nur gerechnet und gezaehlt; angewandt wird erst unter FAC_REKPI_AN
+	// (REK-Block unten) -- REKPI=1 ist damit bitgleich zu REKPI=0 (Abnahme ueber den Feld-Hash).
+	// LEBENSDAUER: ueber den Solve hinweg leben nur rekpi_ok und du (drei float bis zum REK-Block); der
+	// Pi-Block hinter der R3-Buchung liest t_ref/u_tau/u_WM/nu_eff NEU aus fac_nb (Spill-Begrenzung).
+	// Slots 440..471 (Legende lbm.cpp), alle an Zaehlschritten und saettigend; 470 am Schritt danach.
+	bool rekpi_ok = false;
+	float rekpi_dux = 0.0f;
+	float rekpi_duy = 0.0f;
+	float rekpi_duz = 0.0f;
+	{
+		const bool rp_zt = (t%def_zaehl_takt==0ul);
+		const ulong rp_q = def_nb_stride*(ulong)fid;
+		const float rp_ut = fac_nb[rp_q+def_nb_roff+4ul];
+		if(rp_zt&&hits[440]<0xF0000000u) atomic_inc(&hits[440]);
+		if(rp_ut>1e-6f) {
+			const float rp_e1x = fac_nb[rp_q+def_nb_roff+0ul];
+			const float rp_e1y = fac_nb[rp_q+def_nb_roff+1ul];
+			const float rp_e1z = fac_nb[rp_q+def_nb_roff+2ul];
+			const float rp_uwm = fac_nb[rp_q+def_nb_roff+6ul];
+			rekpi_dux = fma(rp_uwm, rp_e1x, -utx);
+			rekpi_duy = fma(rp_uwm, rp_e1y, -uty);
+			rekpi_duz = fma(rp_uwm, rp_e1z, -utz);
+			rekpi_ok = true;
+			const float rp_du1 = rekpi_dux*rp_e1x+rekpi_duy*rp_e1y+rekpi_duz*rp_e1z;
+			if(rp_zt) {
+				if(hits[441]<0xF0000000u) atomic_inc(&hits[441]);
+				const float rp_tau = fac_nb[rp_q+def_nb_roff+5ul];
+				const float rp_yw = fac_nb[rp_q+def_nb_roff+3ul];
+				const float rp_ul = utx*rp_e1x+uty*rp_e1y+utz*rp_e1z;
+				const float rp_r = rp_ul/fmax(rp_uwm, 1e-30f);
+				const uint rp_bu = rp_r<0.0f ? 448u : (rp_r<0.5f ? 449u : (rp_r<0.9f ? 450u : (rp_r<1.1f ? 451u : (rp_r<2.0f ? 452u : 453u))));
+				if(hits[rp_bu]<0xF0000000u) atomic_inc(&hits[rp_bu]);
+				if(rp_ul<0.0f&&hits[459]<0xF0000000u) atomic_inc(&hits[459]);
+				if(rp_yw>fac_nb[rp_q+1ul]+0.25f&&hits[461]<0xF0000000u) atomic_inc(&hits[461]);
+				const float rp_ypw = yw*rp_tau*(2.0f*def_fac_Y);
+				const uint rp_by = rp_ypw<5.0f ? 462u : (rp_ypw<30.0f ? 463u : (rp_ypw<300.0f ? 464u : 465u));
+				if(hits[rp_by]<0xF0000000u) atomic_inc(&hits[rp_by]);
+				const float rp_dl = sqrt(fma(rekpi_dux, rekpi_dux, fma(rekpi_duy, rekpi_duy, rekpi_duz*rekpi_duz)));
+				const float rp_qd = rp_dl/fmax(rp_tau*rp_tau, 1e-30f);
+				const uint rp_bd = rp_qd<1.0E2f ? 466u : (rp_qd<1.0E4f ? 467u : 468u);
+				if(hits[rp_bd]<0xF0000000u) atomic_inc(&hits[rp_bd]);
+				if(rp_du1>0.0f&&hits[469]<0xF0000000u) atomic_inc(&hits[469]);
+				// [474] ★ 04.10. H1: nu_s an der molekularen Untergrenze (fac_nachbar_ab klemmt mit DEMSELBEN Ausdruck)
+				if(fac_nb[rp_q+def_nb_roff+7ul]<=0.5f/def_fac_Y&&hits[474]<0xF0000000u) atomic_inc(&hits[474]);
+			}
+			if(t%def_zaehl_takt==1ul&&rp_du1>0.0f&&hits[470]<0xF0000000u) atomic_inc(&hits[470]);
+)+"#ifdef FAC_REKPI_AN"+R(
+			// ★★ 04.10.2026 NETTO-FLUSS-ZAEHLER (Pruefbefund NEU, direkter Nachweis zu H1), am Schritt NACH dem Zaehlschritt:
+			//   T = T_aus(t) [Post-Kollision der gesetzten Zelle, roff+8, geschrieben in stream_collide]
+			//     + T_ein(t+1) [jetzt einlaufende f von der Fluidseite, c.n < 0 -- vor jeder Setzung, nach der ELIBB-Blende]
+			// ist der diskrete Tangentialimpulsfluss ueber die Fluidseite der Zelle im Schritt t. Soll -rho u_tau^2.
+			// Verhaeltnis r = T/(-rho u_tau^2): [475..481] <0 | 0-0,5 | 0,5-0,9 | 0,9-1,1 | 1,1-2 | 2-10 | >=10;
+			// [482] Messbesuche (gesetzt, t%Takt == 1), [483] davon ohne gueltiges T_aus (im Zaehlschritt nicht gesetzt).
+			// Normierung mit rho, u_tau und t_ref dieses Schritts (ein Schritt nach T_aus; quasistationaer gleich).
+			if(t%def_zaehl_takt==1ul) {
+				if(hits[482]<0xF0000000u) atomic_inc(&hits[482]);
+				const float rp_to = fac_nb[rp_q+def_nb_roff+8ul];
+				if(rp_to>-1.0E29f) {
+					const float rp_tf = fac_nb[rp_q+def_nb_roff+5ul];
+					const float rp_ti = rekpi_halbfluss(fhn, nx, ny, nz, rp_e1x, rp_e1y, rp_e1z, false);
+					const float rp_rt = (rp_to+rp_ti)/fmin(-rhon*rp_tf*rp_tf, -1.0E-30f); // Nenner strikt < 0 (u_tau > 0 im gesetzten Zweig; Unterlaufschutz)
+					const uint rp_bt = rp_rt<0.0f ? 475u : (rp_rt<0.5f ? 476u : (rp_rt<0.9f ? 477u : (rp_rt<1.1f ? 478u : (rp_rt<2.0f ? 479u : (rp_rt<10.0f ? 480u : 481u)))));
+					if(hits[rp_bt]<0xF0000000u) atomic_inc(&hits[rp_bt]);
+				} else if(hits[483]<0xF0000000u) atomic_inc(&hits[483]);
+			}
+)+"#endif"+R( // FAC_REKPI_AN
+		} else if(rp_zt) {
+			if(hits[442]<0xF0000000u) atomic_inc(&hits[442]);
+			// [473] ★ 04.10. H1: davon Nenner-Kollaps der Sekante (Referenz vorhanden, u_k1.e1 - u_WM <= 0) -- Solve wie ohne REK-PI
+			if(rp_ut<-1.5f&&hits[473]<0xF0000000u) atomic_inc(&hits[473]);
+		}
+	}
+)+"#endif"+R( // FAC_REKPI
 )+"#ifdef FAC_REK_R3"+R(
 	// ★★ R3 (Entscheid REKONSTRUKTION-PLAN.md §12): wo die statische Marke sitzt, setzt die
 	// Rekonstruktion und der Solve wird uebersprungen -- zwei Aktoren an derselben Zelle sind nicht
@@ -2231,6 +2561,13 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#endif"+R( // FAC_REK_R3
 )+"#ifdef FAC_REK"+R(
 	{
+)+"#ifdef FAC_REKPI_AN"+R(
+		// ★★ 03.10. REK-PI ANWENDEN: die Marke ist "Referenzpunkt gueltig" (Block oben), nicht fac_geo[8i+7] --
+		// es gibt keine Host-Marke. rek_eps traegt |du|: er wird unten NUR noch fuer die Toleranz der
+		// Zielprobe [330] gelesen (PLAN §6 "rtol auf |du|"); du selbst kommt als Vektor aus dem Block oben.
+		const float rek_marke = rekpi_ok ? 1.0f : 0.0f;
+		const float rek_eps = sqrt(fma(rekpi_dux, rekpi_dux, fma(rekpi_duy, rekpi_duy, rekpi_duz*rekpi_duz)));
+)+"#else"+R(
 		const float rek_marke = fac_geo[b+7ul];
 )+"#ifdef FAC_REK_S2"+R(
 		// ★★ STUFE S2 (24.09.2026): die Amplitude ist KEIN Handwert mehr. Sie steht in
@@ -2248,6 +2585,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#else"+R(
 		const float rek_eps = fac_geo[b+6ul];
 )+"#endif"+R( // FAC_REK_S2
+)+"#endif"+R( // FAC_REKPI_AN
 		if(rek_marke>0.5f) {
 			const bool rek_probe = (t%def_zaehl_takt==0ul);
 			const float mxy_vor = rek_probe ? fhn[7]+fhn[8]-fhn[13]-fhn[14] : 0.0f;
@@ -2282,10 +2620,16 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#endif"+R(
 			}
 			if(rek_probe) atomic_inc(&hits[328]);
+)+"#ifdef FAC_REKPI_AN"+R(
+			const float dux = rekpi_dux;
+			const float duy = rekpi_duy;
+			const float duz = rekpi_duz;
+)+"#else"+R(
 			const float rek_inv = 1.0f/ut;
 			const float dux = rek_eps*utx*rek_inv;
 			const float duy = rek_eps*uty*rek_inv;
 			const float duz = rek_eps*utz*rek_inv;
+)+"#endif"+R( // FAC_REKPI_AN
 )+"#ifdef FACETTEN_NACHBAR"+R(
 			// ★★ IMPULS-AKKUMULATOR (23.09.2026, Stufe A2). Summiert den von der Rekonstruktion je Schritt
 			// EINGETRAGENEN x-Impuls rho*du_x, ungegatet (jeder Schritt, nicht nur Zaehlschritte) -- die
@@ -2297,7 +2641,9 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 			// verschwindet identisch, der quadratische Term traegt zum ersten Moment nichts bei).
 			// Racefrei ohne Atomik, weil 1 Zelle = 1 Facette gilt und das in lbm.cpp bewacht ist --
 			// derselbe Grund, aus dem fac_tau_acc nicht-atomar akkumulieren darf.
+)+"#ifndef FAC_REKPI"+R(
 			fac_nb[def_nb_stride*(ulong)fid+def_nb_roff+3ul] += rhon*dux;
+)+"#endif"+R( // FAC_REKPI -- ★ 03.10.: unter REK-PI traegt roff+3 das yw_ref der Sprungregel (fac_nachbar_ab), der Akkumulator entfaellt dort
 )+"#endif"+R( // FACETTEN_NACHBAR
 )+"#ifdef FAC_REK_R3"+R(
 			rek_dux = dux;
@@ -2559,7 +2905,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#endif"+R( // FACETTEN_ALPHA
 	for(uint i=1u; i<def_velocity_set; i++) { // compiler-entrollt, Muster apply_moving_boundaries
 		const uint ib = (i%2u==1u) ? i+1u : i-1u; // Streaming-Ursprung von fhn[i] ist j[opposite(i)]
-		if((flags[j[ib]]&TYPE_BO)!=TYPE_S) continue; // linkweises Gate (schliesst TYPE_E/TYPE_MS aus)
+		if((fl(flags, j[ib])&TYPE_BO)!=TYPE_S) continue; // linkweises Gate (schliesst TYPE_E/TYPE_MS aus)
 		const float cx=c(i), cy=c(def_velocity_set+i), cz=c(2u*def_velocity_set+i);
 		const float wi=w(i);
 		const float ct1=cx*t1x+cy*t1y+cz*t1z, ct2=cx*t2x+cy*t2y+cz*t2z, cn=cx*nx+cy*ny+cz*nz;
@@ -2717,7 +3063,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 			G11=0.0f; G22=0.0f; G12=0.0f; Sn1=0.0f; Sn2=0.0f; P1=0.0f; P2=0.0f;
 			for(uint i2=1u; i2<def_velocity_set; i2++) {
 				const uint ib2 = (i2%2u==1u) ? i2+1u : i2-1u;
-				if((flags[j[ib2]]&TYPE_BO)!=TYPE_S) continue;
+				if((fl(flags, j[ib2])&TYPE_BO)!=TYPE_S) continue;
 				const float cx2=c(i2), cy2=c(def_velocity_set+i2), cz2=c(2u*def_velocity_set+i2);
 				const float wi2=w(i2);
 				const float ct1b=cx2*t1x+cy2*t1y+cz2*t1z, ct2b=cx2*t2x+cy2*t2y+cz2*t2z, cnb=cx2*nx+cy2*ny+cz2*nz;
@@ -3263,7 +3609,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#endif"+R( // FACETTEN_ALPHA
 	if(pass2_an) for(uint i=1u; i<def_velocity_set; i++) { // Pass 2 (pass2_an == !rueckfall ohne KRAFT): q_i = 6 w_i (c_i*u_s) addieren (Gl. 3); Rueckfall: Feld bleibt BITGLEICH BB
 		const uint ib = (i%2u==1u) ? i+1u : i-1u;
-		if((flags[j[ib]]&TYPE_BO)!=TYPE_S) continue;
+		if((fl(flags, j[ib])&TYPE_BO)!=TYPE_S) continue;
 		fhn[i] = fma(6.0f*w(i), c(i)*usx+c(def_velocity_set+i)*usy+c(2u*def_velocity_set+i)*usz, fhn[i]);
 )+"#ifdef FACETTEN_ALPHA"+R(
 )+"#ifndef FACETTEN_MASSE_ALLE"+R(
@@ -3373,7 +3719,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	}
 )+"#endif"+R( // FACETTEN_ELIBB
 )+"#ifdef FAC_R1Q"+R(
-	// ★★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q; Stufen: 1 messen, 2 V_Z = Formel direkt darunter, 3 V_R = (I-M)R, 4 = V_R mit R' = R + A,
+	// ★★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q; Stufen: 1 messen, 2 V_Z = Formel direkt darunter, 3 V_R = (I-M)R, 4 = V_R mit R' = R + A, 5 = wie 4 mit R2' := 0 (03.10., FAC_R1Q_SPALTE1),
 	// siehe #ifdef FAC_R1Q_VR/FAC_R1Q_OHNE_DRUCK im Block). Hier stehen P, Pass 2, phi und fw fest; fhn wird danach
 	// in dieser Funktion nicht mehr gelesen, und die Kollision laeuft im SELBEN Schritt auf u+du.
 	// Ziel Z = (Z1, 0) in (t1, t2), Z1 = -def_fac_tau*twe. Der PINV-Zweig praegt G~*s_Z = Z1*(a^2+b^2, b) auf
@@ -3407,7 +3753,16 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 			// Anlass: V_R (R1Q=3) am Fahrzeug -- Grenzschicht vorn OF13-duenn, aber Abloesung 0,4 m frueher (r1q_f8_vr).
 			const float r1q_ad = 2.0f*(rhon-1.0f);
 			const float r1q_r1 = fma(r1q_ad, S1x*t1x+S1y*t1y+S1z*t1z, R1);
-			const float r1q_r2 = fma(r1q_ad, S1x*t2x+S1y*t2y+S1z*t2z, R2);
+			const float r1q_r2s = fma(r1q_ad, S1x*t2x+S1y*t2y+S1z*t2z, R2);
+)+"#ifdef FAC_R1Q_SPALTE1"+R(
+			// ★ 03.10.2026 R1Q=5 (K2, UNTERBODEN-R1Q-ANALYSE.md): nur SPALTE 1 -- R2' := 0. Ersetzt wird die Laengsspalte P1-A1 -> Z1;
+			// der Quer-BB-Austausch P2 bleibt so, wie die PINV ihn behandelt. Ergebnis wie Stufe 4 auf e_perp, Betrag sqrt(q)*|R1'|.
+			// Stufe 4 trieb bei kleinem q (Laengskanten) vor allem P2 ueber die Spalte R2' ein. r1q_r2s bleibt fuer die Schattendiagnose.
+			// FAC_R1Q_SPALTE1 setzt FAC_R1Q_OHNE_DRUCK voraus (Stufe 5 >= 4, lbm.cpp Kohaerenz); der Diagnoseblock unten liest r1q_r2s.
+			const float r1q_r2 = 0.0f;
+)+"#else"+R(
+			const float r1q_r2 = r1q_r2s;
+)+"#endif"+R( // FAC_R1Q_SPALTE1
 )+"#else"+R(
 			const float r1q_r1 = R1;
 			const float r1q_r2 = R2;
@@ -3434,6 +3789,15 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 				if(r1q_dl>0.5f*ut*1.0001f&&hits[427]<0xF0000000u) atomic_inc(&hits[427]);
 				// ★ 28.09.: unter V_Z ist 427 ein Stolperdraht (Soll 0), unter V_R das TOR -- dieselbe Schranke wie tw_max = 0,5*rho*ut.
 				if(fabs(r1q_dux*nx+r1q_duy*ny+r1q_duz*nz)>1.0E-3f*r1q_dl+1.0E-12f&&hits[431]<0xF0000000u) atomic_inc(&hits[431]);
+)+"#ifdef FAC_R1Q_SPALTE1"+R(
+				const float r1q_m41 = r1q_m1-r1q_b*r1q_r2s;
+				const float r1q_m42 = fma(r1q_a, r1q_r2s, r1q_m2);
+				const float r1q_m4q = fma(r1q_m41, r1q_m41, r1q_m42*r1q_m42);
+				const float r1q_kap = fma(r1q_m1, r1q_m41, r1q_m2*r1q_m42)/fmax(r1q_m4q, 1.0E-30f);
+				const uint r1q_bk = r1q_kap<0.0f ? 0u : (r1q_kap<0.1f ? 1u : (r1q_kap<0.5f ? 2u : (r1q_kap<0.9f ? 3u : (r1q_kap<1.1f ? 4u : 5u))));
+				if(hits[433u+r1q_bk]<0xF0000000u) atomic_inc(&hits[433u+r1q_bk]);
+				if(sqrt(r1q_m4q)*r1q_ir>0.5f*ut*1.0001f&&hits[439]<0xF0000000u) atomic_inc(&hits[439]);
+)+"#endif"+R( // FAC_R1Q_SPALTE1
 			}
 )+"#ifdef FAC_R1Q_AN"+R(
 			if(!(r1q_dl>0.5f*ut*1.0001f)) {
@@ -3579,6 +3943,163 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		if(fabs(rek_dux*nx+rek_duy*ny+rek_duz*nz)>1.0E-3f*rek_dl&&hits[372]<0xF0000000u) atomic_inc(&hits[372]);
 	}
 )+"#endif"+R( // FAC_REK_R3
+)+"#ifdef FAC_REKPI"+R(
+	// ★★ 03.10.2026 REK-PI, Pi-TAUSCH (PLAN-REK-PI.md §2/§3, Befund B3). ORT IST ZWINGEND: hinter der
+	// R3-Buchung, vor fac_tau_acc. Vor der Momentenschleife waere der Tausch in P1/P2 und damit ein ZWEITER
+	// Doppelterm (die Schleife summiert Sum_Wand 2(c.t)f, also auch 2(c.t)Df_Pi). Hier liest niemand mehr
+	// P; die Kollision sieht den getauschten Zustand im SELBEN Schritt, die Wandkraft das P des naechsten.
+	// Getauscht werden NUR die Schubkomponenten in der Basis (e1 = t_ref, e2 = n x e1, n ins Fluid):
+	//   Pi_neq,k = e_k^T M n - rho u'_k u'_n   (M = Sum c c f^; der c_s^2-Anteil faellt mit e_k.n = 0 weg)
+	//   Ziel  Pi_1 = -rho u_tau^2 (1 + 1/(6 nu_eff)) = -tau_w tau_eff/(tau_eff - 1/2),  Pi_2 = 0
+	//   (Chapman-Enskog: Pi_neq = -sigma tau/(tau - 1/2), sigma_tn = +rho u_tau^2 bei n ins Fluid)
+	//   Df_i = 9 w_i (c_i.n)(c_i.a),  a = DPi_1 e1 + DPi_2 e2  (a senkrecht n)
+	// Momente (D3Q19, viertes Moment isotrop): Sum Df = 3 (n.a) = 0, Sum c Df = 0 (paarweise gleich),
+	// Sum c c Df = n a^T + a n^T, also n.E.n = 0 und e_k.E.n = DPi_k -- masse-, impuls-, normalneutral,
+	// geisterfrei, ohne 19er-Array (Paare (1,2) (3,4) ... (17,18) tragen dasselbe Df).
+	// KEINE eigene Buchung: impulsfrei, er wirkt ueber das P des naechsten Schritts, und das wird gebucht.
+	// tau_eff (Befund B4): f_neq traegt mit (tau - 1/2)/tau weiter -- bei tau0 = 0,500028 waere der Tausch
+	// ohne nu_eff wirkungslos. w_WM = 1/(3 nu_eff + 1/2) geht ueber *rekpi_w an die Kollision und ersetzt
+	// dort FDWAND/SISM/Smagorinsky (Zaehler [472]).
+	// tw: unter ANWENDEN steht in fac_tau_acc[6i] (y+-Spiegel, KDIAG) das AUFGEPRAEGTE rho u_tau^2, nicht der
+	// Wert der Spalding-Kette (die tastet an der k=1-Zelle ab und waere an 6 % der Facetten die eigene Ausgabe).
+	// Unter REKPI=1 nur messen: Pi_lok mit u' = u_l, Df gerechnet, nichts angewandt, Proben 443..447/471 = 0.
+	// ★ 04.10.2026 Pruefbefund H1: "nu_eff" (roff+7, hier rekpi_nueff) ist seither nu_s aus der GITTERSEKANTE zum
+	// unmittelbaren Nachbarn (fac_nachbar_ab, Herleitung dort) -- tau_eff UND Pi_WM aus demselben nu_s, damit der
+	// diskrete Fluss -rho nu_s Du/Delta = -rho u_tau^2 ist. Mit nu D' (Punktgradient) blieb rho(gamma_WM - Du)/12 stehen.
+	// REKPI=3 (FAC_REKPI_NUR_U): Setzung ohne Tausch und ohne tau_eff (Ausweichstufe b).
+	if(rekpi_ok) {
+		const bool rp_zt = (t%def_zaehl_takt==0ul);
+		const ulong rp_q = def_nb_stride*(ulong)fid;
+		const float e1x = fac_nb[rp_q+def_nb_roff+0ul];
+		const float e1y = fac_nb[rp_q+def_nb_roff+1ul];
+		const float e1z = fac_nb[rp_q+def_nb_roff+2ul];
+		const float rekpi_utau = fac_nb[rp_q+def_nb_roff+5ul];
+		const float rekpi_uwm = fac_nb[rp_q+def_nb_roff+6ul];
+		const float rekpi_nueff = fac_nb[rp_q+def_nb_roff+7ul];
+		const float e2x = ny*e1z-nz*e1y;
+		const float e2y = nz*e1x-nx*e1z;
+		const float e2z = nx*e1y-ny*e1x;
+		const float rp_un = nx*uxn+ny*uyn+nz*uzn;
+)+"#ifdef FAC_REKPI_AN"+R(
+		// u' = u_n n + u_WM e1 (die Setzung oben, exakt; du steht senkrecht n)
+		const float rp_u1 = rekpi_uwm;
+		const float rp_u2 = 0.0f;
+)+"#else"+R(
+		const float rp_u1 = uxn*e1x+uyn*e1y+uzn*e1z;
+		const float rp_u2 = uxn*e2x+uyn*e2y+uzn*e2z;
+)+"#endif"+R( // FAC_REKPI_AN
+		const float mxx = fhn[1]+fhn[2]+fhn[7]+fhn[8]+fhn[9]+fhn[10]+fhn[13]+fhn[14]+fhn[15]+fhn[16];
+		const float myy = fhn[3]+fhn[4]+fhn[7]+fhn[8]+fhn[11]+fhn[12]+fhn[13]+fhn[14]+fhn[17]+fhn[18];
+		const float mzz = fhn[5]+fhn[6]+fhn[9]+fhn[10]+fhn[11]+fhn[12]+fhn[15]+fhn[16]+fhn[17]+fhn[18];
+		const float mxy = fhn[7]+fhn[8]-fhn[13]-fhn[14];
+		const float mxz = fhn[9]+fhn[10]-fhn[15]-fhn[16];
+		const float myz = fhn[11]+fhn[12]-fhn[17]-fhn[18];
+		const float mnx = fma(mxx, nx, fma(mxy, ny, mxz*nz));
+		const float mny = fma(mxy, nx, fma(myy, ny, myz*nz));
+		const float mnz = fma(mxz, nx, fma(myz, ny, mzz*nz));
+		const float rp_nmn = fma(nx, mnx, fma(ny, mny, nz*mnz));
+		const float rp_pi1 = fma(e1x, mnx, fma(e1y, mny, e1z*mnz))-rhon*rp_u1*rp_un;
+		const float rp_pi2 = fma(e2x, mnx, fma(e2y, mny, e2z*mnz))-rhon*rp_u2*rp_un;
+		const float rp_tw = rhon*rekpi_utau*rekpi_utau;
+		const float rp_pw = -rp_tw*(1.0f+1.0f/(6.0f*rekpi_nueff));
+		const float rp_d1 = rp_pw-rp_pi1;
+		const float rp_d2 = -rp_pi2;
+		const float rp_ax = rp_d1*e1x+rp_d2*e2x;
+		const float rp_ay = rp_d1*e1y+rp_d2*e2y;
+		const float rp_az = rp_d1*e1z+rp_d2*e2z;
+		const float g1 = 0.5f*nx*rp_ax;
+		const float g3 = 0.5f*ny*rp_ay;
+		const float g5 = 0.5f*nz*rp_az;
+		const float g7 = 0.25f*(nx+ny)*(rp_ax+rp_ay);
+		const float g9 = 0.25f*(nx+nz)*(rp_ax+rp_az);
+		const float g11 = 0.25f*(ny+nz)*(rp_ay+rp_az);
+		const float g13 = 0.25f*(nx-ny)*(rp_ax-rp_ay);
+		const float g15 = 0.25f*(nx-nz)*(rp_ax-rp_az);
+		const float g17 = 0.25f*(ny-nz)*(rp_ay-rp_az);
+		if(rp_zt) {
+			// [454..458] Pi_lok/Pi_WM in t_ref (Risiko b: weit weg von 1 = Ponsin-Empfindlichkeit). rp_pw < 0 strikt.
+			const float rp_qp = rp_pi1/rp_pw;
+			const uint rp_bp = rp_qp<0.0f ? 454u : (rp_qp<0.5f ? 455u : (rp_qp<2.0f ? 456u : (rp_qp<10.0f ? 457u : 458u)));
+			if(hits[rp_bp]<0xF0000000u) atomic_inc(&hits[rp_bp]);
+			// [460] QUANTUM (Risiko f, Entscheidregel E5): |Df|max unter 2^-11 |f^|max, dem relativen
+			// FP16S-Speicherschritt -- dort ueberlebt der Tausch store_f nicht (registerseitiger No-Op).
+			const float rp_gm = fmax(fmax(fmax(fabs(g1), fabs(g3)), fmax(fabs(g5), fabs(g7))), fmax(fmax(fabs(g9), fabs(g11)), fmax(fmax(fabs(g13), fabs(g15)), fabs(g17))));
+			float rp_fm = 0.0f;
+			for(uint i=0u; i<def_velocity_set; i++) rp_fm = fmax(rp_fm, fabs(fhn[i]));
+			if(rp_gm<0.00048828125f*rp_fm&&hits[460]<0xF0000000u) atomic_inc(&hits[460]);
+		}
+)+"#ifdef FAC_REKPI_AN"+R(
+)+"#ifndef FAC_REKPI_NUR_U"+R(
+		fhn[1] += g1;
+		fhn[2] += g1;
+		fhn[3] += g3;
+		fhn[4] += g3;
+		fhn[5] += g5;
+		fhn[6] += g5;
+		fhn[7] += g7;
+		fhn[8] += g7;
+		fhn[9] += g9;
+		fhn[10] += g9;
+		fhn[11] += g11;
+		fhn[12] += g11;
+		fhn[13] += g13;
+		fhn[14] += g13;
+		fhn[15] += g15;
+		fhn[16] += g15;
+		fhn[17] += g17;
+		fhn[18] += g17;
+		*rekpi_w = 1.0f/fma(3.0f, rekpi_nueff, 0.5f);
+)+"#else"+R(
+		// ★ 04.10.2026 AUSWEICHSTUFE (b), CFD_FAC_REKPI=3: NUR u setzen, kein Pi-Tausch, kein tau_eff. -1 ist eine reine
+		// Marke ("gesetzt") fuer den Netto-Fluss-Zaehler in stream_collide; die Kollision prueft rekpi_w > 0 und laesst w stehen.
+		*rekpi_w = -1.0f;
+)+"#endif"+R( // FAC_REKPI_NUR_U
+		tw = rp_tw;
+		if(rp_zt) {
+			// PROBEN, Soll je 0. ★ 04.10.2026 (Pruefbefund M5, Spill): ANALYTISCH aus den g statt mit Vorher-Kopien
+			// (vorher lebten m0, Sum|f|, rho, u ueber den Tausch hinweg). Rundungsboden aus der Betragssumme NACH dem
+			// Tausch: 32 ulp von Sum|f^| + 1, dimensionsrein je Groesse (Dichte, Geschwindigkeit, Spannung).
+			// Paarform: Df(p) = Df(-p) = g_p, also Sum Df = 2 Sum g, Sum (c.n)^2 Df = 2 Sum s^2 g, Sum (c.n)(c.e) Df = 2 Sum s q g.
+			float rp_s1 = 0.0f;
+			for(uint i=0u; i<def_velocity_set; i++) rp_s1 += fabs(fhn[i]);
+			const float rp_tol = 32.0f*1.1920929E-7f*(rp_s1+1.0f);
+			float rp_r1 = 1.0f;
+			float rp_x1 = 0.0f;
+			float rp_y1 = 0.0f;
+			float rp_z1 = 0.0f;
+			calculate_rho_u(fhn, &rp_r1, &rp_x1, &rp_y1, &rp_z1);
+			// [444] Impuls: Sum c Df = 0 ist in der Paarform strukturell; geprueft wird der Rest, den die Setzung UND der Tausch
+			// offen lassen -- u.n unveraendert gegen den Zustand vor der Setzung (du steht senkrecht n). u.e1/u.e2 prueft [446].
+			const float rp_un1 = rp_x1*nx+rp_y1*ny+rp_z1*nz;
+			if(fabs(rp_un1-rp_un)>rp_tol/rp_r1&&hits[444]<0xF0000000u) atomic_inc(&hits[444]);
+)+"#ifndef FAC_REKPI_NUR_U"+R(
+			// [443] Masse: Sum Df = 2 Sum g (= 3 n.a analytisch, a senkrecht n)
+			const float rp_mg = 2.0f*(g1+g3+g5+g7+g9+g11+g13+g15+g17);
+			if(fabs(rp_mg)>rp_tol&&hits[443]<0xF0000000u) atomic_inc(&hits[443]);
+			// [445] Normal: n.E.n = 2 Sum s^2 g (Pi_nn bleibt -- der Druckpfad sieht nichts)
+			const float rp_ng = 2.0f*(nx*nx*g1+ny*ny*g3+nz*nz*g5+(nx+ny)*(nx+ny)*g7+(nx+nz)*(nx+nz)*g9+(ny+nz)*(ny+nz)*g11+(nx-ny)*(nx-ny)*g13+(nx-nz)*(nx-nz)*g15+(ny-nz)*(ny-nz)*g17);
+			if(fabs(rp_ng)>rp_tol&&hits[445]<0xF0000000u) atomic_inc(&hits[445]);
+			// [447] Ist=Soll Pi_t1n/Pi_t2n: Pi_k + 2 Sum s q_k g trifft das Ziel (u' unveraendert, also nur E)
+			const float rp_e1g = 2.0f*(nx*e1x*g1+ny*e1y*g3+nz*e1z*g5+(nx+ny)*(e1x+e1y)*g7+(nx+nz)*(e1x+e1z)*g9+(ny+nz)*(e1y+e1z)*g11+(nx-ny)*(e1x-e1y)*g13+(nx-nz)*(e1x-e1z)*g15+(ny-nz)*(e1y-e1z)*g17);
+			const float rp_e2g = 2.0f*(nx*e2x*g1+ny*e2y*g3+nz*e2z*g5+(nx+ny)*(e2x+e2y)*g7+(nx+nz)*(e2x+e2z)*g9+(ny+nz)*(e2y+e2z)*g11+(nx-ny)*(e2x-e2y)*g13+(nx-nz)*(e2x-e2z)*g15+(ny-nz)*(e2y-e2z)*g17);
+			const float rp_tp = fma(1.0E-3f, fabs(rp_pw), rp_tol);
+			if((fabs(rp_pi1+rp_e1g-rp_pw)>rp_tp||fabs(rp_pi2+rp_e2g)>rp_tp)&&hits[447]<0xF0000000u) atomic_inc(&hits[447]);
+)+"#endif"+R( // FAC_REKPI_NUR_U
+			// [446] Ist=Soll u_t: nach Setzung (und Tausch) u.e1 = u_WM, u.e2 = 0 -- Toleranz wie [330] (1e-3 relativ)
+			const float rp_ue1 = rp_x1*e1x+rp_y1*e1y+rp_z1*e1z;
+			const float rp_ue2 = rp_x1*e2x+rp_y1*e2y+rp_z1*e2z;
+			const float rp_ub = sqrt(rp_x1*rp_x1+rp_y1*rp_y1+rp_z1*rp_z1);
+			const float rp_tu = fma(1.0E-3f, rekpi_uwm, fmax(1.0E-6f*rp_ub, 5.0E-8f));
+			if((fabs(rp_ue1-rekpi_uwm)>rp_tu||fabs(rp_ue2)>rp_tu)&&hits[446]<0xF0000000u) atomic_inc(&hits[446]);
+			// [471] Positivitaet nach Setzung und Tausch (Risiko f): irgendein f_i = f^_i + w_i < 0
+			const bool rp_neg = (fhn[0]<-def_w0)|(fhn[1]<-def_ws)|(fhn[2]<-def_ws)|(fhn[3]<-def_ws)|(fhn[4]<-def_ws)|(fhn[5]<-def_ws)|(fhn[6]<-def_ws)
+				|(fhn[7]<-def_we)|(fhn[8]<-def_we)|(fhn[9]<-def_we)|(fhn[10]<-def_we)|(fhn[11]<-def_we)|(fhn[12]<-def_we)
+				|(fhn[13]<-def_we)|(fhn[14]<-def_we)|(fhn[15]<-def_we)|(fhn[16]<-def_we)|(fhn[17]<-def_we)|(fhn[18]<-def_we);
+			if(rp_neg&&hits[471]<0xF0000000u) atomic_inc(&hits[471]);
+		}
+)+"#endif"+R( // FAC_REKPI_AN
+	}
+)+"#endif"+R( // FAC_REKPI
 )+R(
 	const uxx a = 6ul*(uxx)fid; // Akkumulator: [1..3] Ist-Wandkraft (ungeklemmt == twe*t1; unter PEMA MODELLKRAFT: P gefiltert, P-Fluktuation laeuft als BB durch -- Audit 1/3)
 	fac_tau_acc[a] += tw; fac_tau_acc[a+1ul] += fwx; fac_tau_acc[a+2ul] += fwy; fac_tau_acc[a+3ul] += fwz;
@@ -3773,6 +4294,13 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	atomic_add((volatile global uint*)&hits[slot], convert_uint_sat(fma(b, def_klemm_s, 0.5f)));
 }
 )+"#endif"+R( // POSITIV
+)+"#ifdef SC_SIMD16"+R(
+// ★ 02.10.2026 MESSARM (CFD_SC_SIMD16=<Geraete-ID>, nur dieses Geraet; Heiko: "Spill ist grundsaetzlich nicht ok"): stream_collide mit SIMD16
+// erzwingen; opencl.hpp haengt dort -cl-intel-enable-auto-large-GRF-mode an -> IGC gibt stream_collide 256 GRF, B70 offline 0 B Spill im R1Q=4-Arm
+// (ohne Erzwingen waehlt IGC bei 256 GRF SIMD32, Spill bleibt 1088 B). Preis: halb so viele Threads je EU -- Durchsatz nur auf der B70 messbar.
+// Wirkpfad: Laufzeit-Spill (lbm.cpp sc_spill, Soll 0); Slot 432 = Sub-Group-Breite nur Nebenbeleg (auf der B70 ohnehin 16).
+__attribute__((intel_reqd_sub_group_size(16)))
+)+"#endif"+R( // SC_SIMD16
 )+R(kernel void stream_collide)+"("+R(global fpxx* fi, global rhoxx* rho, global velxx* u, global uchar* flags, const ulong t, const float fx, const float fy, const float fz, const uint felder_voll, global uint* rho_clamp_hits // ) { // main LBM kernel
 )+"#ifdef FORCE_FIELD"+R(
 	, const global float* F, const global uint* f_maske // argument order is important (f_maske: F-Markerliste, 03.09.; im Vollfeld-Arm ungelesen)
@@ -3817,6 +4345,9 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+R( TS_P
 )+") {"+R( // stream_collide()
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
+)+"#ifdef SC_SIMD16"+R(
+	if(n==0u) rho_clamp_hits[432] = get_sub_group_size();
+)+"#endif"+R( // SC_SIMD16
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute stream_collide() on halo
 )+"#ifdef SPARSE_TILES"+R(
 	// FORK: Zellen in toten Tiles duerfen fi NIE anfassen. cell_base() gibt fuer sie defensiv 0
@@ -3824,7 +4355,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	// die Daten einer echten aktiven Tile. Genau daran ist der erste T=8-Lauf divergiert (Cd 18.4).
 	if(is_dead_tile(n, tile_slot)) return;
 )+"#endif"+R(
-	const uchar flagsn = flags[n]; // cache flags[n] for multiple readings
+	const uchar flagsn = fl(flags, n); // cache flags[n] for multiple readings
 	const uchar flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
 	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // if cell is solid boundary or gas, just return
 
@@ -3832,7 +4363,19 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	neighbors(n, j); // calculate neighbor indices
 
 	float fhn[def_velocity_set]; // local DDFs
+)+"#ifdef ZELLBASEN"+R( // ★ 05.10.2026 Byte-Zellbasen (PLAN-ZELLBASEN-2026-10-05.md): dieselben Adressen wie load_f, je Zugriff eine 64-Bit-Addition
+	uint zb_cb[(def_velocity_set+1u)/2u];
+	zb_basen(j, zb_cb);
+	load_f_zb(fhn, fi, t, zb_cb); // perform streaming (part 2)
+	// ★ 05.10.2026 Korrektur A-M3/C-N7: KONSTANTENSPIEGEL Slot 492 (Soll 1 mit ZELLBASEN, 0 ohne). Steht IM Zweig, der load_f_zb ruft --
+	// faellt der Zweig aus dem uebersetzten Kernel (inaktiver Block, //-Falle), bleibt der Slot 0 und die Abnahme (berichte_dichteklemme)
+	// wirft. Stichprobe: Zaehlschritt t%zaehl_takt == 0 an Zellen n%1024 == 0 (Muster 490), atomic_or -- keine Physik. NUR die Ladeseite:
+	// ein zweites Bit an store_f_zb kostete stream_collide auf der iGPU 32 B Spill (offline ocloc 0x7d67, je eine Seite allein: 0 B; als
+	// gewoehnliche Stores beider Seiten 288 B). Die Speicherseite haengt am selben #ifdef ZELLBASEN und an derselben zb_basen-Funktion.
+	if(t%def_zaehl_takt==0ul&&n%1024u==0u) atomic_or(&rho_clamp_hits[492], 1u);
+)+"#else"+R( // ZELLBASEN
 	load_f(n, fhn, fi, j, t TS_A); // perform streaming (part 2)
+)+"#endif"+R( // ZELLBASEN
 )+"#ifdef POSITIV"+R(
 	// ★ 15.09.2026 Klemmen Stufe 1 P1b: Slot 285 = Zelle mit negativer GELADENER Population (Nicht-E, vor MB/Facette), gezaehlt an den
 	// Zaehlschritten t%def_zaehl_takt == 2 an Stichprobenzellen n%def_pos_sub == 0; Slot 289 = dieselbe Probe genau bei t == def_zaehl_takt+3 (Nachladeprobe fuer Haken 1).
@@ -3859,6 +4402,9 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	if(flagsn_bo!=TYPE_S&&flagsn_bo!=TYPE_E&&flagsn_bo!=TYPE_MS) apply_facette(n, fhn, j, flags, fac_geo, fac_idx, fac_tau_acc, fac_tau_cnt, rho_clamp_hits, t);
 )+"#else"+R(
 	float3 fac_kraft = (float3)(0.0f,0.0f,0.0f); // ★ KRAFT: Zellkraft aus dem Wandmodell, unten auf fxn/fyn/fzn (Guo)
+)+"#ifdef FAC_REKPI_AN"+R(
+	float rekpi_w = 0.0f; // ★ 03.10. REK-PI: w_WM aus apply_facette_imem, > 0 nur an angewandten Facettenzellen; gelesen in der Kollision hinter dem SGS-Block
+)+"#endif"+R( // FAC_REKPI_AN
 	if(flagsn_bo!=TYPE_S&&flagsn_bo!=TYPE_E&&flagsn_bo!=TYPE_MS) fac_kraft = apply_facette_imem)+"("+R(n, fhn, j, flags, fac_geo, fac_idx, fac_tau_acc, fac_tau_cnt, rho_clamp_hits, t
 )+"#ifdef FACETTEN_EMA"+R(
 		, fac_us
@@ -3878,6 +4424,9 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#ifdef FACETTEN_KDIAG"+R(
 		, fac_kd
 )+"#endif"+R( // FACETTEN_KDIAG
+)+"#ifdef FAC_REKPI_AN"+R(
+		, &rekpi_w
+)+"#endif"+R( // FAC_REKPI_AN
 	)+");"+R(
 )+"#endif"+R( // FACETTEN_IMEM
 )+"#endif"+R( // FACETTEN
@@ -3955,9 +4504,17 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		// Ein Schritt je Zaehltakt, gleiche Gatterung wie der Besuchszaehler [211]; kein atomic, alle Threads schreiben denselben Wert.
 		if(t==(ulong)def_zaehl_takt+2ul) { rho_clamp_hits[304] = (uint)fma(def_w210_lo, def_klemm_s, 0.5f); rho_clamp_hits[305] = (uint)fma(def_w210_hi, def_klemm_s, 0.5f); }
 )+"#endif"+R( // KLEMM_BILANZ
+)+"#ifdef U_RAND"+R(
+		{ const uxx se_ = ur_idx(u, n); // ★ 04.10.2026 U_RAND: TYPE_E liegt in R1 (U-Zensus); Papierkorb waere ein Zensusfehler, Slot 484 ungegatet
+		  if(se_==(uxx)ur_k(u, URK_P)&&rho_clamp_hits[484]<0xF0000000u) atomic_inc(&rho_clamp_hits[484]);
+		  uxn  = ur_ld(u, se_, 0u);
+		  uyn  = ur_ld(u, se_, 1u);
+		  uzn  = ur_ld(u, se_, 2u); }
+)+"#else"+R( // U_RAND
 		uxn  = load_u(u, n);
 		uyn  = load_u(u, def_N+(ulong)n);
 		uzn  = load_u(u, 2ul*def_N+(ulong)n);
+)+"#endif"+R( // U_RAND
 		// ★ TODO 2 Schritt 4 (12.09.2026) -- Huellenwaechter fuer u, Zwilling zu Slot 210/211 bei rho,
 		// aber gegen eine ANDERE Fehlerklasse. Bei rho faengt Slot 210 den Typverwechsler; bei u kann
 		// er das nicht (dafuer ist der Typ-Zensus da). Hier geht es um die SAETTIGUNG: vstore_half_rte
@@ -4195,7 +4752,39 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		store_rho(rho, n, rhon); // update density field
 		)+"#endif"+R( // RHO_SPARSAM
 		)+"#endif"+R( // RHO_RAND
-		)+"#ifdef U_SPARSAM"+R(
+		)+"#ifdef U_RAND"+R(
+		// ★ 04.10.2026 U_RAND (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.4/B.6): ersetzt U_SPARSAM im Nahfeld. Geschrieben wird an JEDEM
+		// Schritt, wo ein Slot existiert (R1, A -- A traegt E und, Bauabweichung, auch die N2F-Bloecke). Ungespeicherte Zellen schreiben
+		// nichts (der Papierkorb wird nie beschrieben). Wirkpfad (EIN Schritt, t == zaehl_takt+2): 486 geschrieben, 487 ohne Slot (Nicht-
+		// Solid); 485 Kopf traegt nicht die gueltige Magic (vergessene Neubindung, ungegatet).
+		// ★ U1c AUSGABE V (Bauabweichung zu Plan B.5 "u_vorab"): ist Bit 2 von felder_voll gesetzt (nur am letzten Substep eines Grobschritts
+		// mit Leseplan), schreibt dieselbe Stelle den eben berechneten Wert ZUSAETZLICH in die V-Box des Kopfs (Ebene, Saeule oder eine
+		// VOLL-Scheibe) -- bitgleich per Konstruktion, kein nachgebauter Kernel. Hier und nicht am Kernelende: dort kostete jeder u-Schreibvorgang
+		// Spill (uxn lebte ueber die Kollision, offline gemessen bis 1216 B auf der B70). Zaehler 489 V-Zellen (Ebene/Saeule), 490 V-Zellen
+		// einer VOLL-Scheibe nur an n%1024 == 0 (Bit 3), beide Ist=Soll gegen den Host.
+		{ const uxx up_ = (uxx)ur_k(u, URK_P);
+		  const uxx us_ = ur_idx(u, n);
+		  if(ur_k(u, URK_MAGIC)!=UR_MAGIC&&rho_clamp_hits[485]<0xF0000000u) atomic_inc(&rho_clamp_hits[485]);
+		  if(t==(ulong)def_zaehl_takt+2ul) {
+			const uint sl_ = us_<up_ ? 486u : 487u;
+			if(rho_clamp_hits[sl_]<0xF0000000u) atomic_inc(&rho_clamp_hits[sl_]);
+		  }
+		  if(us_<up_) ur_st3(u, us_, (float3)(uxn, uyn, uzn));
+		  if((felder_voll&4u)!=0u) {
+			const global uint* kv_ = (const global uint*)u;
+			const uint3 cv_ = coordinates(n);
+			const uint vx_ = cv_.x-kv_[URK_VBX0];
+			const uint vy_ = cv_.y-kv_[URK_VBY0];
+			const uint vz_ = cv_.z-kv_[URK_VBZ0];
+			if(vx_<kv_[URK_VBNX]&&vy_<kv_[URK_VBNY]&&vz_<kv_[URK_VBNZ]) {
+				ur_st3(u, (uxx)kv_[URK_VOFF]+(uxx)(vx_+(vy_+vz_*kv_[URK_VBNY])*kv_[URK_VBNX]), (float3)(uxn, uyn, uzn));
+				if((felder_voll&8u)==0u) { if(rho_clamp_hits[489]<0xF0000000u) atomic_inc(&rho_clamp_hits[489]); }
+				else if(n%1024u==0u&&rho_clamp_hits[490]<0xF0000000u) atomic_inc(&rho_clamp_hits[490]);
+			}
+		  }
+		}
+)+"#else"+R( // U_RAND
+)+"#ifdef U_SPARSAM"+R(
 		// ★ TODO 2 Schritt 3 (12.09.2026): u wird nur noch dort geschrieben, wo es VOR dem naechsten
 		// Vollschreiben gelesen wird. Die Leser von u je feinem Schritt und ihre Reichweite:
 		//   deriv_reg  -- u an den SECHS Achsnachbarn JEDER TYPE_E-Zelle (kernel.cpp, Zweig
@@ -4217,13 +4806,20 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 			const bool bbox = uxyz.x+2u>=(uint)def_SMX0&&uxyz.x<(uint)def_SMX0+(uint)def_SMNX+2u&&uxyz.y+2u>=(uint)def_SMY0&&uxyz.y<(uint)def_SMY0+(uint)def_SMNY+2u&&uxyz.z+2u>=(uint)def_SMZ0&&uxyz.z<(uint)def_SMZ0+(uint)def_SMNZ+2u;
 			u_schreiben = rand||bbox;
 		  }
-		  // Wirkpfad-Zaehler: Slot 206 = uebersprungen, 207 = geschrieben (EIN Schritt, wie bei rho).
-		  if(t==(ulong)def_zaehl_takt+2ul&&rho_clamp_hits[u_schreiben?207u:206u]<0xF0000000u) atomic_inc(&rho_clamp_hits[u_schreiben?207u:206u]);
+		  // Wirkpfad-Zaehler: Slot 206 = uebersprungen, 207 = geschrieben. ★ 05.10.2026 (SWEEP-SPZ-ZB4, Wachter falsch-positiv bei
+		  // CFD_SCHRITTE_PRO_ZELLE=10): hier zaehlte GENAU EIN Schritt (t == zaehl_takt+2, wie rho 204/205). Faellt der auf einen
+		  // Vollschreibschritt (Fernfeld: Sample-Kadenz bzw. rho_voll_zwang), steht 206 auf 0 und der No-Op-Waechter wirft rc 1 --
+		  // bei N = 10 genau so passiert. Jetzt ein FENSTER von 4 Schritten [zaehl_takt+2, zaehl_takt+6): die Vollschreibschritte
+		  // liegen hoechstens an zwei Stellen je Sample-Periode (Takt- und Lese-Zwang), ein freier Schritt ist damit bei jeder
+		  // Sample-Periode >= 3 im Fenster. Der Host zaehlt mit, wie viele Fensterschritte frei waren (u_fenster_frei), und
+		  // verlangt 206 > 0 nur dann. Summe 206+207 = 4 x aktive Zellen (rho 204/205 bleibt bei EINEM Schritt -- Ist=Soll RHO_RAND).
+		  if(t-((ulong)def_zaehl_takt+2ul)<4ul&&rho_clamp_hits[u_schreiben?207u:206u]<0xF0000000u) atomic_inc(&rho_clamp_hits[u_schreiben?207u:206u]);
 		  if(u_schreiben) store3_u(u, n, (float3)(uxn, uyn, uzn));
 		}
 		)+"#else"+R(
 		store3_u(u, n, (float3)(uxn, uyn, uzn)); // update velocity field
 		)+"#endif"+R( // U_SPARSAM
+)+"#endif"+R( // U_RAND
 	}
 )+"#endif"+R( // UPDATE_FIELDS
 
@@ -4258,7 +4854,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	// FACETTEN-Build cache-neutral, iMEM liest dieselben Flags); der
 	// Kontrollarm zahlt nichts, weil ungesetzt gar nicht emittiert wird.
 	bool sgs_wand = false;
-	for(uint i=1u; i<def_velocity_set; i++) sgs_wand = sgs_wand||(flags[j[i]]&TYPE_BO)==TYPE_S; // ★ WM-Blick D (MITTEL): vorher nur j[1..6] -- Diagonal-Facettenzellen (Kanten/Kugel/Fahrzeug) behielten die nu_t-Rueckkopplung im WANDFREI-Arm; jetzt alle 18
+	for(uint i=1u; i<def_velocity_set; i++) sgs_wand = sgs_wand||(fl(flags, j[i])&TYPE_BO)==TYPE_S; // ★ WM-Blick D (MITTEL): vorher nur j[1..6] -- Diagonal-Facettenzellen (Kanten/Kugel/Fahrzeug) behielten die nu_t-Rueckkopplung im WANDFREI-Arm; jetzt alle 18
 	if(sgs_wand&&t%def_zaehl_takt==0ul) atomic_inc(&rho_clamp_hits[6]); // R2: Wirkpfad-Nachweis (Befund-2-Rest), Slot 6, gegatet wie der WFB-Zaehler
 	if(!sgs_wand)
 )+"#endif"+R( // SGS_WANDFREI
@@ -4441,6 +5037,18 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		}
 )+"#endif"+R( // SGS_BAND
 	} // modity LBM relaxation rate by increasing effective viscosity in regions of high strain rate (add turbulent eddy viscosity), nu_eff = nu_0+nu_t
+)+"#ifdef FAC_REKPI_AN"+R(
+	// ★★ 03.10.2026 REK-PI tau_eff (PLAN-REK-PI.md §2, Befund B4): an angewandten Facettenzellen ersetzt
+	// w_WM = 1/(3 nu_eff + 1/2) das w aus FDWAND/SISM/Smagorinsky (nu_eff = nu D' aus dem Wandgesetz am
+	// eigenen y_w). Ohne diesen Schritt traegt der Pi-Tausch mit (tau0 - 1/2)/tau0 = 5,6e-5 weiter und ist
+	// wirkungslos. Ort: HINTER dem SGS-Zweig und VOR SGS_DIAG -- die Diagnose misst so das FINALE w, SPONGE
+	// und TRT (wm aus w) leiten wie ueberall vom finalen w ab. Slot 472 = Wirkpfad, Soll [472] == [441].
+	// VANDRIEST_ANWENDEN, NUT_SKAL != 1 und WANDFREI sind in setup.cpp gesperrt (zweiter nu_t-Eingriff).
+	if(rekpi_w>0.0f) {
+		w = rekpi_w;
+		if(t%def_zaehl_takt==0ul&&rho_clamp_hits[472]<0xF0000000u) atomic_inc(&rho_clamp_hits[472]);
+	}
+)+"#endif"+R( // FAC_REKPI_AN
 )+"#ifdef SGS_DIAG"+R(
 	// ★ 03.09. (Pruefagent-Vorschlag 6): DIAG-Block HINTER das FDWAND-if/else gezogen. Er hing nur an w und tau0; im
 	// else-Zweig lag er unter FDWAND fuer alle Facettenzellen brach (Wandlagen-Bins 35-48 leer, stiller No-Op).
@@ -4477,7 +5085,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		//      und koennte damit ganze Wandorientierungen systematisch treffen oder verfehlen.
 		//      Der Hash ist gittergroessen-unabhaengig (Pruefbefund 13, 2026-08-23).
 		//  (11) Emission gegatet: ohne CFD_SGS_DIAG wird der Block gar nicht erst erzeugt.
-		if(t>=def_sgs_diag_ab&&t>0ul&&t%def_zaehl_takt==0ul&&((n*2654435761ul)&4227858432ul)==0ul&&(flags[n]&TYPE_E)==0u) {
+		if(t>=def_sgs_diag_ab&&t>0ul&&t%def_zaehl_takt==0ul&&((n*2654435761ul)&4227858432ul)==0ul&&(fl(flags, n)&TYPE_E)==0u) {
 			const float nu0_ = tau0-0.5f;
 			const float nut_ = 1.0f/w-tau0;
 			const float rv_  = nut_/nu0_; // nu0_ > 0 ist Bauvoraussetzung, wird im Host geprueft
@@ -4496,7 +5104,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 			   Unterboden, Raeder und abgeloeste Gebiete -- keine reine anliegende Grenzschicht.
 			   Der Test kostet 18 uchar-Reads, aber nur auf den Zaehlschritten. */
 			bool wand1_ = false;
-			for(uint i=1u; i<def_velocity_set; i++) wand1_ = wand1_||(flags[j[i]]&TYPE_BO)==TYPE_S;
+			for(uint i=1u; i<def_velocity_set; i++) wand1_ = wand1_||(fl(flags, j[i])&TYPE_BO)==TYPE_S;
 			if(wand1_) {
 				const uint bw_ = rv_<5.0f ? 0u : (rv_<15.0f ? 1u : (rv_<30.0f ? 2u : (rv_<60.0f ? 3u : 4u)));
 				atomic_inc(&rho_clamp_hits[35u+bw_]);
@@ -4592,7 +5200,11 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 )+"#endif"+R( // RHO_CLAMP
 		if((kl&4u)!=0u) { // Impuls: dj = f*rho_c*(u_c - u_roh), f = w im Inneren, f = 1 an TYPE_E (REG_E = f_eq ohne Guo)
 			float uxr_, uyr_, uzr_;
+)+"#ifdef U_RAND"+R(
+			if(flagsn_bo==TYPE_E) { const uxx se_ = ur_idx(u, n); uxr_ = ur_ld(u, se_, 0u); uyr_ = ur_ld(u, se_, 1u); uzr_ = ur_ld(u, se_, 2u); } // ★ 04.10.2026 U_RAND
+)+"#else"+R( // U_RAND
 			if(flagsn_bo==TYPE_E) { uxr_ = load_u(u, n); uyr_ = load_u(u, def_N+(ulong)n); uzr_ = load_u(u, 2ul*def_N+(ulong)n); }
+)+"#endif"+R( // U_RAND
 			else { float rr_; calculate_rho_u(fhn, &rr_, &uxr_, &uyr_, &uzr_); }
 )+"#ifdef VOLUME_FORCE"+R(
 			{ const float r2_ = 0.5f/rhon; uxr_ = fma(fxn, r2_, uxr_); uyr_ = fma(fyn, r2_, uyr_); uzr_ = fma(fzn, r2_, uzr_); }
@@ -4629,11 +5241,39 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		// Nachbarn nur benutzen, wenn dort ECHTES Fluid steht (weder Solid noch Gleichgewichtsrand).
 		// Das faengt zugleich den periodischen Umschlag ab: nach aussen zeigt der Nachbar auf die
 		// gegenueberliegende Domaenenflaeche, und die ist selbst Rand.
-		const uchar b1=flags[j[1]]&TYPE_BO, b2=flags[j[2]]&TYPE_BO, b3=flags[j[3]]&TYPE_BO;
-		const uchar b4=flags[j[4]]&TYPE_BO, b5=flags[j[5]]&TYPE_BO, b6=flags[j[6]]&TYPE_BO;
+		const uchar b1=fl(flags, j[1])&TYPE_BO, b2=fl(flags, j[2])&TYPE_BO, b3=fl(flags, j[3])&TYPE_BO;
+		const uchar b4=fl(flags, j[4])&TYPE_BO, b5=fl(flags, j[5])&TYPE_BO, b6=fl(flags, j[6])&TYPE_BO;
 		const bool px=b1!=TYPE_S&&b1!=TYPE_E, mx=b2!=TYPE_S&&b2!=TYPE_E; // +x, -x
 		const bool py=b3!=TYPE_S&&b3!=TYPE_E, my=b4!=TYPE_S&&b4!=TYPE_E; // +y, -y
 		const bool pz=b5!=TYPE_S&&b5!=TYPE_E, mz=b6!=TYPE_S&&b6!=TYPE_E; // +z, -z
+)+"#ifdef U_RAND"+R(
+		// ★ 04.10.2026 U_RAND: deriv_reg bleibt WORTGLEICH -- es bekommt statt (k*def_N, Zellindex) den Komponentenbeginn im kompakten
+		// Puffer und den SLOT. load_u(u, off+jp) liest damit dasselbe Wort. Die sechs Achsnachbarn einer TYPE_E-Zelle liegen in R1 (U-Zensus).
+		const ulong o0_ = ur_o(u, 0u);
+		const ulong o1_ = ur_o(u, 1u);
+		const ulong o2_ = ur_o(u, 2u);
+		const uxx up_ = (uxx)ur_k(u, URK_P);
+		uint pk_ = 0u; // Papierkorb gelesen (nur wo deriv_reg den Nachbarn wirklich liest)
+		uxx sa_ = ur_idx(u, j[1]);
+		uxx sb_ = ur_idx(u, j[2]);
+		pk_ += (uint)((px&&sa_==up_)||(mx&&sb_==up_));
+		const float dxux=deriv_reg(u, o0_, sa_, sb_, px, mx, uxn);
+		const float dxuy=deriv_reg(u, o1_, sa_, sb_, px, mx, uyn);
+		const float dxuz=deriv_reg(u, o2_, sa_, sb_, px, mx, uzn);
+		sa_ = ur_idx(u, j[3]);
+		sb_ = ur_idx(u, j[4]);
+		pk_ += (uint)((py&&sa_==up_)||(my&&sb_==up_));
+		const float dyux=deriv_reg(u, o0_, sa_, sb_, py, my, uxn);
+		const float dyuy=deriv_reg(u, o1_, sa_, sb_, py, my, uyn);
+		const float dyuz=deriv_reg(u, o2_, sa_, sb_, py, my, uzn);
+		sa_ = ur_idx(u, j[5]);
+		sb_ = ur_idx(u, j[6]);
+		pk_ += (uint)((pz&&sa_==up_)||(mz&&sb_==up_));
+		const float dzux=deriv_reg(u, o0_, sa_, sb_, pz, mz, uxn);
+		const float dzuy=deriv_reg(u, o1_, sa_, sb_, pz, mz, uyn);
+		const float dzuz=deriv_reg(u, o2_, sa_, sb_, pz, mz, uzn);
+		if(pk_>0u&&rho_clamp_hits[484]<0xF0000000u) atomic_inc(&rho_clamp_hits[484]); // ungegatet, Soll 0
+)+"#else"+R( // U_RAND
 		const float dxux=deriv_reg(u,      0ul, j[1], j[2], px, mx, uxn);
 		const float dxuy=deriv_reg(u,    def_N, j[1], j[2], px, mx, uyn);
 		const float dxuz=deriv_reg(u, 2ul*def_N, j[1], j[2], px, mx, uzn);
@@ -4643,6 +5283,7 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 		const float dzux=deriv_reg(u,      0ul, j[5], j[6], pz, mz, uxn);
 		const float dzuy=deriv_reg(u,    def_N, j[5], j[6], pz, mz, uyn);
 		const float dzuz=deriv_reg(u, 2ul*def_N, j[5], j[6], pz, mz, uzn);
+)+"#endif"+R( // U_RAND
 		Sxx=dxux; Syy=dyuy; Szz=dzuz;
 		Sxy=0.5f*(dxuy+dyux); Sxz=0.5f*(dxuz+dzux); Syz=0.5f*(dyuz+dzuy);
 	}
@@ -4983,6 +5624,24 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	}
 )+"#endif"+R( // EQUILIBRIUM_BOUNDARIES
 )+"#endif"+R( // TRT
+)+"#ifdef FAC_REKPI_AN"+R(
+	// ★★ 04.10.2026 NETTO-FLUSS-ZAEHLER, Ausflusshaelfte: an gesetzten Facettenzellen (rekpi_w != 0, auch die Marke -1 der
+	// Stufe 3) am Zaehlschritt das Halbraummoment der POST-Kollisions-f mit c.n > 0 -- genau die f, die gleich in die Fluidseite
+	// stroemen. Nach SRT/P-TRT/POSITIV, unmittelbar vor store_f. Abgelegt in fac_nb roff+8 (racefrei: 1 Zelle = 1 Facette),
+	// gelesen am Folgeschritt im REK-PI-Kopf von apply_facette_imem (Einflusshaelfte, Slots 475..483). fid wird hier neu
+	// nachgeschlagen statt aus apply_facette_imem getragen -- der Zweig laeuft nur an Zaehlschritten (Spill-Begrenzung).
+	if(rekpi_w!=0.0f&&t%def_zaehl_takt==0ul) {
+		uxx rp_fb = (uxx)0ul;
+		if(f_bbox(n, &rp_fb)) {
+			const uint rp_fd = fac_fid(fac_idx, rp_fb);
+			if(rp_fd!=0xFFFFFFFFu) {
+				const ulong rp_g8 = 8ul*(ulong)rp_fd;
+				const ulong rp_qs = def_nb_stride*(ulong)rp_fd;
+				fac_nb[rp_qs+def_nb_roff+8ul] = rekpi_halbfluss(fhn, fac_geo[rp_g8], fac_geo[rp_g8+1ul], fac_geo[rp_g8+2ul], fac_nb[rp_qs+def_nb_roff+0ul], fac_nb[rp_qs+def_nb_roff+1ul], fac_nb[rp_qs+def_nb_roff+2ul], true);
+			}
+		}
+	}
+)+"#endif"+R( // FAC_REKPI_AN
 
 	// ★ Rang-1-Remat (Perf-Audit Achse 2, 2026-08-26): zur Laufzeit ist t>>62 == 0 (t = monotoner
 	// Schrittzaehler < 2^62, lbm.hpp/lbm.cpp -- diese Semantik ist TRAGEND, nie Bits in t packen!),
@@ -4992,7 +5651,15 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	const uxx nn = n+(uxx)(t>>62);
 	uxx j2[def_velocity_set]; // rematerialisierte Nachbarindizes, identische Werte wie j
 	neighbors(nn, j2);
+)+"#ifdef ZELLBASEN"+R( // ★ 05.10.2026 Byte-Zellbasen aus j2 (Rang-1-Remat bleibt undurchsichtig: Basen aus nn, nicht aus dem Lade-cb)
+	{
+		uint zb_cb2[(def_velocity_set+1u)/2u];
+		zb_basen(j2, zb_cb2);
+		store_f_zb(fhn, fi, t, zb_cb2); // perform streaming (part 1)
+	}
+)+"#else"+R( // ZELLBASEN
 	store_f(nn, fhn, fi, j2, t TS_A); // perform streaming (part 1)
+)+"#endif"+R( // ZELLBASEN
 } // stream_collide()
 
 )+"#ifdef SURFACE"+R(
@@ -5183,14 +5850,14 @@ float3 apply_facette_imem)+"("+R(const uxx n, float* fhn, const uxx* j, const gl
 	const uint3 xyz = coordinates(n);
 	const uint nz_eff = (xyz.x>=x_split) ? nz_down : nz; // B4-Notiz: nz_down=0 heisst hier AUS ab Nase (V1: uniform nz) -- bewusste Abweichung (Kraefteschutz), V1-A/Bs mit nz_down=0 nicht bitvergleichbar // V1-x_split: ab Nase nz_down (Default 0 = unterm Wagen/Wake AUS), stromauf nz
 	if(nz_eff==0u||!(xyz.z>=1u&&xyz.z<=nz_eff)) return; // Perf-Audit 2026-08-20: z-Test (reine Arithmetik) VOR dem flags-Load -- sonst streamt jede Enqueue das komplette flags-Feld (N x 1 B) fuer ein Band von <2 % der Zellen (V1-Erbdefekt)
-	const uchar bo = flags[n]&TYPE_BO;
+	const uchar bo = fl(flags, n)&TYPE_BO;
 	if(bo==TYPE_S||bo==TYPE_E) return;
 	if(abstand>0u) { // Heiko 2026-08-20: reifennahe Zellen NICHT aufpraegen (Kraefteschutz). Scan nur gleiche Ebene und OBERHALB (dz>=0) -- die Fahrbahn z=0 zaehlt bewusst nicht; damit werden AUCH diagonal-untere Solids ignoriert. Bei unterhalb der Achse konvexen Reifen faengt der In-Ebenen-Scan diese Faelle mit ab (geometrieabhaengige Annahme, XL-R2).
 		const int a = (int)abstand; bool nah = false;
 		for(int dz=0; dz<=a&&!nah; dz++) for(int dy=-a; dy<=a&&!nah; dy++) for(int dx=-a; dx<=a&&!nah; dx++) {
 			const int xx=(int)xyz.x+dx, yy=(int)xyz.y+dy, zz=(int)xyz.z+dz;
 			if(xx<0||yy<0||xx>=(int)def_Nx||yy>=(int)def_Ny||zz>=(int)def_Nz) continue;
-			if((flags[index((uint3)((uint)xx,(uint)yy,(uint)zz))]&TYPE_BO)==TYPE_S) nah = true;
+			if((fl(flags, index((uint3)((uint)xx,(uint)yy,(uint)zz)))&TYPE_BO)==TYPE_S) nah = true;
 		}
 		if(nah) { if(t%def_zaehl_takt==0ul) atomic_inc(&diag[117]); return; } // ★ S5: Aussparungen zaehlen (Slot 117) -- der Schalter CFD_BODEN_EQ_ABSTAND hatte keinen Wirkpfad
 	}
@@ -5231,7 +5898,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 )+"#endif"+R( // SPARSE_TILES
 	const uint3 xyz = coordinates(n);
 	if(nx==0u||xyz.x<1u||xyz.x>nx) return; // nur die Clamp-Schicht hinter dem Einlass; Test VOR dem flags-Load
-	const uchar bo = flags[n]&TYPE_BO;
+	const uchar bo = fl(flags, n)&TYPE_BO;
 	if(bo==TYPE_S||bo==TYPE_E) return; // TYPE_MS wird BEHANDELT (s. o.)
 	if(t%def_zaehl_takt==0ul) atomic_inc(&diag[21]); // Wirkpfad-Nachweis IM Binary (Iron Rule 3)
 	uxx j[def_velocity_set]; neighbors(n, j);
@@ -5266,7 +5933,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	// die Daten einer echten aktiven Tile. Genau daran ist der erste T=8-Lauf divergiert (Cd 18.4).
 	if(is_dead_tile(n, tile_slot)) return;
 )+"#endif"+R(
-	const uchar flagsn = flags[n];
+	const uchar flagsn = fl(flags, n);
 	const uchar flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
 	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // don't update fields for boundary or gas lattice points
 
@@ -5345,7 +6012,11 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 		)+"#else"+R(
 		store_rho(rho, n, rhon); // update density field
 		)+"#endif"+R( // RHO_RAND
+		)+"#ifdef U_RAND"+R(
+		{ const uxx us_ = ur_idx(u, n); if(us_<(uxx)ur_k(u, URK_P)) ur_st3(u, us_, (float3)(uxn, uyn, uzn)); } // ★ 04.10.2026 U_RAND: toter Pfad (UPDATE_FIELDS), aber gebunden -- nur gespeicherte Zellen
+		)+"#else"+R( // U_RAND
 		store3_u(u, n, (float3)(uxn, uyn, uzn)); // update velocity field
+		)+"#endif"+R( // U_RAND
 	}
 } // update_fields()
 
@@ -5411,7 +6082,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	po_mean[0] = s/(float)N_po;
 } // po_final_mean()
 
-)+R(kernel void apply_pressure_outlet(global velxx* u, global rhoxx* rho, const global uint* po_cells, const global uint* po_interior, const uint N_po, const float rho_out, const float po_sigma, const global float* po_mean, const uint po_hart) {
+)+R(kernel void apply_pressure_outlet(global velxx* u, global rhoxx* rho, const global uint* po_cells, const global uint* po_interior, const uint N_po, const float rho_out, const float po_sigma, const global float* po_mean, const uint po_hart, global uint* hits) { // ★ 05.10.2026 A-M1/C-M1: hits angehaengt (Slot 484, nur unter U_RAND gelesen)
 	// FORK -- Druck-Auslass. Setzt an jeder Auslasszelle die vorgeschriebene Dichte und kopiert die
 	// Geschwindigkeit aus der zugehoerigen Innenzelle (Nullgradient). Zusammen mit der TYPE_E-Logik in
 	// stream_collide ergibt das f = f_eq(rho_out, u_innen): Dirichlet auf den Druck, Neumann auf u.
@@ -5475,9 +6146,26 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	store_rho(rho, n, po_hart!=0u ? fma(po_sigma, rho_out-load_rho(rho, m), load_rho(rho, m))
 	                              : fma(po_sigma, (rho_out-1.0f)-po_mean[0], load_rho(rho, m)));
 )+"#endif"+R( // RHO_RAND
+)+"#ifdef U_RAND"+R(
+	{ const uxx sn_ = ur_idx(u, (uxx)n); // ★ 04.10.2026 U_RAND: po_cells und po_interior liegen in R1 (U-Zensus, R1-Pflicht)
+	  const uxx sm_ = ur_idx(u, (uxx)m);
+	  const uxx up_po = (uxx)ur_k(u, URK_P);
+	  const ulong o0_ = ur_o(u, 0u);
+	  const ulong o1_ = ur_o(u, 1u);
+	  const ulong o2_ = ur_o(u, 2u);
+	  // ★ 05.10.2026 Korrektur C-M1: vorher wurde auch bei sn_ == P geschrieben -- in den Papierkorb, entgegen der Zusage "der Papierkorb
+	  // wird nie beschrieben". Jetzt: schreiben nur mit Slot, sonst (und beim Lesen aus dem Papierkorb) Slot 484 zaehlen, ungegatet, saettigend.
+	  if((sn_==up_po||sm_==up_po)&&hits[484]<0xF0000000u) atomic_inc(&hits[484]);
+	  if(sn_<up_po) {
+		store_u(u, o0_+(ulong)sn_, load_u(u, o0_+(ulong)sm_));
+		store_u(u, o1_+(ulong)sn_, load_u(u, o1_+(ulong)sm_));
+		store_u(u, o2_+(ulong)sn_, load_u(u, o2_+(ulong)sm_));
+	  } }
+)+"#else"+R( // U_RAND
 	store_u(u, n, load_u(u, m));
 	store_u(u, def_N+(ulong)n, load_u(u, def_N+(ulong)m));
 	store_u(u, 2ul*def_N+(ulong)n, load_u(u, 2ul*def_N+(ulong)m));
+)+"#endif"+R( // U_RAND
 } // apply_pressure_outlet()
 
 )+R(kernel void apply_velocity_inlet(global rhoxx* rho, const global ulong* vi_cells, const global ulong* vi_interior, const uint N_vi) {
@@ -5587,9 +6275,16 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 )+"#else"+R(
 	out[o+0ul] = load_rho(rho, n);
 )+"#endif"+R( // RHO_RAND
+)+"#ifdef U_RAND"+R(
+	{ const uxx s_ = ur_idx(u, (uxx)n); // ★ 04.10.2026 U_RAND: im Nahfeld nur fuer Slices -- ungespeicherte Zellen liefern den Papierkorb (0), der Host ersetzt die Ebene aus der Ausgabe (V)
+	  out[o+1ul] = ur_ld(u, s_, 0u);
+	  out[o+2ul] = ur_ld(u, s_, 1u);
+	  out[o+3ul] = ur_ld(u, s_, 2u); }
+)+"#else"+R( // U_RAND
 	out[o+1ul] = load_u(u, n);
 	out[o+2ul] = load_u(u, def_N+(ulong)n);
 	out[o+3ul] = load_u(u, 2ul*def_N+(ulong)n);
+)+"#endif"+R( // U_RAND
 } // extract_plane_macros()
 
 )+R(kernel void rho_rek_ebene)+"("+R(const global fpxx* fi, const global rhoxx* rho, const global velxx* u, const global uchar* flags, const ulong t, global float* out, global rhoxx* out_wort,
@@ -5621,7 +6316,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	if(rho_clamp_hits[217]<0xF0000000u) atomic_inc(&rho_clamp_hits[217]);
 	const uxx n = plane_cell_index(gid, plane_axis, origin_x, origin_y, origin_z, extent_a, extent_b);
 	if(n>=(uxx)def_N) { out[o]=1.0f; out[o+1ul]=1.0f; out[o+2ul]=5.0f; out[o+3ul]=1.0f; store_rho(out_wort, gid, 1.0f); return; }
-	const uchar flagsn_bo = flags[n]&TYPE_BO;
+	const uchar flagsn_bo = fl(flags, n)&TYPE_BO;
 	float rhon = 1.0f, rho_roh = 1.0f, klasse = 0.0f;
 	bool rekonstruieren = true;
 )+"#ifdef SPARSE_TILES"+R(
@@ -5686,7 +6381,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 )+"#ifdef SPARSE_TILES"+R(
 	if(is_dead_tile(n, tile_slot)) { out[gid] = 1.0f; return; }
 )+"#endif"+R( // SPARSE_TILES
-	const uchar flagsn_bo = flags[n]&TYPE_BO;
+	const uchar flagsn_bo = fl(flags, n)&TYPE_BO;
 	if(flagsn_bo==TYPE_S) { out[gid] = 1.0f; return; }
 	)+"#ifdef EQUILIBRIUM_BOUNDARIES"+R(
 	if(flagsn_bo==TYPE_E) {
@@ -5710,6 +6405,23 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	out[gid] = rhon;
 } // rho_ausgabe_ebene()
 
+)+R(kernel void flags_pruefsumme(const global uchar* flags, global uint* aus, const ulong n_zellen) { // ★ 05.10.2026 FLAGS4: Geraeteprobe (Plan C.4). Je Work-Item 256 Zellen, ueber fl() dekodiert: gewichtete Summe und TYPE_MS-Zahl. Kein Atomic, kein lokaler Speicher; laeuft je Lauf zweimal (nach dem Hochladen, nach initialize)
+	const ulong g = get_global_id(0);
+	const ulong n0 = 256ul*g;
+	if(n0>=n_zellen) return;
+	uint s = 0u;
+	uint ms = 0u;
+	for(uint k=0u; k<256u; k++) {
+		const ulong n = n0+(ulong)k;
+		if(n<n_zellen) {
+			const uint v = (uint)fl(flags, (uxx)n);
+			s += v*(k+1u);
+			ms += (uint)((v&TYPE_BO)==TYPE_MS);
+		}
+	}
+	aus[2ul*g] = s;
+	aus[2ul*g+1ul] = ms;
+}
 )+R(kernel void extract_plane_flags(const global uchar* flags, global uchar* out,
 	const uint plane_axis, const uint origin_x, const uint origin_y, const uint origin_z,
 	const uint extent_a, const uint extent_b) {
@@ -5720,7 +6432,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	const uint gid = get_global_id(0);
 	if(gid>=extent_a*extent_b) return;
 	const uxx n = plane_cell_index(gid, plane_axis, origin_x, origin_y, origin_z, extent_a, extent_b);
-	out[gid] = (n>=(uxx)def_N) ? (uchar)TYPE_S : flags[n];
+	out[gid] = (n>=(uxx)def_N) ? (uchar)TYPE_S : fl(flags, n);
 } // extract_plane_flags()
 
 )+R(kernel void drive_boundary_cubic_lift(global rhoxx* rho, global velxx* u, const global uchar* flags,
@@ -5735,7 +6447,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	if(gid>=extent_a*extent_b) return;
 	const uxx n = plane_cell_index(gid, plane_axis, origin_x, origin_y, origin_z, extent_a, extent_b);
 	if(n>=(uxx)def_N) return;
-	if((flags[n]&TYPE_BO)!=TYPE_E) return; // nur reine Gleichgewichts-Randzellen; Boden und Fahrzeug bleiben unberuehrt
+	if((fl(flags, n)&TYPE_BO)!=TYPE_E) return; // nur reine Gleichgewichts-Randzellen; Boden und Fahrzeug bleiben unberuehrt
 	int ia[4], ib[4]; float wa[4], wb[4];
 	cubic_lift_weights(gid % extent_a, ratio, coarse_a, ia, wa);
 	cubic_lift_weights(gid / extent_a, ratio, coarse_b, ib, wb);
@@ -5803,10 +6515,16 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 )+"#else"+R(
 	store_rho(rho, n, v[0]);
 )+"#endif"+R( // RHO_RAND
+)+"#ifdef U_RAND"+R(
+	{ const uxx s_ = ur_idx(u, (uxx)n); // ★ 04.10.2026 U_RAND: Kopplungsebenen liegen in R1; Papierkorb nur zaehlen (Slot 484), nie schreiben
+	  if(s_<(uxx)ur_k(u, URK_P)) ur_st3(u, s_, (float3)(v[1], v[2], v[3])); else if(hits[484]<0xF0000000u) atomic_inc(&hits[484]); }
+)+"#else"+R( // U_RAND
 	store_u(u, n, v[1]);
 	store_u(u, def_N+(ulong)n, v[2]);
 	store_u(u, 2ul*def_N+(ulong)n, v[3]);
+)+"#endif"+R( // U_RAND
 } // drive_boundary_cubic_lift()
+
 
 // ★ P9c N2F-SCHALE (Heiko-Idee): near -> far Schalen-RUECKKOPPLUNG. Die Hinkopplung oben ist
 // EINWEG (Fernfeld diktiert dem Nahfeld die Raender); das Fernfeld rechnet das Fahrzeug aber nur
@@ -5830,14 +6548,27 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 // Fenster-Konvention: Offsets -ratio/2 .. ratio-ratio/2-1 je Achse (bei ratio=4: -2..+1) -- das
 // Blockzentrum liegt eine HALBE Feinzelle unter dem Deckungspunkt (2 mm bei dx_f=4mm); fuer eine
 // Relaxationsquelle unerheblich, aber deklariert.
-)+R(kernel void schale_extract(const global velxx* u, const global uchar* flags, const global uint* liste, const uint n, const uint ratio, const uint mittel, global float* out) {
+// ★ 05.10.2026 Korrektur A-M1/C-M1: hits (Zaehlerpuffer) angehaengt -- Slot 484 Papierkorb gelesen, ungegatet, saettigend (Soll 0).
+// Ohne U_RAND ungelesen (Parameter steht in beiden Zweigen, damit die Bindung bedingungsfrei bleibt).
+)+R(kernel void schale_extract(const global velxx* u, const global uchar* flags, const global uint* liste, const uint n, const uint ratio, const uint mittel, global float* out, global uint* hits) {
 	const uint gid = get_global_id(0);
 	if(gid>=n) return;
 	const uxx c = (uxx)liste[gid];
+)+"#ifdef U_RAND"+R(
+	const uxx up_sx = (uxx)ur_k(u, URK_P);
+)+"#endif"+R( // U_RAND
 	if(mittel==0u) { // Punktwert (Waechter auf dem Grobgitter): u-FELD-Wert der Schalenzelle
+)+"#ifdef U_RAND"+R(
+		{ const uxx s_ = ur_idx(u, c); // ★ 04.10.2026 U_RAND
+		  if(s_==up_sx&&hits[484]<0xF0000000u) atomic_inc(&hits[484]); // ★ 05.10.2026 A-M1/C-M1
+		  out[3u*gid   ] = ur_ld(u, s_, 0u);
+		  out[3u*gid+1u] = ur_ld(u, s_, 1u);
+		  out[3u*gid+2u] = ur_ld(u, s_, 2u); }
+)+"#else"+R( // U_RAND
 		out[3u*gid   ] = load_u(u, (ulong)c);
 		out[3u*gid+1u] = load_u(u, def_N+(ulong)c);
 		out[3u*gid+2u] = load_u(u, 2ul*def_N+(ulong)c);
+)+"#endif"+R( // U_RAND
 		return;
 	}
 	const uint x = (uint)(c%(uxx)def_Nx), y = (uint)((c/(uxx)def_Nx)%(uxx)def_Ny), z = (uint)(c/((uxx)def_Nx*(uxx)def_Ny));
@@ -5847,11 +6578,19 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 		const int xx=(int)x+dx, yy=(int)y+dy, zz=(int)z+dz;
 		if(xx<0||yy<0||zz<0||xx>=(int)def_Nx||yy>=(int)def_Ny||zz>=(int)def_Nz) continue; // defensiv -- der Setup-Check haelt die Schale >=2 Grobzellen von den Entnahmeebenen fern
 		const uxx nn = (uxx)xx+((uxx)yy+(uxx)zz*(uxx)def_Ny)*(uxx)def_Nx;
-		const uchar bo = flags[nn]&TYPE_BO;
+		const uchar bo = fl(flags, nn)&TYPE_BO;
 		if(bo==TYPE_S||bo==TYPE_E) continue; // nur Fluid; TYPE_MS wird MITGEZAEHLT (MS-Guard-Lehre)
+)+"#ifdef U_RAND"+R(
+		{ const uxx s_ = ur_idx(u, nn); // ★ 04.10.2026 U_RAND: Blockzellen liegen in A (kein Segment C, Plan B.13.3), gleiche Faltungsreihenfolge
+		  if(s_==up_sx&&hits[484]<0xF0000000u) atomic_inc(&hits[484]); // ★ 05.10.2026 A-M1/C-M1 (H1: Fenster ratio^3 gegen den Zensus -- jede Fluidzelle ohne Slot fiele hier still auf 0)
+		  sx += ur_ld(u, s_, 0u);
+		  sy += ur_ld(u, s_, 1u);
+		  sz += ur_ld(u, s_, 2u); }
+)+"#else"+R( // U_RAND
 		sx += load_u(u, (ulong)nn);
 		sy += load_u(u, def_N+(ulong)nn);
 		sz += load_u(u, 2ul*def_N+(ulong)nn);
+)+"#endif"+R( // U_RAND
 		cnt++;
 	}
 	if(cnt==0u) { // kein Fluid im Block -> NaN-Marker, der Blend ueberspringt die Zelle (Bit-Test)
@@ -5888,7 +6627,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 )+"#ifdef SPARSE_TILES"+R(
 	if(is_dead_tile(nn, tile_slot)) return; // XL-Audit B1; das Fernfeld faehrt im dd-Fall ohne Tiling, der Guard kostet dort nichts
 )+"#endif"+R( // SPARSE_TILES
-	const uchar bo = flags[nn]&TYPE_BO;
+	const uchar bo = fl(flags, nn)&TYPE_BO;
 	if(bo==TYPE_S||bo==TYPE_E) return; // TYPE_MS ist FLUID und wird BEHANDELT (MS-Guard-Lehre 2f705ba)
 	const float unx=unear[3u*gid], uny=unear[3u*gid+1u], unz=unear[3u*gid+2u];
 	if((as_uint(unx)&0x7F800000u)==0x7F800000u||(as_uint(uny)&0x7F800000u)==0x7F800000u||(as_uint(unz)&0x7F800000u)==0x7F800000u) return; // NaN/Inf-Bit-Test (isfinite ist unter -cl-finite-math-only toter Code, Gross-Audit M)
@@ -5991,7 +6730,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	// die Daten einer echten aktiven Tile. Genau daran ist der erste T=8-Lauf divergiert (Cd 18.4).
 	if(is_dead_tile(n, tile_slot)) return;
 )+"#endif"+R(
-	if((flags[n]&TYPE_BO)!=TYPE_S) return; // only continue for solid boundary cells
+	if((fl(flags, n)&TYPE_BO)!=TYPE_S) return; // only continue for solid boundary cells
 	uxx j[def_velocity_set]; // neighbor indices
 	neighbors(n, j); // calculate neighbor indices
 	// FORK: nur Solidzellen mit MINDESTENS EINEM Fluidnachbarn rechnen. Die Momentum-Exchange-Kraft
@@ -6001,7 +6740,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	// Inhalt ist weder null noch definiert -- die Zelle traegt dann eine erfundene Kraft bei, die im
 	// dichten Pfad nicht existiert. Genau daran haette die behauptete Bit-Neutralitaet scheitern koennen.
 	bool has_fluid_neighbor = false;
-	for(uint i=1u; i<def_velocity_set; i++) has_fluid_neighbor = has_fluid_neighbor || (flags[j[i]]&TYPE_BO)!=TYPE_S;
+	for(uint i=1u; i<def_velocity_set; i++) has_fluid_neighbor = has_fluid_neighbor || (fl(flags, j[i])&TYPE_BO)!=TYPE_S;
 )+"#ifdef F_LISTE"+R(
 	// ★ 03.09.: unter der Markerliste hat eine Solidzelle OHNE Fluidnachbarn konstruktiv keinen Slot.
 	// Der Nullschreiber ist dort gegenstandslos -- und er WAR die Quelle von 1,85 Mrd. Treffern auf
@@ -6027,12 +6766,19 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	// bitgleich, weil sich die Summationsreihenfolge gegenueber calculate_rho_u aendert.
 	float Fx=0.0f, Fy=0.0f, Fz=0.0f;
 )+"#ifdef MOVING_BOUNDARIES"+R(
+)+"#ifdef U_RAND"+R(
+	const uxx sw_ = ur_idx(u, n); // ★ 04.10.2026 U_RAND: Wandsolid liegt in E bzw. R1 (U-Zensus); Slot 484 Papierkorb ungegatet, 485 Kopf-Magic
+	if(sw_==(uxx)ur_k(u, URK_P)&&hits[484]<0xF0000000u) atomic_inc(&hits[484]);
+	if(ur_k(u, URK_MAGIC)!=UR_MAGIC&&hits[485]<0xF0000000u) atomic_inc(&hits[485]);
+	const float uwx=ur_ld(u, sw_, 0u), uwy=ur_ld(u, sw_, 1u), uwz=ur_ld(u, sw_, 2u);
+)+"#else"+R( // U_RAND
 	const float uwx=load_u(u, n), uwy=load_u(u, def_N+(ulong)n), uwz=load_u(u, 2ul*def_N+(ulong)n);
+)+"#endif"+R( // U_RAND
 	const bool bewegt = (uwx!=0.0f||uwy!=0.0f||uwz!=0.0f);
 )+"#endif"+R( // MOVING_BOUNDARIES
 	for(uint i=1u; i<def_velocity_set; i++) {
 		const uint ib = (i%2u==1u) ? i+1u : i-1u; // Streaming-Ursprung von fhn[i] ist j[opposite(i)]
-		if((flags[j[ib]]&TYPE_BO)==TYPE_S) continue; // toter Link: nie beschrieben, traegt den initialize()-Wert
+		if((fl(flags, j[ib])&TYPE_BO)==TYPE_S) continue; // toter Link: nie beschrieben, traegt den initialize()-Wert
 		const float cix=c(i), ciy=c(def_velocity_set+i), ciz=c(2u*def_velocity_set+i);
 		float m = 2.0f*fhn[i];
 )+"#ifdef MOVING_BOUNDARIES"+R(
@@ -6055,7 +6801,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	const uint lid = get_local_id(0); // local memory reduction of cl_workgroup_size:1
 	local float3 cache[cl_workgroup_size];
 	local uint cells[cl_workgroup_size];
-	const uint is_part_of_object = (uint)(n<(uxx)def_N&&flags[n]==flag_marker);
+	const uint is_part_of_object = (uint)(n<(uxx)def_N&&fl(flags, n)==flag_marker);
 	cache[lid] = is_part_of_object ? position(coordinates(n)) : (float3)(0.0f, 0.0f, 0.0f);
 	cells[lid] = is_part_of_object;
 	barrier(CLK_GLOBAL_MEM_FENCE);
@@ -6086,7 +6832,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	const ulong gid = (ulong)get_global_id(0), gs = (ulong)get_global_size(0); // ★ Pruefbefund 1-b: als uxx wickelt die Schleife im 65536-Fenster unter der uxx-Grenze zur Endlosschleife
 	local float3 cache[cl_workgroup_size];
 	float3 s = (float3)(0.0f, 0.0f, 0.0f);
-	for(ulong n=gid; n<(ulong)def_N; n+=gs) if(flags[(uxx)n]==flag_marker) s += load3_F(F, f_maske, (uxx)n); // feste Reihenfolge je Work-Item
+	for(ulong n=gid; n<(ulong)def_N; n+=gs) if(fl(flags, (uxx)n)==flag_marker) s += load3_F(F, f_maske, (uxx)n); // feste Reihenfolge je Work-Item
 	cache[lid] = s;
 	barrier(CLK_LOCAL_MEM_FENCE); // ★ war CLK_GLOBAL_MEM_FENCE -- der falsche Speicher fuer ein local-Array
 	for(uint st=1u; st<cl_workgroup_size; st*=2u) {
@@ -6102,7 +6848,7 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	const ulong gid = (ulong)get_global_id(0), gs = (ulong)get_global_size(0); // ★ Pruefbefund 1-b: als uxx wickelt die Schleife im 65536-Fenster unter der uxx-Grenze zur Endlosschleife
 	local float3 cache[cl_workgroup_size];
 	float3 s = (float3)(0.0f, 0.0f, 0.0f);
-	for(ulong n=gid; n<(ulong)def_N; n+=gs) if(flags[(uxx)n]==flag_marker&&coordinates((uxx)n).z>=z_lo&&coordinates((uxx)n).z<z_hi) s += load3_F(F, f_maske, (uxx)n);
+	for(ulong n=gid; n<(ulong)def_N; n+=gs) if(fl(flags, (uxx)n)==flag_marker&&coordinates((uxx)n).z>=z_lo&&coordinates((uxx)n).z<z_hi) s += load3_F(F, f_maske, (uxx)n);
 	cache[lid] = s;
 	barrier(CLK_LOCAL_MEM_FENCE);
 	for(uint st=1u; st<cl_workgroup_size; st*=2u) {
@@ -6182,6 +6928,216 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	}
 } // kraft_facetten_gpu()
 
+)+R(void kp1_link(const uint i, const uxx* j, const global fpxx* fi, const global uchar* flags, const ulong tt, const uint haken, float* cx, float* cy, float* cz, uint* cn, uint* ce, uint* ck TS_P) {
+	// ★ 04.10.2026 KRAFT-P1 (Heiko-Entscheid, Bauplan Planungsagent): EIN Link der Druckkraft P1 = Sum 2 w_i (rho_q - 1) c_i,
+	// Bezug rho = 1, c_i zeigt in den Koerper (wie werkzeuge/luecke_of13/zellkraft.py). Linkmenge WORTGLEICH zu update_force_field:
+	// ib = Gegenrichtung, Quelle j[ib] (Streaming-Ursprung von fhn[i]), Link nur wenn die Quelle nicht Solid ist.
+	// rho der Quelle aus den DDFs zum Zeitstand tt (Host uebergibt t-1), Rechnung wortgleich zu rho_ausgabe_ebene:
+	// load_f + calculate_rho_u MIT RHO_CLAMP, drho = rhon - 1. NICHT der rho-Puffer (unter RHO_RAND nur Randschale).
+	// haken 2 (Negativtest): Quelle j[i] statt j[ib] -- der Host-Selbsttest MUSS dann reissen.
+	const uint ib = (i%2u==1u) ? i+1u : i-1u;
+	const uxx q = (haken==2u) ? j[i] : j[ib];
+	const uchar fq = fl(flags, q)&TYPE_BO;
+	if(fq==TYPE_S) return;
+	if(fq==TYPE_E) *ce += 1u;
+	uxx jq[def_velocity_set];
+	neighbors(q, jq);
+	float fhq[def_velocity_set];
+	load_f(q, fhq, fi, jq, tt TS_A);
+	float rhon, uxn, uyn, uzn;
+	calculate_rho_u(fhq, &rhon, &uxn, &uyn, &uzn);
+)+"#ifdef RHO_CLAMP"+R(
+	if(rhon<=RHO_CLAMP_MIN||rhon>=RHO_CLAMP_MAX) *ck += 1u;
+)+"#endif"+R( // RHO_CLAMP
+	const float m = 2.0f*w(i)*(rhon-1.0f);
+	*cx = fma(m, c(i), *cx);
+	*cy = fma(m, c(def_velocity_set+i), *cy);
+	*cz = fma(m, c(2u*def_velocity_set+i), *cz);
+	*cn += 1u;
+} // kp1_link()
+
+)+R(kernel void kraft_p1_gpu(const global fpxx* fi, const global uchar* flags, const global uint* f_maske, const global uint* kf_liste, const uint kf_N, const ulong tt, const uint haken, global float* kp1_f, global uint* kp1_u TS_P) {
+	// ★ 04.10.2026 KRAFT-P1: Druckkraft P1 ueber die Markerzellenliste kf_liste (dieselbe Liste wie kraft_facetten_gpu, die
+	// bleibt wortgleich). Zweck: cd_rest/cz_rest ueber dx vergleichbar messen -- P1 haengt nicht am Facetten-Projektionspfad.
+	// Grid-Stride mit FESTER Gruppenzahl (Host 1024, Muster object_force) -> feste Summationsreihenfolge, keine Atomics.
+	// Lage K = z-Index der Solidzelle (z = 0 Fahrbahn), 8 Lagen K = 0..7 einzeln; das Band (K < N) bildet der Host.
+	// Kanaele float [0..2] P gesamt x/y/z, [3..10] px Lage 0..7, [11..18] pz Lage 0..7;
+	// uint [0] Links gesamt, [1..8] Links je Lage, [9] Links mit TYPE_E-Quelle (Soll 0), [10] Quell-rho an der RHO_CLAMP-Grenze,
+	// [11] Wandzellen mit mindestens einem Link. lid==0 schreibt exklusiv kp1_f[19g+k] und kp1_u[12g+k].
+	const uint lid = get_local_id(0);
+	const uint gsz = get_global_size(0);
+	float sx = 0.0f;
+	float sy = 0.0f;
+	float sz = 0.0f;
+	float lx0 = 0.0f;
+	float lx1 = 0.0f;
+	float lx2 = 0.0f;
+	float lx3 = 0.0f;
+	float lx4 = 0.0f;
+	float lx5 = 0.0f;
+	float lx6 = 0.0f;
+	float lx7 = 0.0f;
+	float lz0 = 0.0f;
+	float lz1 = 0.0f;
+	float lz2 = 0.0f;
+	float lz3 = 0.0f;
+	float lz4 = 0.0f;
+	float lz5 = 0.0f;
+	float lz6 = 0.0f;
+	float lz7 = 0.0f;
+	uint nl = 0u;
+	uint ln0 = 0u;
+	uint ln1 = 0u;
+	uint ln2 = 0u;
+	uint ln3 = 0u;
+	uint ln4 = 0u;
+	uint ln5 = 0u;
+	uint ln6 = 0u;
+	uint ln7 = 0u;
+	uint ne = 0u;
+	uint nk = 0u;
+	uint nw = 0u;
+	for(uint g=get_global_id(0); g<kf_N; g+=gsz) {
+		const uxx n = (uxx)kf_liste[g];
+)+"#ifdef F_LISTE"+R(
+		{
+			uxx s_;
+			if(!f_slot(f_maske, n, &s_)) continue;
+		}
+)+"#endif"+R( // F_LISTE
+		uxx j[def_velocity_set];
+		neighbors(n, j);
+		float cx = 0.0f;
+		float cy = 0.0f;
+		float cz = 0.0f;
+		uint cn = 0u;
+		uint ce = 0u;
+		uint ck = 0u;
+		kp1_link(1u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(2u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(3u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(4u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(5u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(6u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(7u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(8u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(9u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(10u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(11u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(12u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(13u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(14u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(15u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(16u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(17u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(18u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+)+"#ifdef D3Q27"+R(
+		kp1_link(19u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(20u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(21u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(22u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(23u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(24u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(25u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+		kp1_link(26u, j, fi, flags, tt, haken, &cx, &cy, &cz, &cn, &ce, &ck TS_A);
+)+"#endif"+R( // D3Q27
+		sx += cx;
+		sy += cy;
+		sz += cz;
+		nl += cn;
+		ne += ce;
+		nk += ck;
+		if(cn>0u) nw += 1u;
+		const uint K = coordinates(n).z;
+		if(K==0u) {
+			lx0 += cx;
+			lz0 += cz;
+			ln0 += cn;
+		}
+		if(K==1u) {
+			lx1 += cx;
+			lz1 += cz;
+			ln1 += cn;
+		}
+		if(K==2u) {
+			lx2 += cx;
+			lz2 += cz;
+			ln2 += cn;
+		}
+		if(K==3u) {
+			lx3 += cx;
+			lz3 += cz;
+			ln3 += cn;
+		}
+		if(K==4u) {
+			lx4 += cx;
+			lz4 += cz;
+			ln4 += cn;
+		}
+		if(K==5u) {
+			lx5 += cx;
+			lz5 += cz;
+			ln5 += cn;
+		}
+		if(K==6u) {
+			lx6 += cx;
+			lz6 += cz;
+			ln6 += cn;
+		}
+		if(K==7u) {
+			lx7 += cx;
+			lz7 += cz;
+			ln7 += cn;
+		}
+	}
+	local float lf[19u*cl_workgroup_size];
+	local uint lu[12u*cl_workgroup_size];
+	lf[0u*cl_workgroup_size+lid] = sx;
+	lf[1u*cl_workgroup_size+lid] = sy;
+	lf[2u*cl_workgroup_size+lid] = sz;
+	lf[3u*cl_workgroup_size+lid] = lx0;
+	lf[4u*cl_workgroup_size+lid] = lx1;
+	lf[5u*cl_workgroup_size+lid] = lx2;
+	lf[6u*cl_workgroup_size+lid] = lx3;
+	lf[7u*cl_workgroup_size+lid] = lx4;
+	lf[8u*cl_workgroup_size+lid] = lx5;
+	lf[9u*cl_workgroup_size+lid] = lx6;
+	lf[10u*cl_workgroup_size+lid] = lx7;
+	lf[11u*cl_workgroup_size+lid] = lz0;
+	lf[12u*cl_workgroup_size+lid] = lz1;
+	lf[13u*cl_workgroup_size+lid] = lz2;
+	lf[14u*cl_workgroup_size+lid] = lz3;
+	lf[15u*cl_workgroup_size+lid] = lz4;
+	lf[16u*cl_workgroup_size+lid] = lz5;
+	lf[17u*cl_workgroup_size+lid] = lz6;
+	lf[18u*cl_workgroup_size+lid] = lz7;
+	lu[0u*cl_workgroup_size+lid] = nl;
+	lu[1u*cl_workgroup_size+lid] = ln0;
+	lu[2u*cl_workgroup_size+lid] = ln1;
+	lu[3u*cl_workgroup_size+lid] = ln2;
+	lu[4u*cl_workgroup_size+lid] = ln3;
+	lu[5u*cl_workgroup_size+lid] = ln4;
+	lu[6u*cl_workgroup_size+lid] = ln5;
+	lu[7u*cl_workgroup_size+lid] = ln6;
+	lu[8u*cl_workgroup_size+lid] = ln7;
+	lu[9u*cl_workgroup_size+lid] = ne;
+	lu[10u*cl_workgroup_size+lid] = nk;
+	lu[11u*cl_workgroup_size+lid] = nw;
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
+		if(lid%(2u*s)==0u) {
+			for(uint k=0u; k<19u; k++) lf[k*cl_workgroup_size+lid] += lf[k*cl_workgroup_size+lid+s];
+			for(uint k=0u; k<12u; k++) lu[k*cl_workgroup_size+lid] += lu[k*cl_workgroup_size+lid+s];
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+	if(lid==0u) {
+		const uint gr = get_group_id(0);
+		for(uint k=0u; k<19u; k++) kp1_f[19u*gr+k] = lf[k*cl_workgroup_size];
+		for(uint k=0u; k<12u; k++) kp1_u[12u*gr+k] = lu[k*cl_workgroup_size];
+	}
+} // kraft_p1_gpu()
+
 )+R(kernel void sgs_gdiag(const global fpxx* fi, const global velxx* u, const global uchar* flags,
 	const global uint* gd_zellen, const uint gd_N, global float* fac_gd, const ulong t,
 	const float fx, const float fy, const float fz, const uint guo_an TS_P) {
@@ -6214,11 +7170,19 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	float g[3][3]; uint nsolid=0u;
 	for(uint a=0u; a<3u; a++) {
 		const uxx np=j[2u*a+1u], nm=j[2u*a+2u];
-		const bool sp=(flags[np]&TYPE_BO)==TYPE_S, sm=(flags[nm]&TYPE_BO)==TYPE_S;
+		const bool sp=(fl(flags, np)&TYPE_BO)==TYPE_S, sm=(fl(flags, nm)&TYPE_BO)==TYPE_S;
 		nsolid += (uint)sp+(uint)sm;
+)+"#ifdef U_RAND"+R(
+		const uxx sp_ = ur_idx(u, np); // ★ 04.10.2026 U_RAND (g-Diagnose ist unter U_RAND gesperrt; der Pfad bleibt indexrichtig)
+		const uxx sm_ = ur_idx(u, nm);
+		for(uint i=0u; i<3u; i++) {
+			const float up_ = sp?0.0f:ur_ld(u, sp_, i);
+			const float um_ = sm?0.0f:ur_ld(u, sm_, i);
+)+"#else"+R( // U_RAND
 		for(uint i=0u; i<3u; i++) {
 			const float up_ = sp?0.0f:load_u(u, (ulong)i*def_N+(ulong)np);
 			const float um_ = sm?0.0f:load_u(u, (ulong)i*def_N+(ulong)nm);
+)+"#endif"+R( // U_RAND
 			g[i][a] = 0.5f*(up_-um_);
 		}
 	}
@@ -6267,7 +7231,12 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	load_f(n, fhn, fi, j, t TS_A);
 	float rhon, dux, duy, duz;
 	calculate_rho_u(fhn, &rhon, &dux, &duy, &duz); // dux..duz VERWERFEN (Paritaetsfalle), nur rhon zaehlt
+)+"#ifdef U_RAND"+R(
+	const uxx sn_ = ur_idx(u, n); // ★ 04.10.2026 U_RAND (gesperrt, indexrichtig)
+	const float uxn=ur_ld(u, sn_, 0u), uyn=ur_ld(u, sn_, 1u), uzn=ur_ld(u, sn_, 2u);
+)+"#else"+R( // U_RAND
 	const float uxn=load_u(u, n), uyn=load_u(u, def_N+(ulong)n), uzn=load_u(u, 2ul*def_N+(ulong)n);
+)+"#endif"+R( // U_RAND
 	float feq[def_velocity_set];
 	calculate_f_eq(rhon, uxn, uyn, uzn, feq);
 	float Hxx=0.0f, Hyy=0.0f, Hzz=0.0f, Hxy=0.0f, Hxz=0.0f, Hyz=0.0f;
@@ -6301,6 +7270,10 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	const global uint* gd_zellen, const uint gd_N, global float* fac_wfd // ) {
 )+"#ifdef SGS_SISM"+R(
 	, const ulong t, global float* fac_sb, global uint* rho_clamp_hits, const uint sbar_out // ★ 07.09. SISM: Reihenfolge = add_parameters in alloc_facetten_domain (t, fac_sb, hits), VOR tile_slot. ★ 08.09. sbar_out: 0 = fac_wfd traegt w (Lage 1, Geistermoden-Fix), 1 = es traegt Sbar (Band -- dort ersetzt nichts das w, stream_collide zieht Sbar selbst ab)
+)+"#else"+R( // SGS_SISM
+)+"#ifdef U_RAND"+R(
+	, global uint* rho_clamp_hits // ★ 05.10.2026 Korrektur A-M1/C-M1: ohne SISM fehlte der Zaehlerpuffer, und der Papierkorb-Zaehler 484 stand nur unter SGS_SISM. Bindung in lbm.cpp: sism_on ? (t, fac_sb, hits, sbar_out) : u_rand_on ? (hits), VOR tile_slot
+)+"#endif"+R( // U_RAND
 )+"#endif"+R( // SGS_SISM
 	TS_P
 )+") {"+R( // sgs_fdwand() -- Kopfklammern als Strings AUSSERHALB von R() (Muster stream_collide): R() zaehlt Klammern; ein Splice zwischen "(" und ")" innerhalb EINES R-Blocks wird bis zur balancierten Klammer als TEXT stringifiziert -- so kam 07.09. abends ')+"#ifdef SGS_SISM"+R(' woertlich in den OpenCL-Quelltext (JIT -11 in ALLEN Armen, auch SISM=0)
@@ -6323,10 +7296,19 @@ kernel void einlass_eq(global fpxx* fi, const global uchar* flags, const ulong t
 	float g[3][3];
 	for(uint a=0u; a<3u; a++) {
 		const uxx np=j[2u*a+1u], nm=j[2u*a+2u];
-		const bool sp=(flags[np]&TYPE_BO)==TYPE_S, sm=(flags[nm]&TYPE_BO)==TYPE_S;
+		const bool sp=(fl(flags, np)&TYPE_BO)==TYPE_S, sm=(fl(flags, nm)&TYPE_BO)==TYPE_S;
+)+"#ifdef U_RAND"+R(
+		const uxx sp_ = ur_idx(u, np); // ★ 04.10.2026 U_RAND: Facetten-Achsnachbarn ohne reines Solid liegen in E (U-Zensus, Leser "fdwand_nb")
+		const uxx sm_ = ur_idx(u, nm);
+		{ const uxx up_k = (uxx)ur_k(u, URK_P); if(((!sp&&sp_==up_k)||(!sm&&sm_==up_k))&&rho_clamp_hits[484]<0xF0000000u) atomic_inc(&rho_clamp_hits[484]); } // Papierkorb, ungegatet, Soll 0 (★ 05.10.2026 A-M1/C-M1: auch ohne SGS_SISM)
+		for(uint i=0u; i<3u; i++) {
+			const float up_ = sp?0.0f:ur_ld(u, sp_, i);
+			const float um_ = sm?0.0f:ur_ld(u, sm_, i);
+)+"#else"+R( // U_RAND
 		for(uint i=0u; i<3u; i++) {
 			const float up_ = sp?0.0f:load_u(u, (ulong)i*def_N+(ulong)np);
 			const float um_ = sm?0.0f:load_u(u, (ulong)i*def_N+(ulong)nm);
+)+"#endif"+R( // U_RAND
 			g[i][a] = 0.5f*(up_-um_);
 		}
 	}
@@ -6385,8 +7367,15 @@ float apg_rho_zelle(const uxx nb, const global fpxx* fi, const ulong tt TS_P) { 
 )+"#endif"+R( // FACETTEN_APG_HAKEN3
 }
 )+"#endif"+R( // FACETTEN_APG
-)+R(kernel void fac_nachbar_ab(const global velxx* u, const global uchar* flags, const global float* fac_geo,
-	const global uint* gd_zellen, const uint gd_N, global float* fac_nb TS_P) { // ★ 16.09.: unveraendert bis auf def_nb_stride -- der APG-Gradient steht im EIGENEN Kernel fac_apg_ab (Gate-Befund: gemeinsam spillte er 1280 B auf der B70)
+)+R(kernel void fac_nachbar_ab)+"("+R(const global velxx* u, const global uchar* flags, const global float* fac_geo,
+	const global uint* gd_zellen, const uint gd_N, global float* fac_nb
+)+"#ifdef FAC_REKPI"+R(
+	, const global uint* fac_idx // ★ 03.10. REK-PI: Facettentest der Sprungregel (f_bbox + fac_fid). Bindung in lbm.cpp unter fac_rekpi_on (Werkzeugfalle 8)
+)+"#endif"+R( // FAC_REKPI
+)+"#ifdef U_RAND"+R(
+	, global uint* rho_clamp_hits // ★ 05.10.2026 Korrektur A-M1/C-M1: Papierkorb-Zaehler Slot 484. Bindung in lbm.cpp unter u_rand_on, NACH fac_idx, VOR tile_slot (Werkzeugfalle 8)
+)+"#endif"+R( // U_RAND
+	TS_P)+") {"+R( // ★ 16.09.: unveraendert bis auf def_nb_stride -- der APG-Gradient steht im EIGENEN Kernel fac_apg_ab (Gate-Befund: gemeinsam spillte er 1280 B auf der B70). ★ 03.10.: Signatur auf das Klammer-Splice-Muster umgestellt (Werkzeugfalle 4), damit der FAC_REKPI-Parameter im OpenCL-Text landet und nicht im C++-Ausdruck
 	// ★★ DETERMINISTISCHE NACHBARABTASTUNG (CFD_FAC_NACHBAR, 03.09.2026). Der Direktzugriff u[nb] in
 	// apply_facette_imem lief im Kernel stream_collide, der u im selben Launch schreibt -- gemessen NICHT
 	// bitreproduzierbar (xu_det_mit_a/b: cf 0,00073682648 gegen 0,00073630592; ohne NACHBAR bitgleich).
@@ -6413,7 +7402,7 @@ float apg_rho_zelle(const uxx nb, const global fpxx* fi, const ulong tt TS_P) { 
 	float bestp = 0.5f; uint ib = 0u; // Schwelle: Link muss ueberwiegend in Normalenrichtung zeigen
 	float bcx = 0.0f, bcy = 0.0f, bcz = 0.0f; uxx bnb = (uxx)0ul; // Mitschrift des besten Links
 	for(uint ia=1u; ia<def_velocity_set; ia++) {
-		if((flags[j[ia]]&TYPE_BO)!=0u) continue; // nur reines Fluid (kein Solid, kein TYPE_E/MS)
+		if((fl(flags, j[ia])&TYPE_BO)!=0u) continue; // nur reines Fluid (kein Solid, kein TYPE_E/MS)
 		const float cxa=c(ia), cya=c(def_velocity_set+ia), cza=c(2u*def_velocity_set+ia);
 		const float cl = sqrt(cxa*cxa+cya*cya+cza*cza);
 		const float pr = (cxa*nx+cya*ny+cza*nz)/cl;
@@ -6431,7 +7420,13 @@ float apg_rho_zelle(const uxx nb, const global fpxx* fi, const ulong tt TS_P) { 
 )+"#endif"+R( // FAC_REK
 	if(ib>0u) {
 		const uxx nb = bnb;
+)+"#ifdef U_RAND"+R(
+		const uxx snb_ = ur_idx(u, nb); // ★ 04.10.2026 U_RAND: Linkziel (reines Fluid unter den Nachbarn einer Facette) liegt in E (Leser "nachbar_ziele")
+		if(snb_==(uxx)ur_k(u, URK_P)&&rho_clamp_hits[484]<0xF0000000u) atomic_inc(&rho_clamp_hits[484]); // ★ 05.10.2026 A-M1/C-M1: Papierkorb gelesen, ungegatet, Soll 0
+		const float ubx=ur_ld(u, snb_, 0u), uby=ur_ld(u, snb_, 1u), ubz=ur_ld(u, snb_, 2u);
+)+"#else"+R( // U_RAND
 		const float ubx=load_u(u, nb), uby=load_u(u, def_N+(ulong)nb), ubz=load_u(u, 2ul*def_N+(ulong)nb);
+)+"#endif"+R( // U_RAND
 		const float undb = nx*ubx+ny*uby+nz*ubz;
 		const float utxb=ubx-undb*nx, utyb=uby-undb*ny, utzb=ubz-undb*nz;
 		const float ut2 = sqrt(utxb*utxb+utyb*utyb+utzb*utzb);
@@ -6444,12 +7439,156 @@ float apg_rho_zelle(const uxx nb, const global fpxx* fi, const ulong tt TS_P) { 
 )+"#endif"+R( // FAC_REK
 		ywb = yw + (bcx*nx+bcy*ny+bcz*nz); // war c(ib)... -- siehe Scratch-Fix oben
 	}
+)+"#ifdef FAC_REKPI"+R(
+	// ★★ 03.10.2026 REK-PI SPRUNGREGEL (PLAN-REK-PI.md §4, Befund B1). NACHBAR springt heute NICHT ueber
+	// Facettenzellen: an Rang-2-Facetten ist die Abtastzelle selbst eine Facettenzelle (8 mm Dach 22,7 %,
+	// Heck 27,6 %, REK-PI-SCHRITT0.md Tabelle B), und eine Rekonstruktion, die ALLE Facettenzellen setzt,
+	// laese dort ihre eigene Ausgabe. Deshalb: vom NACHBAR-Link (k = 1, dieselbe Wahl wie oben) entlang
+	// DESSELBEN c weiter, solange die Zelle eine aktive Facette ist, hoechstens k = 2.
+	//   k = 1 keine Facette             -> Referenz = k=1-Zelle
+	//   k = 1 Facette, k = 2 reines Fluid und keine Facette -> Referenz = k=2-Zelle
+	//   k = 2 nicht reines Fluid ("blockiert") ODER wieder Facette, oder gar kein k=1-Link -> SENTINEL
+	// Ausgabe NUR in den REK-Floats, [0]/[1] bleiben die k=1-Werte von heute -- damit rechnet der Solve an
+	// allen Zellen ohne REK-PI (Sentinel, und REKPI=1 ueberall) WORTGLEICH weiter (REKPI=1 bitgleich, §9).
+	//   roff+0..2  t_ref (normiert, tangential zur EIGENEN Normale; 0 bei stillem Referenzpunkt)
+	//   roff+3     yw_ref = y_w + k (c.n)   (Bauabweichung: dort stand der REK-Impulsakkumulator, der unter
+	//              FAC_REKPI nicht geschrieben wird)
+	//   roff+4     u_t,ref > 1e-6 gueltig, 0 Referenz steht still, -1 Sentinel (kein Referenzpunkt),
+	//              -2 Nenner-Kollaps der Sekante (★ 04.10. H1: Referenz da, Du <= 0 -> nicht setzen, Slot 473)
+	//   roff+8     ★ 04.10. NUR apply_facette_imem/stream_collide: Ausfluss-Halbmoment T_aus des Zaehlschritts
+	//              (Netto-Fluss-Zaehler [475..483]); dieser Kernel schreibt ihn NICHT
+	//   roff+5..7  u_tau, u_WM(y_w), nu_s (★ 04.10. H1: Sekanten-nu statt nu D', siehe unten) -- das Wandgesetz wird HIER gerechnet, nicht in stream_collide
+	//              (Bauabweichung, nb_rekpi_floats = 3: im Hauptkernel kostete die Spalding-/Newton-Rechnung
+	//              offline gemessen 1408 B Spill auf der B70 (REKPI=1: 2816 statt 1408 B ohne die Rechnung).
+	//              Dieser Kernel laeuft ohnehin je Facette und Schritt, VOR dem naechsten stream_collide, auf
+	//              DENSELBEN Eingaben -- kein zusaetzlicher Versatz gegenueber der Rechnung im Hauptkernel.)
+	//   u_tau = Spalding^-1(u_t,ref, yw_ref) wie die Kette in apply_facette_imem mit nachbar_ab = true (kein
+	//   UTKORR am Nachbarn), u_WM = u_tau u+(y_w u_tau/nu) am EIGENEN y_w (rekpi_uplus), nu_eff = nu D'.
+	// Index ARITHMETISCH aus der Mitschrift (bcx, bcy, bcz) und coordinates(), periodisch wie
+	// calculate_indices -- kein laufzeitindiziertes c(ib)/j[ib] (Scratch-Fix 11.09. oben).
+	// Facettentest wie im Hauptkernel: f_bbox + fac_fid (aktive Facetten, dieselbe Menge wie gd_zellen).
+	// Eigener Launch nach stream_collide auf dem fertigen u-Feld wie bisher: bitreproduzierbar.
+	float rp_ut = -1.0f;
+	float rp_yw = yw;
+	float rp_tx = 0.0f;
+	float rp_ty = 0.0f;
+	float rp_tz = 0.0f;
+	float kr = 1.0f; // ★ 04.10.: aus dem if gehoben -- die Sekante (H1) braucht k hinter dem Block
+	if(ib>0u) {
+		uxx nr = bnb;
+		bool rp_ok = true;
+		uxx fb1 = (uxx)0ul;
+		if(f_bbox(nr, &fb1)&&fac_fid(fac_idx, fb1)!=0xFFFFFFFFu) {
+			const uint3 q1 = coordinates(nr);
+			const uint x2 = (uint)(((int)q1.x+(int)bcx+(int)def_Nx)%(int)def_Nx);
+			const uint y2 = (uint)(((int)q1.y+(int)bcy+(int)def_Ny)%(int)def_Ny);
+			const uint z2 = (uint)(((int)q1.z+(int)bcz+(int)def_Nz)%(int)def_Nz);
+			nr = index((uint3)(x2, y2, z2));
+			kr = 2.0f;
+			uxx fb2 = (uxx)0ul;
+			if((fl(flags, nr)&TYPE_BO)!=0u) rp_ok = false;
+			else if(f_bbox(nr, &fb2)&&fac_fid(fac_idx, fb2)!=0xFFFFFFFFu) rp_ok = false;
+		}
+		if(rp_ok) {
+)+"#ifdef U_RAND"+R(
+			const uxx snr_ = ur_idx(u, nr); // ★ 04.10.2026 U_RAND: REK-PI ist unter U_RAND gesperrt (Chebyshev 2 ausserhalb E); indexrichtig gehalten
+			const float urx = ur_ld(u, snr_, 0u);
+			const float ury = ur_ld(u, snr_, 1u);
+			const float urz = ur_ld(u, snr_, 2u);
+)+"#else"+R( // U_RAND
+			const float urx = load_u(u, nr);
+			const float ury = load_u(u, def_N+(ulong)nr);
+			const float urz = load_u(u, 2ul*def_N+(ulong)nr);
+)+"#endif"+R( // U_RAND
+			const float urn = nx*urx+ny*ury+nz*urz;
+			const float utxr = urx-urn*nx;
+			const float utyr = ury-urn*ny;
+			const float utzr = urz-urn*nz;
+			const float utr = sqrt(utxr*utxr+utyr*utyr+utzr*utzr);
+			const float rinv_r = (utr>1e-6f) ? 1.0f/utr : 0.0f;
+			rp_ut = (utr>1e-6f) ? utr : 0.0f;
+			rp_tx = utxr*rinv_r;
+			rp_ty = utyr*rinv_r;
+			rp_tz = utzr*rinv_r;
+			rp_yw = yw + kr*(bcx*nx+bcy*ny+bcz*nz);
+		}
+	}
+	float rp_tau = 0.0f;
+	float rp_uwm = 0.0f;
+	float rp_nue = 0.0f;
+	if(rp_ut>1e-6f) {
+		const float rp_Y = rp_ut*((2.0f*rp_yw)*def_fac_Y);
+		const float rp_up = wf_spalding_uplus(rp_Y);
+		rp_tau = rp_ut/rp_up;
+		const float2 rp_xd = rekpi_uplus(yw*rp_tau*(2.0f*def_fac_Y));
+		rp_uwm = rp_tau*rp_xd.x;
+		// ★★ 04.10.2026 Pruefbefund H1 -- nu_s aus der SEKANTE statt nu_eff = nu D' am Punkt y_w.
+		// Herleitung (achsparallele Wand, Delta = 1; Halbraummomente D3Q19): der Tangentialfluss ueber die
+		// fluidseitige Flaeche der gesetzten Zelle c zum Nachbarn o ist nach der Kollision
+		//   T = -rho (u_o - u_c)/6 + 1/2 [(1 - w_c) Pi_c + (1 - w_o) Pi_o]
+		// (Gleichgewichtsteil: Sum_{c_n=1} c_t f_eq = rho u_t/6 + rho u_t u_n/2; Nichtgleichgewicht: 1/2 Pi_tn je Seite).
+		// Mit Pi_c = -rho u_tau^2 tau/(tau - 1/2), tau = 3 nu + 1/2 ist (1 - w_c) Pi_c = -rho u_tau^2 + rho u_tau^2/(6 nu);
+		// der zellseitige Halbanteil ist damit -rho u_tau^2/2 + rho (u_tau^2/nu - Du)/12. Er trifft -rho u_tau^2/2 genau
+		// dann, wenn u_tau^2/nu = Du/Delta: nu muss aus der GITTERSEKANTE zum unmittelbaren Nachbarn kommen. Mit nu = nu D'
+		// (Gradient am Punkt) bleibt rho (gamma_WM - Du)/12 je Zelle und Schritt -- ~60 rho u_tau^2 am Kanal, mit
+		// u_tau ~ u_ref positiv rueckgekoppelt (rp_cpu_k26_2 cf -> 1,42; rp_cpu_k0_2 Ub 0,080 -> 0,24 bei f = 0, dann NaN).
+		// Verstaerkung: Du/(12 u_tau^2) ~ 70 bei u_tau 0,003 -- die Sekante muss die TATSAECHLICHE Differenz treffen,
+		// eine Naeherung reicht nicht. Deshalb:
+		//   Sekantenstelle = der UNMITTELBARE Nachbar entlang c_ib (die Flaeche, ueber die c austauscht), Delta = c_ib.n.
+		//   k = 1: das ist die Referenzzelle selbst -> Du = u_t,ref - u_WM, Delta = yw_ref - y_w (Pruefvorschlag, wortgleich).
+		//   k = 2: der unmittelbare Nachbar ist selbst eine Facettenzelle; die Referenz (2 Delta) lieferte bei der
+		//          konkaven Wandgesetzkurve eine zu flache Sekante (Log-Schicht y_w 0,5: ln5/2 gegen ln3, ~ -30 %, mal
+		//          ~70 = Faktor 20 Fehlfluss). Genommen wird u_k1.e1, das tatsaechliche u der k=1-Zelle auf t_ref
+		//          projiziert (dieselbe Abtastung, derselbe Zeitpunkt wie u_t,ref).
+		//   nu_s = u_tau^2 Delta/Du; daraus tau_eff = 3 nu_s + 1/2 (-> w_WM) UND Pi_WM = -rho u_tau^2 (1 + 1/(6 nu_s)).
+		// Der Nachbar o zaehlt mit seinem eigenen Halbanteil (-rho Du/12 + 1/2 (1 - w_o) Pi_o); den regelt seine eigene
+		// Kollision und er ist hier weder bekannt noch (deterministisch) lesbar -- REK-PI stellt nur die zellseitige Haelfte.
+		// Schraege Waende: die uebrigen Links mit c.n > 0 erreichen Nachbarn in anderen Wandabstaenden; deren Sekanten
+		// weichen bei gekruemmtem Profil ab. Das misst der Netto-Fluss-Zaehler [475..481] (kipp26 gegen kipp0).
+		// GRENZFAELLE, ohne Handwert:
+		//   Du <= 0 (Nenner-Kollaps/Umkehr)  -> NICHT setzen: roff+4 = -2 (zweiter Sentinel), Solve wie heute, Slot 473.
+		//   nu_s < nu (molekular)             -> nu_s = nu = 0,5/def_fac_Y. Physikalische Untergrenze (du+/dy+ = 1/D' <= 1;
+		//                                        greift nur durch Rundung/Tabellenfehler), Slot 474.
+		const float rp_dn = bcx*nx+bcy*ny+bcz*nz;
+		float rp_u1 = rp_ut;
+		if(kr>1.5f) {
+)+"#ifdef U_RAND"+R(
+			const uxx sk1_ = ur_idx(u, bnb); // ★ 04.10.2026 U_RAND (REK-PI gesperrt, indexrichtig)
+			const float uk1x = ur_ld(u, sk1_, 0u);
+			const float uk1y = ur_ld(u, sk1_, 1u);
+			const float uk1z = ur_ld(u, sk1_, 2u);
+)+"#else"+R( // U_RAND
+			const float uk1x = load_u(u, bnb);
+			const float uk1y = load_u(u, def_N+(ulong)bnb);
+			const float uk1z = load_u(u, 2ul*def_N+(ulong)bnb);
+)+"#endif"+R( // U_RAND
+			rp_u1 = uk1x*rp_tx+uk1y*rp_ty+uk1z*rp_tz;
+		}
+		const float rp_du = rp_u1-rp_uwm;
+		if(rp_du>0.0f) {
+			rp_nue = fmax(rp_tau*rp_tau*rp_dn/rp_du, 0.5f/def_fac_Y);
+		} else {
+			rp_ut = -2.0f;
+		}
+	}
+)+"#endif"+R( // FAC_REKPI
 	fac_nb[def_nb_stride*(ulong)gid] = utb;
 	fac_nb[def_nb_stride*(ulong)gid+1ul] = ywb;
 )+"#ifdef FAC_REK"+R(
+)+"#ifdef FAC_REKPI"+R(
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+0ul] = rp_tx;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+1ul] = rp_ty;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+2ul] = rp_tz;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+3ul] = rp_yw;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+4ul] = rp_ut;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+5ul] = rp_tau;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+6ul] = rp_uwm;
+	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+7ul] = rp_nue;
+)+"#else"+R(
 	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+0ul] = tnx;
 	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+1ul] = tny;
 	fac_nb[def_nb_stride*(ulong)gid+def_nb_roff+2ul] = tnz;
+)+"#endif"+R( // FAC_REKPI
 )+"#endif"+R(
  // def_nb_stride = 2 (5 unter FACETTEN_APG), JIT-Emission lbm.cpp
 } // fac_nachbar_ab()
@@ -6477,12 +7616,12 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 	  // Bloecke mit LITERALEN Linkindizes 1..6 -- die Achsenerkennung ueber c(ia) faltet der Compiler bei Literalen weg.
 	  const float r0 = apg_rho_zelle(n, fi, t+1ul TS_A);
 	  float sx=0.0f, sy=0.0f, sz=0.0f, kx=0.0f, ky=0.0f, kz=0.0f; // Summen und Nachbarzahl je Achse
-	  if(fabs(c(1u))+fabs(c(def_velocity_set+1u))+fabs(c(2u*def_velocity_set+1u))==1.0f&&(flags[j[1]]&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[1], fi, t+1ul TS_A)-r0; sx=fma(d_,c(1u),sx); sy=fma(d_,c(def_velocity_set+1u),sy); sz=fma(d_,c(2u*def_velocity_set+1u),sz); kx+=fabs(c(1u)); ky+=fabs(c(def_velocity_set+1u)); kz+=fabs(c(2u*def_velocity_set+1u)); }
-	  if(fabs(c(2u))+fabs(c(def_velocity_set+2u))+fabs(c(2u*def_velocity_set+2u))==1.0f&&(flags[j[2]]&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[2], fi, t+1ul TS_A)-r0; sx=fma(d_,c(2u),sx); sy=fma(d_,c(def_velocity_set+2u),sy); sz=fma(d_,c(2u*def_velocity_set+2u),sz); kx+=fabs(c(2u)); ky+=fabs(c(def_velocity_set+2u)); kz+=fabs(c(2u*def_velocity_set+2u)); }
-	  if(fabs(c(3u))+fabs(c(def_velocity_set+3u))+fabs(c(2u*def_velocity_set+3u))==1.0f&&(flags[j[3]]&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[3], fi, t+1ul TS_A)-r0; sx=fma(d_,c(3u),sx); sy=fma(d_,c(def_velocity_set+3u),sy); sz=fma(d_,c(2u*def_velocity_set+3u),sz); kx+=fabs(c(3u)); ky+=fabs(c(def_velocity_set+3u)); kz+=fabs(c(2u*def_velocity_set+3u)); }
-	  if(fabs(c(4u))+fabs(c(def_velocity_set+4u))+fabs(c(2u*def_velocity_set+4u))==1.0f&&(flags[j[4]]&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[4], fi, t+1ul TS_A)-r0; sx=fma(d_,c(4u),sx); sy=fma(d_,c(def_velocity_set+4u),sy); sz=fma(d_,c(2u*def_velocity_set+4u),sz); kx+=fabs(c(4u)); ky+=fabs(c(def_velocity_set+4u)); kz+=fabs(c(2u*def_velocity_set+4u)); }
-	  if(fabs(c(5u))+fabs(c(def_velocity_set+5u))+fabs(c(2u*def_velocity_set+5u))==1.0f&&(flags[j[5]]&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[5], fi, t+1ul TS_A)-r0; sx=fma(d_,c(5u),sx); sy=fma(d_,c(def_velocity_set+5u),sy); sz=fma(d_,c(2u*def_velocity_set+5u),sz); kx+=fabs(c(5u)); ky+=fabs(c(def_velocity_set+5u)); kz+=fabs(c(2u*def_velocity_set+5u)); }
-	  if(fabs(c(6u))+fabs(c(def_velocity_set+6u))+fabs(c(2u*def_velocity_set+6u))==1.0f&&(flags[j[6]]&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[6], fi, t+1ul TS_A)-r0; sx=fma(d_,c(6u),sx); sy=fma(d_,c(def_velocity_set+6u),sy); sz=fma(d_,c(2u*def_velocity_set+6u),sz); kx+=fabs(c(6u)); ky+=fabs(c(def_velocity_set+6u)); kz+=fabs(c(2u*def_velocity_set+6u)); }
+	  if(fabs(c(1u))+fabs(c(def_velocity_set+1u))+fabs(c(2u*def_velocity_set+1u))==1.0f&&(fl(flags, j[1])&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[1], fi, t+1ul TS_A)-r0; sx=fma(d_,c(1u),sx); sy=fma(d_,c(def_velocity_set+1u),sy); sz=fma(d_,c(2u*def_velocity_set+1u),sz); kx+=fabs(c(1u)); ky+=fabs(c(def_velocity_set+1u)); kz+=fabs(c(2u*def_velocity_set+1u)); }
+	  if(fabs(c(2u))+fabs(c(def_velocity_set+2u))+fabs(c(2u*def_velocity_set+2u))==1.0f&&(fl(flags, j[2])&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[2], fi, t+1ul TS_A)-r0; sx=fma(d_,c(2u),sx); sy=fma(d_,c(def_velocity_set+2u),sy); sz=fma(d_,c(2u*def_velocity_set+2u),sz); kx+=fabs(c(2u)); ky+=fabs(c(def_velocity_set+2u)); kz+=fabs(c(2u*def_velocity_set+2u)); }
+	  if(fabs(c(3u))+fabs(c(def_velocity_set+3u))+fabs(c(2u*def_velocity_set+3u))==1.0f&&(fl(flags, j[3])&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[3], fi, t+1ul TS_A)-r0; sx=fma(d_,c(3u),sx); sy=fma(d_,c(def_velocity_set+3u),sy); sz=fma(d_,c(2u*def_velocity_set+3u),sz); kx+=fabs(c(3u)); ky+=fabs(c(def_velocity_set+3u)); kz+=fabs(c(2u*def_velocity_set+3u)); }
+	  if(fabs(c(4u))+fabs(c(def_velocity_set+4u))+fabs(c(2u*def_velocity_set+4u))==1.0f&&(fl(flags, j[4])&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[4], fi, t+1ul TS_A)-r0; sx=fma(d_,c(4u),sx); sy=fma(d_,c(def_velocity_set+4u),sy); sz=fma(d_,c(2u*def_velocity_set+4u),sz); kx+=fabs(c(4u)); ky+=fabs(c(def_velocity_set+4u)); kz+=fabs(c(2u*def_velocity_set+4u)); }
+	  if(fabs(c(5u))+fabs(c(def_velocity_set+5u))+fabs(c(2u*def_velocity_set+5u))==1.0f&&(fl(flags, j[5])&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[5], fi, t+1ul TS_A)-r0; sx=fma(d_,c(5u),sx); sy=fma(d_,c(def_velocity_set+5u),sy); sz=fma(d_,c(2u*def_velocity_set+5u),sz); kx+=fabs(c(5u)); ky+=fabs(c(def_velocity_set+5u)); kz+=fabs(c(2u*def_velocity_set+5u)); }
+	  if(fabs(c(6u))+fabs(c(def_velocity_set+6u))+fabs(c(2u*def_velocity_set+6u))==1.0f&&(fl(flags, j[6])&TYPE_BO)!=TYPE_S) { const float d_=apg_rho_zelle(j[6], fi, t+1ul TS_A)-r0; sx=fma(d_,c(6u),sx); sy=fma(d_,c(def_velocity_set+6u),sy); sz=fma(d_,c(2u*def_velocity_set+6u),sz); kx+=fabs(c(6u)); ky+=fabs(c(def_velocity_set+6u)); kz+=fabs(c(2u*def_velocity_set+6u)); }
 	  float gx = (kx>0.0f) ? sx/kx : 0.0f, gy = (ky>0.0f) ? sy/ky : 0.0f, gz = (kz>0.0f) ? sz/kz : 0.0f;
 	  if(t%def_zaehl_takt==0ul) { // Zaehler nur an Zaehlschritten (Absturzlehre 15.09.: nichts Atomares im Immerpfad)
 		if(rho_clamp_hits[306]<0xF0000000u) atomic_inc(&rho_clamp_hits[306]); // Vorkernel-Besuche (Soll = [7])
@@ -6508,7 +7647,7 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 	// las das weit hinter dem Puffer. Latent, weil object_torque von keinem Setup gerufen wird -- aber
 	// es ist eine Falle fuer den Tag, an dem jemand Momente auswertet. Alle uebrigen F-Zugriffe des
 	// Forks waren bereits auf load3_F umgestellt, nur dieser eine nicht.
-	cache[lid] = n<(uxx)def_N&&flags[n]==flag_marker ? cross(position(coordinates(n))-(float3)(cx, cy, cz), load3_F(F, f_maske, n)) : (float3)(0.0f, 0.0f, 0.0f);
+	cache[lid] = n<(uxx)def_N&&fl(flags, n)==flag_marker ? cross(position(coordinates(n))-(float3)(cx, cy, cz), load3_F(F, f_maske, n)) : (float3)(0.0f, 0.0f, 0.0f);
 	barrier(CLK_GLOBAL_MEM_FENCE);
 	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
 		if(lid%(2u*s)==0u) cache[lid] += cache[lid+s];
@@ -6702,14 +7841,14 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 	((global float*)transfer_buffer)[    A+a] = load_u(u, n);
 	((global float*)transfer_buffer)[ 2u*A+a] = load_u(u, def_N+(ulong)n);
 	((global float*)transfer_buffer)[ 3u*A+a] = load_u(u, 2ul*def_N+(ulong)n);
-	((global uchar*)transfer_buffer)[16u*A+a] = flags[             n];
+	((global uchar*)transfer_buffer)[16u*A+a] = fl(flags,              n);
 }
 )+R(void insert_rho_u_flags(const uint a, const uint A, const uxx n, const global char* transfer_buffer, global rhoxx* rho, global velxx* u, global uchar* flags) {
 	store_rho(rho,     n,   ((const global float*)transfer_buffer)[      a]);
 	store_u(u, n, ((const global float*)transfer_buffer)[    A+a]);
 	store_u(u, def_N+(ulong)n, ((const global float*)transfer_buffer)[ 2u*A+a]);
 	store_u(u, 2ul*def_N+(ulong)n, ((const global float*)transfer_buffer)[ 3u*A+a]);
-	flags[             n] = ((const global uchar*)transfer_buffer)[16u*A+a];
+	st_fl(flags, n, ((const global uchar*)transfer_buffer)[16u*A+a]);
 }
 )+R(kernel void transfer_extract_rho_u_flags(const uint direction, const ulong t, global char* transfer_buffer_p, global char* transfer_buffer_m, const global rhoxx* rho, const global velxx* u, const global uchar* flags) {
 	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
@@ -6727,14 +7866,14 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 )+R(kernel void transfer_extract_flags(const uint direction, const ulong t, global uchar* transfer_buffer_p, global uchar* transfer_buffer_m, const global uchar* flags) {
 	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
 	if(a>=A) return; // area might not be a multiple of cl_workgroup_size, so return here to avoid writing in unallocated memory space
-	transfer_buffer_p[a] = flags[index_extract_p(a, direction)];
-	transfer_buffer_m[a] = flags[index_extract_m(a, direction)];
+	transfer_buffer_p[a] = fl(flags, index_extract_p(a, direction));
+	transfer_buffer_m[a] = fl(flags, index_extract_m(a, direction));
 }
 )+R(kernel void transfer__insert_flags(const uint direction, const ulong t, const global uchar* transfer_buffer_p, const global uchar* transfer_buffer_m, global uchar* flags) {
 	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
 	if(a>=A) return; // area might not be a multiple of cl_workgroup_size, so return here to avoid writing in unallocated memory space
-	flags[index_insert_p(a, direction)] = transfer_buffer_p[a];
-	flags[index_insert_m(a, direction)] = transfer_buffer_m[a];
+	st_fl(flags, index_insert_p(a, direction), transfer_buffer_p[a]);
+	st_fl(flags, index_insert_m(a, direction), transfer_buffer_m[a]);
 }
 
 )+"#ifdef FORCE_FIELD"+R(
@@ -6898,12 +8037,16 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 		}
 		inside = inside&&(intersection<intersections&&h<hmesh); // point must be outside if there are no more ray-mesh intersections ahead (error correction)
 		const uxx n = index((uint3)(direction==0u?h:xyz.x, direction==1u?h:xyz.y, direction==2u?h:xyz.z));
-		uchar flagsn = flags[n];
+		uchar flagsn = fl(flags, n);
 		const float3 p = position(coordinates(n))+offset;
 		const float3 u_set = (float3)(ux, uy, uz)+cross((float3)(cx, cy, cz)-p, (float3)(rx, ry, rz));
 		if(inside) { // cell is inside of mesh geometry
 			flagsn = (flagsn&~TYPE_BO)|flag; // set flag
+)+"#ifdef U_RAND"+R(
+			if(set_u) { const uxx s_ = ur_idx(u, n); if(s_<(uxx)ur_k(u, URK_P)) ur_st3(u, s_, u_set); } // ★ 04.10.2026 U_RAND. ★ 05.10.2026 Korrektur C-M2: set_u ist hier nie wahr -- LBM_Domain::voxelize_mesh_on_device bricht unter U_RAND bei Geschwindigkeit != 0 hart ab (vorher stand hier eine Sperre, die es nicht gab)
+)+"#else"+R( // U_RAND
 			if(set_u) store3_u(u, n, u_set); // set solid velocity
+)+"#endif"+R( // U_RAND
 		} else { // cell is outside of mesh geometry
 			if((flagsn&TYPE_BO)==TYPE_S&&(flagsn&TYPE_XY)==(flag&TYPE_XY)) { // cell was previously marked solid
 				// ★ TODO 2 Schritt 4 (12.09.2026) -- LATENT, heute inert, und deshalb hier angesagt statt
@@ -6914,7 +8057,12 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 				// Heute inert, weil alle fuenf Aufrufer set_u == false fahren und u_set damit (0,0,0)
 				// ist -- und 0,0f ist unter FP16S ein exakter Fixpunkt (Wort 0x0000). Wer je eine
 				// BEWEGTE oder rotierende Geometrie voxelisiert, braucht hier ein Ein-Quant-Epsilon.
+)+"#ifdef U_RAND"+R(
+				float3 un = (float3)(0.0f, 0.0f, 0.0f); // ★ 04.10.2026 U_RAND: ungespeichert (oder Platzhalter vor alloc_u_rand) = 0, wie der Vollpuffer vor dem ersten Hochladen
+				{ const uxx s_ = ur_idx(u, n); if(s_<(uxx)ur_k(u, URK_P)) un = (float3)(ur_ld(u, s_, 0u), ur_ld(u, s_, 1u), ur_ld(u, s_, 2u)); }
+)+"#else"+R( // U_RAND
 				const float3 un = load3_u(u, n); // load previous velocity
+)+"#endif"+R( // U_RAND
 				if(un.x==u_set.x&&un.y==u_set.y&&un.z==u_set.z) { // velocity matched: cell belonged to the currently voxelized geometry
 )+"#ifndef SPARSE_TILES"+R(
 					// FORK: bei SPARSE_TILES ist fi zur Voxelisierungszeit noch der 1-Zell-Platzhalter --
@@ -6933,7 +8081,7 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 				} // else: don't change cell state
 			}
 		}
-		flags[n] = flagsn;
+		st_fl(flags, n, flagsn);
 )+"#ifdef SURFACE"+R(
 		mass[n] += massex[n]; // apply distributed excess mass
 		massex[n] = 0.0f; // clear excess mass
@@ -6943,8 +8091,9 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 
 )+R(kernel void unvoxelize_mesh(global uchar* flags, const uchar flag, float x0, float y0, float z0, float x1, float y1, float z1) { // remove voxelized triangle mesh
 	const uxx n = get_global_id(0);
+	if(n>=(uxx)def_N) return; // ★ 05.10.2026 Korrektur A-N5: das globale Raster ist auf die Arbeitsgruppe aufgerundet; unter FLAGS4 griffe st_fl sonst jenseits von flags4_bytes(N)
 	const float3 p = position(coordinates(n))+(float3)(0.5f*(float)((int)def_Nx+2*def_Ox)-0.5f, 0.5f*(float)((int)def_Ny+2*def_Oy)-0.5f, 0.5f*(float)((int)def_Nz+2*def_Oz)-0.5f);
-	if(p.x>=x0-1.0f&&p.y>=y0-1.0f&&p.z>=z0-1.0f&&p.x<=x1+1.0f&&p.y<=y1+1.0f&&p.z<=z1+1.0f) flags[n] &= ~flag;
+	if(p.x>=x0-1.0f&&p.y>=y0-1.0f&&p.z>=z0-1.0f&&p.x<=x1+1.0f&&p.y<=y1+1.0f&&p.z<=z1+1.0f) st_fl(flags, n, (uchar)(fl(flags, n)&~flag));
 } // unvoxelize_mesh()
 
 

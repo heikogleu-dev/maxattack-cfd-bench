@@ -15,6 +15,7 @@ struct Info { // contains redundant information for console printing
 	std::mutex allow_printing; // to prevent threading conflicts when continuously printing updates to console
 	void append(const ulong steps, const ulong total_steps, const ulong t);
 	void update(const double dt);
+	void lauf_binden(LBM* lbm, const ulong total_steps); // ★ 03.10.2026: Laufzeile an EIN LBM binden und ihre Zaehler frisch setzen (fahrzeug_dd: Nahfeld)
 	double time() const; // returns either elapsed time or remaining time
 	void print_logo() const;
 	void print_initialize(LBM* lbm); // enables interactive rendering

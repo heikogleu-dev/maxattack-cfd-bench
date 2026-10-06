@@ -1,8 +1,30 @@
 #include "lbm.hpp"
+#include <cstring> // ★ 04.10.2026 U_RAND: memcpy des Kopfs
 #include <atomic> // C2: Zaehler fuer CFD_DUMP_CL-Dateinamen
 
 // ★ F-Null-Read-Gate (Perf-Audit Achse 1, Rang 3): EIN Praedikat fuer Emission, Ansage und
 // F-Waechter -- nie dreimal getrennt auswerten (Drift-Schutz). Default AN.
+// ★ 02.10.2026 Messarm CFD_SC_SIMD16=<OpenCL-Geraete-ID> (Pruefbefund SC16 M2): streng gelesen -- leer/ungesetzt = aus (-1), Nicht-Zahl = harter Fehler
+// statt still Geraet 0 (atoi). Die Pruefung, dass das Define auch auf einem Geraet ankommt, steht in setup.cpp (pruefe_sc_simd16).
+int sc_simd16_geraet() {
+	const char* e = getenv("CFD_SC_SIMD16");
+	if(e==nullptr||e[0]=='\0') return -1;
+	char* ende = nullptr;
+	const unsigned long v = strtoul(e, &ende, 10);
+	if(ende==e||*ende!='\0'||v>255ul) print_error("CFD_SC_SIMD16 = \""+string(e)+"\" ist keine OpenCL-Geraete-ID (erwartet z. B. 1 fuer die B70).");
+	return (int)v;
+}
+// ★ 05.10.2026 CFD_ZELLBASEN (PLAN-ZELLBASEN-2026-10-05.md, Messarm 6 aus TILING-AUFHOLEN): streng gelesen wie CFD_SC_SIMD16 --
+// ungesetzt/leer = 1 (Vorgabe, Byte-Zellbasen), 0 = alter Pfad ueber index_f; alles andere ist ein harter Fehler statt still 0 (atoi).
+// Global fuer alle Domaenen und Faelle (reiner Geraetepfad ohne Host-Zwilling, darum keine Statik mit Lese-/Nullstellen).
+uint zellbasen_modus() {
+	const char* e = getenv("CFD_ZELLBASEN");
+	if(e==nullptr||e[0]=='\0') return 1u;
+	if(string(e)=="0") return 0u;
+	if(string(e)=="1") return 1u;
+	print_error("CFD_ZELLBASEN = \""+string(e)+"\" -- erlaubt sind nur 0 (alter Pfad, index_f) und 1 (Byte-Zellbasen, Vorgabe).");
+	return 1u;
+}
 static bool f_nur_solid_an() { const char* e = getenv("CFD_F_NUR_SOLID"); return e==nullptr||e[0]=='\0'||atoi(e)>0; } // leer gesetzt = Default AN (Pruefagent NIEDRIG-2)
 
 Units units; // for unit conversion
@@ -73,6 +95,174 @@ uint bandwidth_bytes_per_cell_device() { // returns the bandwidth in Bytes per c
 #endif // TEMPERATURE
 	return bandwidth_bytes_per_cell;
 }
+// ★ 05.10.2026 FLAGS4 F0 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md C.4): Host-Packer. Gearbeitet wird in Bloecken zu 2^20 Ausgabebytes
+// (ein std::function-Aufruf je Zelle waere bei 4 mm 655 Mio Aufrufe). Jedes Ausgabebyte gehoert genau einem Block: kein Wettlauf.
+ulong flags4_packen(const uchar* f, const ulong N, uchar* p) {
+	const ulong nb = flags4_bytes(N), bs = 1048576ull, nblk = (nb+bs-1ull)/bs;
+	std::vector<ulong> fremd(nblk, 0ull);
+	parallel_for(nblk, [&](ulong k) {
+		const ulong b0 = k*bs, b1 = min(nb, b0+bs);
+		ulong fr = 0ull;
+		for(ulong b=b0; b<b1; b++) {
+			const ulong n0 = 2ull*b, n1 = n0+1ull;
+			const uchar f0 = n0<N ? f[n0] : (uchar)0u;
+			const uchar f1 = n1<N ? f[n1] : (uchar)0u;
+			fr += (ulong)((f0&0x3Cu)!=0u)+(ulong)((f1&0x3Cu)!=0u);
+			p[b] = (uchar)(flags4_enc(f0)|(flags4_enc(f1)<<4u));
+		}
+		fremd[k] = fr;
+	});
+	ulong s = 0ull;
+	for(ulong k=0ull; k<nblk; k++) s += fremd[k];
+	return s;
+}
+void flags4_entpacken(const uchar* p, const ulong N, uchar* f) {
+	const ulong nb = (N+1ull)/2ull, bs = 1048576ull, nblk = (nb+bs-1ull)/bs;
+	parallel_for(nblk, [&](ulong k) {
+		const ulong b0 = k*bs, b1 = min(nb, b0+bs);
+		for(ulong b=b0; b<b1; b++) {
+			const ulong n0 = 2ull*b, n1 = n0+1ull;
+			f[n0] = flags4_dec((uchar)(p[b]&0x0Fu));
+			if(n1<N) f[n1] = flags4_dec((uchar)(p[b]>>4u));
+		}
+	});
+}
+uint flags4_selbsttest() {
+	uint bad = 0u;
+	uint codes_ok = 0u;
+	for(uint c=0u; c<16u; c++) { // (1) alle 16 Codes: dec ist injektiv, enc(dec(c)) = c
+		const uchar f = flags4_dec((uchar)c);
+		if(flags4_enc(f)==(uchar)c&&(f&0x3Cu)==0u) codes_ok++;
+	}
+	if(codes_ok!=16u) bad++;
+	uint byte_ok = 0u; // (2) alle 256 Bytewerte: genau die mit (f & 0x3C) == 0 ueberleben die Rundreise unveraendert
+	for(uint f=0u; f<256u; f++) {
+		const bool rein = (f&0x3Cu)==0u;
+		const bool rund = flags4_dec(flags4_enc((uchar)f))==(uchar)f;
+		if(rein==rund) byte_ok++;
+	}
+	if(byte_ok!=256u) bad++;
+	const ulong N = 1000003ull; // (3) Feld mit ungerader Zellzahl (letztes Byte halb belegt) aus den real vorkommenden Werten 0x00/01/02/03/41 und TYPE_Y-Kombinationen
+	const uchar werte[8] = {0x00u, 0x01u, 0x02u, 0x03u, 0x41u, 0x40u, 0x80u, 0xC3u};
+	std::vector<uchar> f(N), p(flags4_bytes(N), (uchar)0xAAu), r(N, (uchar)0x55u);
+	ulong x = 0x9E3779B97F4A7C15ull;
+	for(ulong n=0ull; n<N; n++) { x ^= x<<13; x ^= x>>7; x ^= x<<17; f[n] = werte[x&7ull]; }
+	const ulong fremd = flags4_packen(f.data(), N, p.data());
+	flags4_entpacken(p.data(), N, r.data());
+	ulong abw = 0ull;
+	for(ulong n=0ull; n<N; n++) abw += (ulong)(r[n]!=f[n]);
+	ulong rest = 0ull; // Bytes hinter der letzten Zelle muessen 0 sein (der Kernel liest dort nie, aber das Wort wird atomar geschrieben)
+	for(ulong b=(N+1ull)/2ull; b<p.size(); b++) rest += (ulong)(p[b]!=0u);
+	const ulong hoch = (ulong)(p[(N-1ull)/2ull]>>4u); // N ungerade: das obere Nibble des letzten belegten Bytes ist leer
+	std::vector<uchar> g(4ull, (uchar)0x3Cu); // (4) Fremdbit-Erkennung: vier Zellen, alle mit verbotenen Bits
+	std::vector<uchar> gp(flags4_bytes(4ull));
+	const ulong fremd_soll4 = flags4_packen(g.data(), 4ull, gp.data());
+	if(fremd!=0ull||abw!=0ull||rest!=0ull||hoch!=0ull) bad++;
+	if(fremd_soll4!=4ull) bad++;
+	println("FLAGS4 SELBSTTEST Codes "+to_string(codes_ok)+"/16 Bytewerte "+to_string(byte_ok)+"/256 Feld N "+to_string(N)+" abweichend "+to_string(abw)+" fremd "+to_string(fremd)+" Rest "+to_string(rest+hoch)+" Fremdbit-Probe "+to_string(fremd_soll4)+"/4 Beanstandungen "+to_string(bad)+" (Soll 0)");
+	return bad;
+}
+// ★ 05.10.2026 FLAGS4 F3 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md C.2/C.4): Fassade der Domaenen-flags. FLAGS4=0 ruft exakt die
+// Memory-Aufrufe von vorher (h ist Host+Geraet wie bisher). FLAGS4=1 packt beim Schreiben und entpackt beim Lesen.
+void Flags_Puffer::anlegen(Device& device, const ulong N, const bool vier, const uint haken) {
+	this->dev = &device;
+	this->N = N;
+	this->vier = vier;
+	this->haken = haken;
+	if(!vier) {
+		h = Memory<uchar>(device, N); // wie bisher
+	} else {
+		h = Memory<uchar>(device, N, 1u, true, false); // nur Host, KEIN Geraetepuffer
+		g = Memory<uchar>(device, flags4_bytes(N)); // gepackt, Host-Schatten + Geraet
+		println("FLAGS4 PUFFER N "+to_string(N)+" gepackt "+to_string(g.capacity())+" B ("+to_string((float)((double)g.capacity()/1048576.0),2u)+" MiB) statt "+to_string(N)+" B ("+to_string((float)((double)N/1048576.0),2u)+" MiB), Ersparnis "+to_string((float)((double)(N-g.capacity())/1048576.0),2u)+" MiB");
+	}
+}
+void Flags_Puffer::read_from_device() {
+	if(!vier) { h.read_from_device(); return; }
+	g.read_from_device(); // blockierend; bei Zero-Copy leert es die Queue (opencl.hpp), danach ist der Schatten gueltig
+	flags4_entpacken(g.data(), N, h.data());
+	n_runter++;
+}
+void Flags_Puffer::write_to_device(const bool blocking) {
+	if(!vier) { h.write_to_device(blocking); return; }
+	g.finish_queue(); // Zero-Copy: Schatten = Geraetespeicher -- kein Kernel darf mehr lesen, waehrend gepackt wird
+	const ulong fr = flags4_packen(h.data(), N, g.data());
+	fremd += fr;
+	if(fr>0ull) print_error("FLAGS4: "+to_string(fr)+" Zelle(n) tragen Bits ausserhalb {0,1,6,7} (TYPE_T/F/I/G) -- 4 Bit koennen sie nicht darstellen. Lauf nicht gestartet.");
+	{ // Rundreise am echten Feld: entpacken und gegen h vergleichen (Soll 0)
+		std::vector<uchar> r(N);
+		flags4_entpacken(g.data(), N, r.data());
+		ulong abw = 0ull;
+		for(ulong n=0ull; n<N; n++) abw += (ulong)(r[n]!=h[n]);
+		rundreise_abw += abw;
+		if(abw>0ull) print_error("FLAGS4: Rundreise des echten Feldes weicht an "+to_string(abw)+" Zellen ab. Lauf nicht gestartet.");
+	}
+	if(haken==1u&&n_hoch==0ull) { // Testhaken: erste Feststoffzelle (TYPE_S) im gepackten Puffer zu Fluid kippen
+		ulong z = N;
+		for(ulong n=0ull; n<N; n++) if((h[n]&0x03u)==0x01u) { z = n; break; }
+		if(z<N) { g[z>>1] = (uchar)(g[z>>1]^(uchar)(0x01u<<((uint)(z&1ull)<<2u))); haken_zelle = (long)z; println("FLAGS4-TESTHAKEN 1: Nibble der Zelle "+to_string(z)+" im gepackten Puffer gekippt (TYPE_S -> 0). Soll: Geraeteprobe nach dem Hochladen meldet genau 1 abweichende Gruppe."); }
+		else print_warning("FLAGS4-TESTHAKEN 1: keine TYPE_S-Zelle gefunden -- Haken wirkungslos.");
+	}
+	g.write_to_device(true); // immer blockierend: der Schatten darf nach der Rueckkehr wieder beschrieben werden
+	n_hoch++;
+	(void)blocking;
+}
+void Flags_Puffer::geraet_in(std::vector<uchar>& ziel) {
+	ziel.resize(N);
+	if(vier) {
+		g.read_from_device();
+		flags4_entpacken(g.data(), N, ziel.data());
+	} else {
+		cl::CommandQueue q = dev->get_cl_queue();
+		q.enqueueReadBuffer(h.get_cl_buffer(), CL_TRUE, 0ull, N, (void*)ziel.data()); // h bleibt unberuehrt (der Host-Spiegel traegt bis zum naechsten Setup-Read den Zustand VOR initialize)
+	}
+}
+void LBM::Flags_Feld::read_from_device() { // ★ 05.10.2026 FLAGS4: wie Memory_Container::read_from_device, aber je Domaene ueber die Fassade
+#ifndef UPDATE_FIELDS
+	if(lbm_->initialized) for(uint d=0u; d<lbm_->get_D(); d++) lbm_->lbm_domain[d]->enqueue_update_fields();
+#endif // UPDATE_FIELDS
+	for(uint d=0u; d<lbm_->get_D(); d++) lbm_->lbm_domain[d]->flags.read_from_device();
+}
+void LBM::Flags_Feld::write_to_device() {
+	for(uint d=0u; d<lbm_->get_D(); d++) lbm_->lbm_domain[d]->flags.write_to_device();
+}
+uint LBM_Domain::flags4_geraeteprobe(const string& wann, const bool gegen_host) { // ★ 05.10.2026 FLAGS4 (Plan C.4)
+	const ulong NN = get_N(), G = (NN+255ull)/256ull;
+	Memory<uint> aus(device, 2ull*G);
+	Kernel kp(device, G, "flags_pruefsumme", flags.k(), aus, NN);
+	kp.run();
+	aus.read_from_device();
+	std::vector<uchar> tmp;
+	const uchar* ref = flags.data();
+	if(!gegen_host) {
+		flags.geraet_in(tmp);
+		ref = tmp.data();
+	}
+	ulong abw = 0ull, ms_g = 0ull, ms_h = 0ull, sum_g = 0ull;
+	long erste = -1l;
+	for(ulong g=0ull; g<G; g++) {
+		uint s = 0u, ms = 0u;
+		for(uint k=0u; k<256u; k++) {
+			const ulong n = 256ull*g+(ulong)k;
+			if(n>=NN) break;
+			const uint v = (uint)ref[n];
+			s += v*(k+1u);
+			ms += (uint)((v&0x03u)==0x03u);
+		}
+		ms_h += ms;
+		ms_g += aus[2ull*g+1ull];
+		sum_g += aus[2ull*g];
+		if(aus[2ull*g]!=s||aus[2ull*g+1ull]!=ms) { abw++; if(erste<0l) erste = (long)g; }
+	}
+	println("FLAGS4 GERAETEPROBE "+wann+" ("+string(flags.ist_vier() ? "4 Bit" : "Byte")+", Geraetepuffer "+to_string(flags.geraet_bytes())+" B) Gruppen "+to_string(G)+" abweichend "+to_string(abw)+" (Soll 0"+string(flags.haken_zelle>=0l&&gegen_host ? "; Testhaken 1: Soll 1" : "")+") erste "+to_string(erste)+" MS-Zellen Geraet "+to_string(ms_g)+" Host "+to_string(ms_h)+" Summe "+to_string(sum_g));
+	return (uint)min(abw, (ulong)max_uint);
+}
+double bpz_konv(const LBM& lbm) { // ★ 03.10.2026 einzige Quelle, s. lbm.hpp; derselbe Ausdruck wie bisher in info.cpp:123 und main.cpp:75
+	// ★ 05.10.2026 Pruefbefund FLAGS4 N1: unter CFD_FLAGS4 liest stream_collide 4 Bit flags je Zelle statt 1 Byte -> 0,5 B weniger
+	// (Upstream zaehlt flags mit 1 B, bandwidth_bytes_per_cell_device). Deshalb double statt uint (halbe Byte-Einheit).
+	const LBM_Domain* d = lbm.lbm_domain[0];
+	return (double)bandwidth_bytes_per_cell_device()-(d->rho_rand_on ? (double)sizeof(rhoxx) : 0.0)-(d->flags.ist_vier() ? 0.5 : 0.0);
+}
 uint3 resolution(const float3 box_aspect_ratio, const uint memory) { // input: simulation box aspect ratio and VRAM occupation in MB, output: grid resolution
 #ifndef D2Q9
 	float memory_required = (box_aspect_ratio.x*box_aspect_ratio.y*box_aspect_ratio.z)*(float)bytes_per_cell_device()/1048576.0f; // in MB
@@ -106,6 +296,16 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 	this->alpha = alpha; this->beta = beta;
 	this->particles_N = particles_N;
 	this->particles_rho = particles_rho;
+	// ★ 05.10.2026 FLAGS4 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md Teil C): VOR dem JIT (device_defines liest flags4_on) und vor der Allokation.
+	flags4_on = s_flags4>0u;
+	flags4_pruef = s_flags4_pruef;
+	if(flags4_on) {
+		if(Dx*Dy*Dz>1u) print_error("FLAGS4: die Domaene ist Teil einer Mehrdomaenen-Zerlegung -- die Halo-Transferkernel sind fuer 4 Bit nicht abgenommen.");
+		if(s_sparse_tiles_on) print_error("FLAGS4 mit Block-Tiling: nicht kombiniert (nicht abgenommen).");
+#if defined(SURFACE) || defined(GRAPHICS) || defined(PARTICLES) || defined(TEMPERATURE)
+		print_error("FLAGS4 mit SURFACE/GRAPHICS/PARTICLES/TEMPERATURE: deren flags-Leser und -Schreiber sind nicht umgestellt, TYPE_T/F/I/G passen nicht in 4 Bit.");
+#endif
+	}
 	// FORK -- F-Bounding-Box HIER aufloesen, nicht erst in allocate(). Der Konstruktor baut den
 	// OpenCL-Code (und damit def_FBNX/def_FBN) weiter unten; allocate() laeuft erst DANACH. Stand die
 	// Aufloesung in allocate(), wurde def_FBNX = 0 emittiert, f_bbox lieferte ueberall false und
@@ -134,7 +334,9 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 	fac_idx_voll_on = s_fac_idx_voll>0u;
 	fac_r1q_on = s_facetten&&s_fac_imem&&s_fac_r1q>0u; // ★ 28.09. R1Q: eingefroren wie fac_rek_on
 	fac_r1q_stufe = fac_r1q_on ? s_fac_r1q : 0u; // ★ 28.09. Audit B N2: Stufe mit einfrieren -- die Unterstufen-Kohaerenz wird bei der Allokation geprueft, nicht erst am Laufende
-	fac_rek_on = s_facetten&&s_fac_imem&&s_fac_rek>0u; // ★ 22.09. S0: Konstruktionszustand einfrieren, GENAU wie die Geschwister -- die Statik wird in setup.cpp neben s_fac_pinv gesetzt, also VOR dem Konstruktor (Pruefbefund H1 vom 22.09.: eine hier per env_u gefuellte Statik ist zum Einfrieren noch 0)
+	fac_rekpi_on = s_facetten&&s_fac_imem&&s_fac_rekpi>0u; // ★ 03.10. REK-PI: eingefroren wie die Geschwister (Statik in setup.cpp VOR dem Konstruktor gesetzt, Werkzeugfalle 21)
+	fac_rekpi_stufe = fac_rekpi_on ? s_fac_rekpi : 0u;
+	fac_rek_on = s_facetten&&s_fac_imem&&(s_fac_rek>0u||s_fac_rekpi>0u); // ★ 03.10. REK-PI zieht die REK-Infrastruktur nach (fac_nb-REK-Floats, FAC_REK-Block, fac_nachbar_ab-Richtung; PLAN-REK-PI.md §6 "fac_rek_on |= fac_rekpi_on") // ★ 22.09. S0: Konstruktionszustand einfrieren, GENAU wie die Geschwister -- die Statik wird in setup.cpp neben s_fac_pinv gesetzt, also VOR dem Konstruktor (Pruefbefund H1 vom 22.09.: eine hier per env_u gefuellte Statik ist zum Einfrieren noch 0)
 	fac_pinv_on = s_fac_pinv>0u; // ★ 04.09.: Rang-1-Pseudoinverse statt Skalarleiter (JIT-Define, muss vor der ersten Kernel-Erzeugung stehen)
 	for(uint i=0u; i<6u; i++) s_fbbox[i]=0u; // read-once: eine zweite Domaene erbt die Box nicht
 	// ★ 2026-08-08, beim Bau der Doppel-Domaene gefunden: das Block-Tiling wurde bis hier ueberall direkt
@@ -367,6 +569,17 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 	sparse_on = s_sparse_tiles_on;
 	sparse_T  = s_sparse_T;
 	s_sparse_tiles_on = false; s_sparse_T = 8u; // read-once beidseitig (Gross-Audit N13: T erbte sonst)
+	string zb_grund = "an"; // ★ 05.10.2026 ZELLBASEN: Grund fuer die Log-Zeile nach dem JIT
+	{ // ★ 05.10.2026 ZELLBASEN (PLAN-ZELLBASEN-2026-10-05.md): Entscheid je Domaene VOR dem JIT (device_defines liest zellbasen_on). Bei einer
+	  // Sperre faellt die Domaene still auf den alten Pfad zurueck und sagt es in der ZELLBASEN-Zeile (Grund), kein Abbruch: der alte Pfad ist physikalisch identisch.
+		const ulong zb_bytes = (ulong)sizeof(fpxx)*(ulong)Nx*(ulong)Ny*(ulong)Nz;
+		const uint zb_modus = zellbasen_modus();
+		if(zb_modus==0u) zb_grund = "CFD_ZELLBASEN=0";
+		else if(velocity_set!=19u) zb_grund = "nicht D3Q19 (cb-Feld und Abnahme nur fuer D3Q19)";
+		else if(sparse_on) zb_grund = "Block-Tiling (SPARSE_TILES hat eigene Zellbasen)";
+		else if(zb_bytes>=4294967296ull) zb_grund = "sizeof(fpxx)*N >= 2^32 (uint-Byteversatz liefe ueber)";
+		zellbasen_on = zb_grund=="an";
+	}
 	string opencl_c_code;
 #ifdef GRAPHICS
 	graphics = Graphics(this);
@@ -376,10 +589,23 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 #endif // GRAPHICS
 	fac_rek_jit = opencl_c_code.find("#define FAC_REK\n")!=string::npos; // ★ 23.09. Pruefbefund M5: das \n MUSS mit -- "#define FAC_REK" ist Teilstring von "#define FAC_REK_R3", ein reiner R3-Text haette hier faelschlich "MIT FAC_REK" gemeldet (messwerte/_bb-Teilstringfalle vom 03.09.)
 	fac_rek_r3_jit = opencl_c_code.find("#define FAC_REK_R3")!=string::npos;
+	fac_rekpi_jit = opencl_c_code.find("#define FAC_REKPI\n")!=string::npos; // ★ 03.10. REK-PI: mit \n -- "#define FAC_REKPI" ist Teilstring von "#define FAC_REKPI_AN" (Lehre M5 vom 23.09.)
+	fac_rekpi_an_jit = opencl_c_code.find("#define FAC_REKPI_AN")!=string::npos;
+	fac_rekpi_nur_u_jit = opencl_c_code.find("#define FAC_REKPI_NUR_U")!=string::npos; // ★ 04.10. Stufe 3
 	fac_r1q_jit = opencl_c_code.find("#define FAC_R1Q\n")!=string::npos; // ★ 28.09. R1Q: mit \n, sonst ist FAC_R1Q Teilstring von FAC_R1Q_AN (Lehre M5 vom 23.09.)
 	fac_r1q_an_jit = opencl_c_code.find("#define FAC_R1Q_AN")!=string::npos;
 	fac_r1q_vr_jit = opencl_c_code.find("#define FAC_R1Q_VR")!=string::npos; // ★ 28.09. V_R
+	sc_simd16_jit = opencl_c_code.find("#define SC_SIMD16")!=string::npos; // ★ 02.10. Messarm SIMD16 fuer stream_collide (Slot 432)
+	{ // ★ 05.10.2026 ZELLBASEN: Wirkpfad aus dem JIT-Text, Wortgrenze explizit geprueft (Teilstring-Lehre M5; das Define muss nicht von \n gefolgt sein)
+		const string zb_d = "#define ZELLBASEN";
+		const size_t zb_p = opencl_c_code.find(zb_d);
+		const size_t zb_e = zb_p+zb_d.size();
+		zellbasen_jit = zb_p!=string::npos&&(zb_e>=opencl_c_code.size()||!(isalnum((unsigned char)opencl_c_code[zb_e])||opencl_c_code[zb_e]=='_'));
+	}
+	if(zellbasen_jit!=zellbasen_on) print_error("ZELLBASEN: Host-Entscheid ("+string(zellbasen_on?"an":"aus")+") und JIT-Text ("+string(zellbasen_jit?"an":"aus")+") widersprechen sich.");
+	println("ZELLBASEN geraet="+to_string(device_info.id)+" N="+to_string((ulong)Nx*(ulong)Ny*(ulong)Nz)+" jit="+string(zellbasen_jit?"1":"0")+" modus="+to_string(zellbasen_modus())+" grund="+zb_grund); // ★ eine ungebrochene Zeile fuer grep (println, nicht print_info)
 	fac_r1q_od_jit = opencl_c_code.find("#define FAC_R1Q_OHNE_DRUCK")!=string::npos; // ★ 28.09. V_R ohne Druckanteil (R1Q=4)
+	fac_r1q_k2_jit = opencl_c_code.find("#define FAC_R1Q_SPALTE1")!=string::npos; // ★ 03.10. R1Q=5 (K2, nur Spalte 1). Ohne \n (Pruefung N4): kein anderes Define beginnt mit diesem Namen, und die Suche haengt so nicht an der Emissionsreihenfolge
 	fac_rek_s2_jit = opencl_c_code.find("#define FAC_REK_S2")!=string::npos; // ★ 24.09. S2: eigener Spiegel. Suchtext OHNE abschliessendes \n, sonst traegt er dieselbe Teilstring-Falle wie fac_rek_jit (Pruefbefund 23.09.). // ★ 23.09. R3: eigener Spiegel, sonst traegt der Arm-2-Lauf keinen Wirkpfadbeleg fuer das Gate. Gelesen in setup.cpp: pruefe_rek_wirkpfad (Wirkpfadwaechter) UND der K2-Zweig des Cd-Pfads sowie der Bilanzblock (★ 24.09., Pruefbefund N3: hier stand "NUR in pruefe_rek_wirkpfad"). Der Kohaerenzvergleich gegen fac_rek_on in alloc_facetten_domain betrifft fac_rek_jit, nicht dieses Feld. // ★ 22.09. S0, Lehre M2: Kernelzustand aus dem JIT-Text einfrieren; alloc_facetten_domain vergleicht ihn gegen fac_rek_on
 	band_pi_jit = opencl_c_code.find("#define SGS_BAND_PI")!=string::npos; // ★ 22.09. Pruefbefund A-M2: Kernel-Modus aus dem JIT-Text einfrieren, alloc_sgs_band vergleicht ihn mit dem Host-Modus (H1-Klasse: Host FD, Kernel Pi -> 6x Ueberlauf; war nur ueber Symptome zu finden). Durchgang 2 N-2: HINTER dem #endif, damit auch ein GRAPHICS-Bau ihn setzt.
 	// ★ C2 (aus V1 portiert, 2026-08-15): CFD_DUMP_DEFINES druckt die tatsaechlich emittierte
@@ -448,8 +674,10 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 			return n;
 		};
 		const uint n_uf = zaehle_wortgenau("global\nfloat*\nu"), n_uv = zaehle_wortgenau("global\nvelxx*\nu");
-		if(n_uf!=21u||n_uv!=20u) print_error("u-Typ-Zensus im OpenCL-Quelltext: "+to_string(n_uf)+" x \"global float* u\" (Soll 21, alle in SURFACE/PARTICLES/GRAPHICS oder totem Code) und "
-			+to_string(n_uv)+" x \"global velxx* u\" (Soll 20; 19 -> 20 am 15.09.: rho_rek_ebene, RHO_RAND C1). Ein u-Kernel ist nicht auf velxx umgestellt oder es ist einer dazugekommen -- bei 2-Byte-u waere das ein stiller Fehler, kein Absturz: der Kernel laese zwei halbe Geschwindigkeiten als eine.");
+		// ★ 04.10.2026 U_RAND: 20 -> 21. apply_moving_boundaries steht zweimal im Quelltext (#ifdef U_RAND / #else), beide mit
+		// "global velxx* u"; gezaehlt wird der Text, nicht der emittierte Zweig. Die U_RAND-Helfer heissen bewusst "ub" (kein Zuwachs).
+		if(n_uf!=21u||n_uv!=21u) print_error("u-Typ-Zensus im OpenCL-Quelltext: "+to_string(n_uf)+" x \"global float* u\" (Soll 21, alle in SURFACE/PARTICLES/GRAPHICS oder totem Code) und "
+			+to_string(n_uv)+" x \"global velxx* u\" (Soll 21; 19 -> 20 am 15.09.: rho_rek_ebene, RHO_RAND C1; 20 -> 21 am 04.10.: apply_moving_boundaries U_RAND-Zwilling). Ein u-Kernel ist nicht auf velxx umgestellt oder es ist einer dazugekommen -- bei 2-Byte-u waere das ein stiller Fehler, kein Absturz: der Kernel laese zwei halbe Geschwindigkeiten als eine.");
 	}
 	// ★★ 15.09.2026 ABSTURZSPERRE TESTHAKEN (Heiko: "sicherstellen, dass so ein CL_OUT_OF_RESOURCES nicht versehentlich nochmal passiert").
 	// Anlass: CFD_KLEMM_HAKEN=1 im 8-mm-Fahrzeug (65,6 Mio Nahfeldzellen) auf der B70 -- nahezu JEDE Zelle nimmt je Schritt den
@@ -507,6 +735,7 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 		print_info("[CFD_DUMP_CL] OpenCL-Quelltext -> "+pfad+" ("+to_string((uint)opencl_c_code.size())+" Bytes)");
 	}
 	this->device = Device(device_info, opencl_c_code);
+	profil_an = device.profil_queue; // ★ 03.10.2026 CFD_GPU_PROFIL: Konstruktionszeit-Kopie (Ist-Zustand der Queue, nicht der Schalter)
 	print_info("Allocating memory. This may take a few seconds.");
 	allocate(device); // lbm first
 #ifdef GRAPHICS
@@ -548,6 +777,9 @@ uint LBM_Domain::s_smbox[6] = {0u,0u,0u,0u,0u,0u}; // ★ TODO 2: Schreibmasken-
 uint LBM_Domain::s_u_takt = 0u;     // ★ TODO 2 Schritt 3 (CFD_U_SPARSAM): 0 = aus, sonst ratio
 uint LBM_Domain::s_rho_takt = 0u;   // ★ TODO 2 Schritt 1 (CFD_RHO_SPARSAM): 0 = aus, sonst Sample-Kadenz in FEINEN Schritten
 uint LBM_Domain::s_rho_rand = 0u;   // ★ 15.09.2026 RHO_RAND (CFD_RHO_RAND): 0 = aus; nur Nahfeld
+uint LBM_Domain::s_u_rand = 0u;    // ★ 04.10.2026 U_RAND (CFD_U_RAND): 0 = aus; nur fahrzeug_dd-Nahfeld
+uint LBM_Domain::s_flags4 = 0u;    // ★ 05.10.2026 FLAGS4 (CFD_FLAGS4): 0 = Byte, 1 = 4 Bit; nur fahrzeug_dd-Nahfeld
+bool LBM_Domain::s_flags4_pruef = false; // ★ 05.10.2026 FLAGS4: Geraeteprobe in beiden Armen (CFD_FLAGS4 in der Zeile gesetzt)
 float LBM_Domain::s_einlass_eq_u = -1.0f; // Setup reicht sein u_lat durch (Konvention wie s_boden_eq_u); Sentinel wie dort, Pruefbefund B7
 bool LBM_Domain::s_schale_paritaet = false; // CFD_N2F_PARITAET (Beweisarm, s. lbm.hpp)
 float LBM_Domain::s_schale_alpha = 0.0f; // ★ P9c N2F-SCHALE: Blendfaktor der near->far-Rueckkopplung; 0 = aus. Read-once wie EINLASS_EQ; Setup setzt lbm_f EXPLIZIT 0.
@@ -559,6 +791,7 @@ uint LBM_Domain::s_fac_messnur = 0u; // ★ 30.08. Mess-Nur-Modus (BB-Physik, Fa
 float LBM_Domain::s_fac_rek_leiter = 1.0f; // ★ 24.09. CFD_FAC_REK_LEITER (Diagnoseleiter, Vorgabe 1.0 = bitgleich)
 uint LBM_Domain::s_fac_r1q = 0u; // ★ 28.09. CFD_FAC_R1Q (Rang-1-Querrest)
 uint LBM_Domain::s_fac_rek = 0u; // ★ 22.09. CFD_FAC_REK (S0/S1 Wandzell-Rekonstruktion)
+uint LBM_Domain::s_fac_rekpi = 0u; // ★ 03.10. CFD_FAC_REKPI (REK-PI, Knotenrekonstruktion an allen Facettenzellen)
 uint LBM_Domain::s_fac_pinv = 0u; // ★ 04.09. CFD_FAC_PINV: Rang-1-Pseudoinverse im gekoppelten Zweig
 uint LBM_Domain::s_fac_idx_voll = 0u; // ★ 03.09. Rueckschalter auf die fac_idx-Vollfeldform (A/B gegen die Bitmaske)
 float LBM_Domain::s_sgs_nut_skal = 1.0f; // ★ 10.09. Diskriminator-Messarm, 1,0 = aus = bitgleich
@@ -774,8 +1007,26 @@ void LBM_Domain::allocate(Device& device) {
 #endif
 	}
 	rho = Memory<rhoxx>(device, rho_rand_on ? rr_N+1ull : N, 1u, true, true, rho_pack(1.0f)); // ★ TODO 2 Schritt 4: Speicherwort fuer rho=1 (ohne RHO_FP16 1.0f, mit RHO_FP16 0x0000). ★ C2c: unter RHO_RAND nur R1 + 1 Papierkorb-Slot
+	// ★ 04.10.2026 U_RAND (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.4/B.5): u_rand_on VOR der u-Allokation (Muster rho_rand_on).
+	u_rand_on = s_u_rand>0u;
+	ur_modus_soll = s_u_rand;
+	if(u_rand_on) { // Konstruktor-Sperren, setup-unabhaengig
+		if(Dx*Dy*Dz>1u) print_error("U_RAND: die Domaene ist Teil einer Mehrdomaenen-Zerlegung -- der Halo-Transfer liest u mit vollen Indizes.");
+		if(get_Nx()<6u||get_Ny()<6u||get_Nz()<6u) print_error("U_RAND: eine Gitterkante < 6 -- die Randschale R1 ist dort nicht definiert.");
+		if(sparse_on) print_error("U_RAND mit Block-Tiling: nicht kombiniert.");
+		if(s_u_takt==0u) print_error("U_RAND ohne U_SPARSAM-Takt: der Substep-Takt (ratio) fehlt.");
+#if defined(SURFACE) || defined(GRAPHICS) || defined(PARTICLES) || defined(TEMPERATURE) || !defined(MOVING_BOUNDARIES) || !defined(UPDATE_FIELDS)
+		print_error("U_RAND mit SURFACE/GRAPHICS/PARTICLES/TEMPERATURE oder ohne MOVING_BOUNDARIES/UPDATE_FIELDS: deren u-Leser/-Schreiber sind nicht auf den kompakten Puffer umgestellt.");
+#endif
+#ifndef U_FP16
+		print_error("U_RAND ohne U_FP16 (velxx = float): der Kopf adressiert die Init-Regel (ur_k::REGEL_VX) und den Datenbeginn (ur_DOFF) in 2-Byte-Woertern -- mit float schriebe alloc_u_rand hinter den Kopf (Pruefbefund M2, 05.10.2026). Vor einer FP32-Randschale die Regel in uint-Woertern adressieren.");
+#endif // U_FP16
+		ur_platzhalter(); // ★ U1b: nur der Kopf (Magic PLATZHALTER); alloc_u_rand legt nach dem Listenbau den echten Puffer an und bindet neu
+		u_spiegel = Memory<velxx>(device, N, 3u, true, false); // voller Hostspiegel, KEIN Geraetepuffer
+	} else {
 	u = Memory<velxx>(device, N, 3u); // ★ TODO 2 Schritt 4: Speicherwort, 4 oder 2 Byte je Komponente
-	flags = Memory<uchar>(device, N);
+	}
+	flags.anlegen(device, N, flags4_on, flags4_on ? env_u("CFD_FLAGS4_HAKEN", 0u) : 0u); // ★ 05.10.2026 FLAGS4: Fassade; ohne FLAGS4 exakt Memory<uchar>(device, N) wie bisher
 	if(sparse_on) { // Tile-Raster aufspannen; der Inhalt kommt erst in finalize_sparse_tiles()
 		sparse_tiles_x = ((uint)get_Nx()+sparse_T-1u)/sparse_T;
 		sparse_tiles_y = ((uint)get_Ny()+sparse_T-1u)/sparse_T;
@@ -784,7 +1035,7 @@ void LBM_Domain::allocate(Device& device) {
 	} else {
 		tile_slot = Memory<uint>(device, 1ull); // Platzhalter, wird nie gelesen (TS_A ist leer)
 	}
-	kernel_initialize = Kernel(device, N, "initialize", fi, rho, u, flags);
+	kernel_initialize = Kernel(device, N, "initialize", fi, rho, u, flags.k());
 	// 23 Slots (Legende R3 nachgezogen, massgeblich ist lbm.hpp; [22] N2F-SCHALE-Blend-Wirkpfad t%100 (P9c); [21] EINLASS_EQ-Wirkpfad t%100; [20] BODEN_EQ-Wirkpfad t%100): [0,1] RHO_CLAMP, [2] WFB-Wirkpfad
 	// (t%100), [3] tau-Klemme, [4] u_t~0-Skips, [5] Ein-Zellen-Spalt, [6] SGS-Wirkpfad (t%100),
 	// [7] Facetten-Wirkpfad (t%100), [8] Facetten-Klemmen (BEIDE, gegatet t%100 seit R3),
@@ -815,12 +1066,18 @@ void LBM_Domain::allocate(Device& device) {
 	// | [289] Nachladeprobe t == zaehl_takt+3 | [290] Haken: Selbstpruefung Sum(f**-f*), Sum c(f**-f*) ueber Toleranz | [291] TYPE_E-Kandidaten (f_eq_i + w_i < tau_i) | [292]/[293] Sum-q (1-s), Sum-q Sum|df_i|
 	// (Festkomma, wickeln ABSICHTLICH mod 2^32) | [294] Kappung zu 293. Klemmen Z2b: [295] u-Komponentenhuelle |u_a| >= c_s vor der Klemme (Soll = [28] unter der Komponentenklemme)
 	// | [296] u-Betragshuelle |u|^2 >= c_s^2 | [297] 296 ohne 295 (Diagonalluecke) | [298]/[299] (nur CFD_RHO_HUELLE) rho unter/ueber der Konsistenzhuelle 0,5/1,5 | [300] Lift-rho ausserhalb der GESCHLOSSENEN Bildhuelle [0,21875; 1,78125], Soll 0 (Haken 5: > 0). Audit 16.09.2026 (B1): [301]/[302] KONSTANTENSPIEGEL der uebersetzten Torgrenzen def_tor_gate_lo/hi als Festkomma (S = def_klemm_s), Ist=Soll gegen die Host-Rechnung -- der Wirkpfadbeleg fuer CFD_TOR_HUELLE, das sonst nur eine Null vorzuweisen hatte. [303] (nur CFD_POSITIV_FACETTE) K0-Facettenzelle WIRKLICH begrenzt, Stichprobe wie [273] -- Wirkpfadbeleg des Schalters (Befund B3; [273] allein zaehlt in beiden Stellungen gleich). [304]/[305] KONSTANTENSPIEGEL der uebersetzten Waechterhuelle def_w210_lo/hi (Befund M3, zweite Haelfte von CFD_TOR_HUELLE), ein Schritt je Zaehltakt. APG 16.09.2026 (PLAN-APG-2026-09-16.md §A5, alle nur an Zaehlschritten, saettigend): [306] Vorkernel-Besuche (Soll = [7]) | [307] entartet (eine Achse ohne Fluidnachbar) | [308] APG-Zweig besucht (Soll = [7]-[9]) | [309]/[310] Klemme unten 0 / oben 2*tw (Summe = [19]) | [311]/[312] dp/ds > 0 (APG) / < 0 (FPG) | [313..316] Autoritaet |kappa*y_ab*dp/ds|/tw in <0,1 / 0,1-0,5 / 0,5-1 / >=1. MOZAFFARI 22.09.2026 (nur unter FACETTEN_APG_MOZ, alle an Zaehlschritten, saettigend): [317] Entartung (u_tau <= 0 oder alpha_p nicht endlich -> f := 1 erzwungen, Soll 0) | [318..325] f-HISTOGRAMM, Grenzen f >= 0,99 / 0,95 / 0,90 / 0,80 / 0,70 / 0,65 / 0,62 / darunter -- in alpha_p umgerechnet (C = 0,4, a0 = 0,005): 1,282e-4 / 7,143e-4 / 1,667e-3 / 5,000e-3 (= a0, natuerliche Mitte) / 1,500e-2 / 3,500e-2 / 9,500e-2. [318] enthaelt auch den gesamten FPG-Ast (f konstruktiv 1) UND die Besuche mit dp/ds exakt 0. Bezug ist das GEKLEMMTE Spalding-tw (Klemme tw_max im Spalding-Block), tw_neu = tw*f^2. ABNAHME: Summe [317..325] == [308] (jeder Besuch genau ein Fach; NICHT [311]+[312], die zaehlen dp/ds == 0 nicht mit -- Pruefbefund A-5/B-M1); [318] < [308], sonst ist der Tausch ein No-Op; [317] == 0 | [326]/[327] SCHATTEN der entfallenen Klemme: korr > tw bzw. -korr > tw (geklemmtes Spalding-tw), also genau die Bedingung, die unter der linearen Form [309]/[310] gezaehlt hat. ABNAHME unter MOZ: [19] = [309] = [310] = 0 UND |[326]+[327] - [316]| <= 1e-3*[316]+16 (symmetrisch: Strikt-/Nichtstrikt-Kante |korr| == tw und GPU-Divisionsrundung 2,5 ulp in [316]; Pruefbefund A-10/B-N1/2A-M1). Slot 8 (Endklemme tw*faca > tw_max) feuert unter MOZ NUR bei faca > 1 (tw <= tw_Spalding <= tw_max), also seltener als linear (dort tw bis 2*tw_Spalding) -- kein Widerspruch zu "keine Klemme mehr", die Endklemme ist die alte Stabilitaetsklemme (2A-N1). REKONSTRUKTION S0 (22.09.2026, CFD_FAC_REK): [328] Wirkpfad (Block erreicht, gegattert) | [329] WIRKUNG |du|/|u| > 1e-6 (Soll in S0 EXAKT 0) | [330] relativer Rundungszaehler (Soll 0 in der Delta-Form; Ausschlag = falsche Formelform gebaut) | [331] RESERVIERT fuer die R3-Kreuztabelle (ab S2). Inkrement am 23.09. ENTFERNT: es stand im selben Gate wie [328], war konstruktiv identisch, kostete ein Atomic je Besuch und taeuschte eine Pruefung vor, die nie feuern konnte (Audit-Schleife, drei Auditoren unabhaengig). [332] S1b MASSENNEUTRALITAET: |rho(f+Df) - rho(f)| > 1e-6*rho. Die Delta-Form erhaelt die Masse ANALYTISCH exakt (Sum w_i = 1, Sum w_i c_i c_i = c_s^2 I heben den -1,5(s.du)-Term genau auf), ★ 23.09. BERICHTIGT: die Probe rechnet INLINE mit derselben Summenreihenfolge wie klemm_rho_roh(), also rho VOR der Dichteklemme -- ein AUFRUF laege hier oberhalb der Definition und ist unter OpenCL C99 der sofortige Lauftod (BERICHTIGT 23.09. abends: der alte Text nannte den Aufruf, wer ihn nachzieht baut error -11 ein). Vorher standen zwei Aufrufe von calculate_rho_u gegeneinander, und DIE KLEMMT auf [0,5;1,5] (kernel.cpp:1257) -- bei einer Zelle dauerhaft ausserhalb war die Differenz EXAKT 0, egal was die Rekonstruktion mit der Masse tat (1,2-1,8 Mrd Klemmtreffer je Lauf, nicht hypothetisch). Schranke 1e-6 -> 5e-7. Numerisch bleibt der Boden beim ulp der Schlussaddition rho += 1.0f, also 5,96e-8 bis 1,19e-7 -- NICHT 1e-9, wie hier zuerst stand (Pruefbefund 23.09.). Die Schranke 1e-6*rho traegt damit rund 8- bis 17-fache Luft; wer sie schaerft, erzeugt Fehlalarme. ★ BERICHTIGT 23.09. abends: die Schranke im Kernel ist 5e-7, nicht 1e-6, und traegt damit 4,2- bis 8,4-fache Luft ueber dem ulp-Boden, nicht die hier zuerst genannten 8 bis 17. Soll 0 in JEDER Stufe. | [333] S1b ZWEITES MOMENT (xy): Summe c_x c_y Df_i gegen rho*(u_x du_y + du_x u_y + du_x du_y). NOETIG, weil [330] und [332] gemeinsam BLIND fuer einen Fehler im s-Vektor sind: Summe_i c_i w_i (c_i.du)(c_i.s) = 0 und Summe_i w_i [4,5(c.du)(c.s) - 1,5(du.s)] = 0 gelten fuer JEDES s, der s-Term wird erst im zweiten Moment sichtbar. Ohne [333] wuerden s = 2u, s = u+du oder das voellige Weglassen der quadratischen Terme unentdeckt durchlaufen. | [334] BEGLEITZAEHLER zu [333]: wie oft war |mxy_soll| <= 1e-7, die Probe an dieser Facette also LEER? [333] hat einen absoluten Boden; wo das Sollmoment darunter liegt, behauptet sie nichts. Ohne [334] liest man 333 = 0 als Beleg, wo gar nichts geprueft wurde. | [335] KONSTANTENSPIEGEL der Rekonstruktion: der UEBERSETZTE Kernel schreibt 0x5245464B ('REFK'), sobald der FAC_REK-Block im Geraetecode steht. Noetig, weil der alte Kohaerenzwaechter (fac_rek_jit gegen fac_rek_on) TAUTOLOGISCH war -- beide Seiten lasen dasselbe eingefrorene Feld, er konnte nie ausloesen (Audit-Schleife 23.09., Auditor B). Dieser Slot belegt den uebersetzten Kernel, nicht den JIT-Text. | [336..343] HISTOGRAMM der Hubrichtung t1.x ueber die Marken, Grenzen -0,5/-0,1/0/0,1/0,5/0,9/0,99. Beantwortet, ob die 10620 Huebe in x gleichsinnig zeigen. Haeufung nahe +1 heisst: die Betragssumme IST die Vektorsumme, und die gemessene Ausbeute von rund 3 % hat eine ANDERE Ursache. Streuung um 0 heisst: die wirksame Amplitude ist eps*<t1.x>, und jede auf eps normierte Amplitudenleiter ist falsch skaliert. | [344..351] HISTOGRAMM von rhon ueber die Marken, Grenzen 0,55/0,7/0,85/0,95/1,05/1,2/1,45. Der Block injiziert rhon*du mit dem GEKLEMMTEN rhon (Untergrenze 0,5); an **85 %** der Facettenbesuche steht es auf der Klemme und daempft dort den Hub um 43 % (GEMESSEN 23.09., Commit b4158aa, 53 195 580 Besuche -- die hier zuerst notierten 6,5 % waren eine Schaetzung aus den globalen Klemmzaehlern und galten fuer ALLE Facettenzellen, nicht fuer die markierten). Ohne diese Zahl ist die Amplitude des Arms unbekannt. Beide sind BITNEUTRAL: kein Zugriff auf fhn, nur atomic_inc an Zaehlschritten. | [352..359] HISTOGRAMM der NACHBARRICHTUNG t_nb.x, gleiche Eimergrenzen wie [336..343]. Die Nachbarabtastung liest das fertige u-Feld einer zweiten Fluidzelle entlang der Normale -- eine Zelle, die die ELIBB-Blende NICHT angefasst hat. Gegen [336..343] (lokale Richtung, aus der zu 85 % geklemmten Zelle) ist das der direkte Vergleich. | [360..367] HISTOGRAMM von cos zwischen lokaler und Nachbarrichtung, Grenzen -0,5/0/0,3/0,6/0,8/0,95/0,999. PFLICHT, nicht Beiwerk: zeigt der Hub kuenftig entlang t_nb, sieht das Wandmodell (Basis t1 bleibt LOKAL, kernel.cpp) davon nur cos*eps, und sin*eps landet im t2-Kanal -- also im Querrest, den das Modell zu null setzen will. | [368] kein Fluidnachbar (Rueckfall auf die lokale Richtung), Gegenprobe zu Slot 73. | [369] BAUPROBE der geschriebenen Richtung: ||t_nb|-1| > 1e-5 ODER |t_nb.n| > 1e-3 (die Tangentialschranke ist 1e-3, BERICHTIGT 23.09. abends -- hier stand 1e-5, Faktor 100 gegen den Kernel). Soll 0. Ohne sie ist ein Stride-Versatz nicht von "die Richtung streut halt" zu unterscheiden. Alle vier sind BITNEUTRAL (nur atomic_inc an Zaehlschritten). R3 23.09.2026 (nur unter CFD_FAC_REK=2, alle an Zaehlschritten, saettigend): [370] markierte Besuche AM GATE (Nenner) | [331] davon ZUSAETZLICH in den Rueckfall gezwungen -- die eigentliche Wirkung von R3; frueher "reserviert", jetzt belegt | [380] davon ohnehin schon Rueckfall (Gate war dort ein No-Op). ABNAHME [331]+[380] == [370], jeder Besuch genau ein Fach. | [371] BAUREIHENFOLGE-PROBE (NICHT der Nullbeweis des Tors -- berichtigt 23.09. spaet; unter der erlaubten Schalterschnittmenge konstruktiv 0, den Nullbeweis liefert der Hashvergleich Arm 1/Arm 2): Marke UND der Additivterm u_s != 0 nach dem Solve, Soll EXAKT 0 -- 370/331/380 zaehlen die Absicht, 371 das Ergebnis. Der Zaehler sass zuerst an pass2_an und war dort TAUTOLOGISCH (Nachpruefung H4). | [372] Normalprobe der Buchung: |du.n| > 1e-3*|du| (RELATIV -- die absolute Schranke prueft bei kleinem eps nichts, Nachpruefung M2), Soll 0 (du steht konstruktiv tangential; ein Normalanteil ginge in den Druckpfad und waere dort doppelt). Die Buchung selbst ist KEIN Zaehler, sondern fwx/y/z -= rho*du vor fac_tau_acc[1..3] -- ihr Beleg ist die Bilanzserie a2_bilanz (23.09.) und K2. [373..377] HISTOGRAMM von |G11roh| an den Marken (Grenzen 1e-6/1e-4/1e-2/1), belegt 23.09. abends. ENTSCHEIDET den Doppelterm: P1 wird aus fhn gebildet, und fhn traegt an den Marken schon das Df -- unter R3 ist phi1 = P1, die Wandkraft enthaelt den Wandlink-Anteil also ein ZWEITES Mal, zusaetzlich zur Buchung fw -= rho*du. Zur fuehrenden Ordnung ist der Zusatzterm rho*eps*G11roh. Liegt das Histogramm nicht im untersten Fach, traegt die Wandkraft den Term doppelt. ★ 24.09.2026 ERLEDIGT: er WIRD korrigiert (exakt, siehe 381..385); dieser Absatz ist keine Handlungsanweisung mehr, sondern die Messung der Groesse. GEMESSEN am kipp26 24.09.: nur 0,38 % der Marken haben |G11roh| < 1e-6 -- der Kanal traegt den Term also SEHR WOHL, die frueher hier und in kernel.cpp stehende Entwarnung war unbelegt. DOPPELTERM-KORREKTUR 24.09.2026 (nur unter CFD_FAC_REK=2, an Zaehlschritten, saettigend): [378] ANWENDUNGSPROBE -- fw wird VOR und NACH den drei Korrekturzeilen auf t1 projiziert und die Differenz gegen rek_dp1 gehalten; Soll EXAKT 0. Faengt drei Fehler, die kein Zaehler auf rek_gate fangen kann: Korrektur hinter fac_tau_acc (toter Code), Korrektur ausserhalb der FAC_REK_R3-Insel, Vorzeichen verkehrt. Sie faengt NICHT ein falsches Vorzeichen in der HERLEITUNG von DP1 -- aus den Ausgabedateien ist das NICHT pruefbar (kein Dateipaar isoliert Summe rho*du, ★ 02.10. Pruefbefund F-N3), siehe die R3-ANSAGE in setup.cpp. | [379] t2-KANAL: |DP2| > 0,1*|DP1| an der Marke. Beantwortet empirisch, ob die fuehrende Ordnung rho*eps*G11roh (nur t1) gereicht haette; sie haette rho*eps*G12roh unterschlagen, an ebener Wand exakt 0, an schiefen Linkmengen bis sqrt(G11roh*G22roh). Deshalb ist die EXAKTE Form gebaut: Df wird je Wandlink in der Momentenschleife nachgebildet und auf t1/t2 projiziert, ohne Ordnungsargument. | [381..385] HISTOGRAMM der Korrekturgroesse |DP|/(rho*|du|), Grenzen 0,01/0,1/0,5/1,0 (★ 24.09. Pruefbefund M4: es waren zwei Grenzen, das oberste Fach damit OFFEN bei 0,1 -- die Groesse erreicht aber 2,0, das Fach konnte "ein Zehntel der Quelle" nicht von "doppelt so gross, Reibungspfad gedreht" unterscheiden). ABNAHME: Summe [381..385] == [370]. | [386] BEGLEITZAEHLER zu [378] (Klasse von [334]): wie oft dominiert der Ausloeschungsboden 4,8e-7*|fw|_1 den relativen Teil der Toleranz? Wo er das tut, prueft [378] nichts und seine Null ist kein Beleg -- |fw.t1| ist um Dekaden groesser als |DP1|. Liegt alles im untersten Fach, war der Doppelterm an dieser Geometrie vernachlaessigbar und die Korrektur ein GEMESSENER No-Op. WAS [378] NICHT FAENGT (ausdruecklich, damit seine Null nicht ueberlesen wird): er vergleicht die ANWENDUNG gegen rek_dp1, nicht rek_dp1 gegen die Injektion. Eine Aenderung des Linkgates in der Momentenschleife, die rek_dp1 ueber eine andere Menge als P1 akkumuliert, bleibt unsichtbar; ebenso ein Vorzeichenfehler in der HERLEITUNG von DP1. Und wenn jemand die Korrekturzeilen UND den 378-Block GEMEINSAM hinter fac_tau_acc schiebt, bleibt er gruen -- er misst eine lokale Invariante, nicht die Lage zum Verbraucher (Pruefbefund M3, 24.09.). | [387] BLINDHEITSSCHRANKE von [378]: |DP2| > 1000*|DP1| an der Marke. Die Toleranz von 378 faengt ein verkehrtes Vorzeichen bis Verhaeltnis rund 1e4 und toten Code bis rund 1e3 (eigener float-Versuch 24.09., 200 000 Saetze je Stufe); darueber ist sie blind. [379] zaehlt ab 0,1 und sagt darueber nichts. Steht [387] auf 0, ist die Null von [378] ueber den gefahrenen Wertebereich belastbar. (Historie: am 23.09. stand hier einmal 373, widerspruechlich zur Zeile darueber, die 373..377 belegt -- wer der Legende folgte, haette 373 ein zweites Mal vergeben. Die Zeile, auf die sich diese Berichtigung bezog, ist am 24.09. ersetzt worden; der Hinweis bleibt als Warnung stehen, weil dieselbe Falle bei jeder Neuvergabe droht.) ★ 24.09.2026 BERICHTIGT (Pruefbefund M-7): hier stand bis eben ein zweites Mal "Puffer hits_n = 384 seit 22.09.2026" -- eine widerspruechliche Zweitfassung IN DERSELBEN ZEILE, aus der der naechste Slot falsch vergeben worden waere. Das ist wortwoertlich Pruefbefund 3-E, eine Ebene hoeher. | [388..392] HISTOGRAMM |DP_n|/(rho*|du|), Grenzen 0,01/0,05/0,15/0,3 -- der NORMALANTEIL des Wandlink-Flusses der Rekonstruktion. NICHT dasselbe wie [372]: der prueft |du.n| und ist konstruktiv 0, weil du tangential steht. DP_n verschwindet nur an der EBENEN Wand; an einer Einzellink-Zelle ist c.n von null verschieden, und 92 % der Rang-0-Facetten haben genau einen Link. Gebaut aus dem S2-Planungsschritt (Befund H1, 24.09.). ABNAHME: Summe [388..392] == [370]. WAS ER MISST UND WAS NICHT: allein die GROESSE von DP_n. Ob dieser Anteil im Druckpfad ankommt und ob er dort ungebucht ist, ist damit NICHT beantwortet -- das braucht eine eigene Messung. STUFE S2 24.09.2026 (nur unter CFD_FAC_REK=3, JIT-Define FAC_REK_S2, an Zaehlschritten): [397] WIRKPFAD und Nenner der vier folgenden -- Besuche des Bestimmungsblocks. Soll > 0; steht er auf 0, bleibt die Amplitude auf ihrem Anfangswert 0 und der Arm ist ein stiller No-Op. | [393] SCHRITTFLUKTUATION der Amplitude ★ BERICHTIGT 24.09. nachmittags (Pruefagent H3): hier stand "KONVERGENZ des Lag-1-Kreises". Das galt fuer das ALTE Ziel mit P1 (e_{n+1} = e* - G11roh*e_n). Seit S1 haengt die Amplitude nur noch an twe und rhon DESSELBEN Schritts, es gibt keine Rueckkopplung mehr und also auch nichts zu kontrahieren. Der Zaehler misst jetzt die Schrittschwankung von twe/rhon und damit DIREKT den Lag-1-Fehler (gemessen 63,8 %: an zwei Dritteln der Marken weicht die angewandte Amplitude um mehr als 5 % ab). KEIN Konvergenzbefund. Alter Text: |d1_neu - d1_alt| > 5 % von |d1_neu|. Die Amplitude stammt aus dem VORSCHRITT, weil P1 erst nach der Momentenschleife feststeht. Faellt dieser Zaehler nicht, schwingt sie (Periode-2-Mode, im Plan als real gefuehrt) -- dann muss die Injektion hinter die Momentenschleife. | [394] rhon auf der unteren Klemme. VORZEICHENUMKEHR gegen die frueheren Stufen: rho steht in S2 im NENNER, die Klemme VERSTAERKT die Amplitude statt sie zu daempfen. | [395] ★ NUR ZUSAMMEN MIT SLOT 8 DEUTBAR (24.09. nachmittags, Pruefagent H1/H2): unter S1 ist die Schranke STRUKTURELL redundant, weil |s2_r1| = def_fac_tau*twe <= def_fac_tau*tw_max per fmin gilt. Die Null ist ein STOLPERDRAHT, keine bestandene Messung -- sie feuert nur, wenn jemand die tw_max-Klemme entfernt (wie beim MOZ-Tausch schon einmal geschehen). Slot 8 sagt, ob der Klemmpfad ueberhaupt lief; ohne ihn ist [395] = 0 ein Zufallsbefund. Bis 24.09. nachmittags wurde ausserdem NACH der Division verglichen (fabs(s2_d1)<=0.5f*ut), was an der twe-Klemme um 1-2 ulp ueberschoss und die Zelle STILL auf Bounce-Back warf -- der damals gemessene [400] = 9 ist genau diese Kante. Alter Text: Schranke 0,5*u_t gegriffen -> Rueckfall auf Bounce-Back (SATGATE-Logik, nicht klemmen: Befund G8, die geklemmte Anwendung hat einen vorzeichen-definiten Bias). Hohe Quote heisst, die Amplitude kommt von der SCHRANKE statt vom Wandmodell -- der Knopf waere nur umbenannt. | [396] RICHTUNG der Schrittaenderung (s2_neu > s2_alt). ★ ERSETZT 24.09. nachmittags (Pruefagent H1): hier stand "R1 > 0, die Wand beschleunigt, erwartet rund 40 %". Unter S1 ist s2_r1 = -def_fac_tau*twe mit twe >= 0 lueckenlos und def_fac_tau in {0;1} (drei Zuweisungen, alle Literale, ein CFD_FAC_TAU gibt es nicht) -- der Zaehler KONNTE nicht feuern, die 40 % waren nicht verfehlt sondern unmoeglich, und der Gegenphasentest verglich 0 % gegen 0 %. Dieselbe Klasse wie Slot 124/125 und Slot 331. JETZT: bei einer Periode-2-Mode geht [396]/[397] gegen 100 % und [401]/[402] gegen 0 % (oder umgekehrt), bei reiner Fluktuation liegen BEIDE bei rund 50 %. | [397] WIRKPFAD des Bestimmungsblocks und NENNER der vier S2-Prozentzahlen (★ Pruefbefund MITTEL-3: er fehlte hier, obwohl die M1-Abnahme auf ihm steht). ABNAHME: [397] == [370], strikt -- gleiches Gate, kein return dazwischen. | [398] LEERE PROBE: markierter Besuch mit rho*|du| == 0. Unter S2 ist die Amplitude je Facette UND Schritt 0 -- beim ersten Schritt immer, und nach jedem Schranken-Rueckfall. Die Histogramme 381..385 und 388..392 legen solche Besuche stumm ins unterste Fach; ohne diesen Zaehler liest sich das als "vernachlaessigbar" (Klasse [334]/[386]). | [399] WIDERSPRUCHS-ENTSCHEIDER: |rek_dp1 - rho*du*G11roh| > 20 %. Beide sind nur in fuehrender Ordnung (u, du -> 0) dieselbe Groesse; je Wandlink kann der (du*s)-Term das Vorzeichen umkehren -- 399 misst den Abstand zur Linearisierung, nicht das Vorzeichen (★ 02.10. Pruefbefund G-M1). Gebaut, weil sich [373..377] und [381..385] im S2-Probelauf widersprachen (G11roh >= 1e-2 an 92 %, |DP|/(rho|du|) >= 1e-2 an 21 %) -- die fruehere Deutung, die H1-Korrektur (P1 - rek_dp1) stehe genau auf dieser Gleichheit, ist seit 24.09. als falsch markiert (setup.cpp R3-Bericht; ★ 02.10. F-N3). | [400..402] GEGENPHASE zu [395]/[396], abgetastet bei t%def_zaehl_takt==1 statt ==0, mit [402] als eigenem Nenner. GRUND (Pruefbefund HOCH-2, 24.09.): def_zaehl_takt ist gerade, alle Zaehlschritte sind gerade, und die dort gelesene Amplitude stammt vom Schritt DAVOR, also von einem ungeraden. Eine Periode-2-Mode -- vom Plan ausdruecklich als real gefuehrt -- ist damit konstruktiv unsichtbar und liest sich als einseitiges Vorzeichen (gemessen 99,7 %), als Schranke die nie greift und als dauerhafte Schrittaenderung. Weichen die Paritaeten um mehr als 20 Prozentpunkte ab, schwingt die Amplitude und KEINE Kraftzahl des Arms ist deutbar. [403..407] AMPLITUDENGROESSE, ★ NEU 24.09. nachmittags (Pruefagent H4). Faecher von |s2_neu| an den projekteigenen Schwellen: [403] < 1e-6, [404] 1e-6..1e-5, [405] 1e-5..1e-4, [406] 1e-4..1e-3, [407] >= 1e-3. Nenner ist [397] (gleiches Gate). GRUND: unter S2 ist CFD_FAC_REK_EPS zwingend 0, deshalb schweigen BEIDE Groessenwaechter in setup.cpp (harte Sperre 1e-6 "der Hub ueberlebt store_f nicht", Warnung 1e-4 "darunter messen die Zaehler registerseitig") -- sie haengen an rek_eps_b>0. Fuer die LAUFZEITamplitude gab es keinen einzigen Waechter, und die Herleitung gibt |du| = twe/rhon ~ 4,5e-6..1,35e-5, also 7- bis 22-fach UNTER dem Messhub. Liegt die Masse in [403]/[404], arbeitet der Arm im stillen Band und KEINE seiner gruenen Zahlen belegt etwas ausserhalb der Register. DER KERNEL INDIZIERT DIESE FUENF BERECHNET (s2_f) -- ein Literal-Grep nach hits[404] findet sie NICHT, dieselbe Falle wie die SGS_DIAG-Faecher 30..48. (Stand 24.09.: Puffer 408, mit 403..407 voll -- ★ 28.09. ueberholt, siehe die R1Q-Zeile darunter: hits_n = 432.) DIESE LEGENDE IST DIE EINZIGE QUELLE DER SLOTVERGABE.
-	// RANG-1-QUERREST 28.09.2026 (nur unter CFD_FAC_R1Q, JIT-Defines FAC_R1Q / FAC_R1Q_AN / FAC_R1Q_VR / FAC_R1Q_OHNE_DRUCK, alle an Zaehlschritten, saettigend): [408] markierte Besuche am Anwendungspunkt (Nenner; Marke -1 in fac_geo[8i+7] = Lage 1 und statischer Rang 1) | [409] Quelle berechnet (PINV-Zweig angewandt, pass2_an) | [410] PINV mit Rueckfall | [411] Zweig 3 (entkoppelter Skalarzweig) | [412] Zweig 1/2 (Vollrang) | [413] sonst -- ABNAHME Summe [409..413] == [408] STRIKT | [414] UNmarkiert im PINV-Zweig (nicht bedient) | [415..420] q = 1-a^2-b^2, Grenzen 0,1/0,3/0,5/0,7/0,9, Summe == [409] | [421..425] |p_perp|/|Z1| mit p_perp = (I-Gt/tr)P, Grenzen 0,1/1/10/100, [426] Ziel Z1 == 0, Summe [421..426] == [409] | R1Q=4 (FAC_R1Q_OHNE_DRUCK): V_R mit R' = R + 2(rho-1)(S1.t) -- nur der Reibungsanteil des BB wird ersetzt. [427] |du| > 0,5*ut: unter V_Z (R1Q=2) Stolperdraht, Soll 0; unter V_R (R1Q=3 und 4) das TOR (Quelle nicht angewandt, BB bleibt -- wie SATGATE, Schranke wie tw_max) | [428] Impulsprobe Sum c Df != rho*du (aus den Inkrementen, Toleranz 1e-3 relativ) | [429] Massenprobe Sum Df != 0 (aus den Inkrementen, 1e-3 von rho*|du|) | [430] Buchungsprobe dfw != -m | [431] Normalanteil |du.n| > 1e-3|du|. 428..430 nur unter FAC_R1Q_AN. Puffer hits_n = 432 seit 28.09.2026, VOLL.
-	kernel_stream_collide = Kernel(device, N, "stream_collide", fi, rho, u, flags, t, fx, fy, fz, felder_voll_h, rho_clamp_hits); // ★ TODO 2: rho_voll HINTER fz, damit set_parameters(4u, t, fx, fy, fz, rho_voll) zusammenhaengend bleibt; absolute Indizes gibt es nur fuer 0 und 4..7
-	kernel_update_fields = Kernel(device, N, "update_fields", fi, rho, u, flags, t, fx, fy, fz);
-	kernel_boden_eq = Kernel(device, N, "boden_eq", fi, flags, t, 0.0f, 0u, 0u, 0u, 0u, rho_clamp_hits); // Parameter t/u/nz/nz_down/x_split/abstand je Enqueue
+	// RANG-1-QUERREST 28.09.2026 (nur unter CFD_FAC_R1Q, JIT-Defines FAC_R1Q / FAC_R1Q_AN / FAC_R1Q_VR / FAC_R1Q_OHNE_DRUCK / FAC_R1Q_SPALTE1, alle an Zaehlschritten, saettigend): [408] markierte Besuche am Anwendungspunkt (Nenner; Marke -1 in fac_geo[8i+7] = Lage 1 und statischer Rang 1) | [409] Quelle berechnet (PINV-Zweig angewandt, pass2_an) | [410] PINV mit Rueckfall | [411] Zweig 3 (entkoppelter Skalarzweig) | [412] Zweig 1/2 (Vollrang) | [413] sonst -- ABNAHME Summe [409..413] == [408] STRIKT | [414] UNmarkiert im PINV-Zweig (nicht bedient) | [415..420] q = 1-a^2-b^2, Grenzen 0,1/0,3/0,5/0,7/0,9, Summe == [409] | [421..425] |p_perp|/|Z1| mit p_perp = (I-Gt/tr)P, Grenzen 0,1/1/10/100, [426] Ziel Z1 == 0, Summe [421..426] == [409] | R1Q=4 (FAC_R1Q_OHNE_DRUCK): V_R mit R' = R + 2(rho-1)(S1.t) -- nur der Reibungsanteil des BB wird ersetzt. [427] |du| > 0,5*ut: unter V_Z (R1Q=2) Stolperdraht, Soll 0; unter V_R (R1Q=3 bis 5) das TOR (Quelle nicht angewandt, BB bleibt -- wie SATGATE, Schranke wie tw_max) | [428] Impulsprobe Sum c Df != rho*du (aus den Inkrementen, Toleranz 1e-3 relativ) | [429] Massenprobe Sum Df != 0 (aus den Inkrementen, 1e-3 von rho*|du|) | [430] Buchungsprobe dfw != -m | [431] Normalanteil |du.n| > 1e-3|du|. 428..430 nur unter FAC_R1Q_AN. | [432] (★ 02.10.2026, nur unter SC_SIMD16) tatsaechliche Sub-Group-Breite von stream_collide, geschrieben von Zelle 0 (kein Zaehler; Soll 16). | R1Q=5 (★ 03.10.2026, nur unter FAC_R1Q_SPALTE1, an Zaehlschritten): kappa = (m.m4)/|m4|^2 = Anteil des Stufe-4-Schubs m4, den K2 (R2':=0) uebrig laesst, [433] <0 | [434] [0;0,1) | [435] [0,1;0,5) | [436] [0,5;0,9) | [437] [0,9;1,1) | [438] >=1,1 -- Summe 433..438 == [409] | [439] Schattentor |m4|/rho > 0,5*ut (dort haette Stufe 4 abgeschnitten; gegen [427] lesen). Puffer hits_n = 440 seit 03.10.2026, VOLL.
+	// U_RAND 04.10.2026 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.8, nur unter #ifdef U_RAND emittiert): [484] Papierkorb GELESEN, UNGEGATET, saettigend, Soll 0 (stream_collide TYPE_E und deriv_reg-Nachbarn, update_force_field Wandsolid, sgs_fdwand, drive_boundary als Schreibversuch; ★ 05.10.2026 Korrektur A-M1/C-M1 ERGAENZT: sgs_fdwand auch OHNE SGS_SISM, schale_extract (Punkt- und Blockmittel), fac_nachbar_ab (Linkziel), apply_pressure_outlet (Lesen ODER Schreiben am Papierkorb; geschrieben wird dort seither nur mit Slot). Laufzeit-Negativtests: CFD_U_RAND_TESTHAKEN 6/7/8 nehmen Zellen eines Lesers aus dem Layout, Soll dann 484 > 0. Nicht als Laufzeitzaehler erfasst: apply_moving_boundaries (in stream_collide; der Zaehler kostete auf der iGPU 1600 B Spill -- dafuer STATISCHE Probe der MS-Solidnachbarn gegen die Geraete-Flags in berichte_u_rand, die Lesemenge ist nach initialize fest), rho_rek_ebene (Diagnose), update_fields (tot unter UPDATE_FIELDS), sgs_gdiag/REK-PI (gesperrt), extract_plane_macros (Nahfeld nur ueber lese_yslice_in_host, das u verwirft; die oeffentliche API sperrt U_RAND) | [485] Kopf traegt nicht die gueltige Magic (Platzhalter/vergessene Neubindung), ungegatet, Soll 0 | [486] stream_collide geschrieben (Slot in R1/A) an t == zaehl_takt+2, Ist=Soll gegen Host | [487] dort ohne Slot (Nicht-Solid), Ist=Soll | [488] FREI (war C-Segment; entfallen, die N2F-Bloecke liegen in A) | [489] Ausgabe V Ebenen-/Saeulenzellen (Nicht-Solid), Ist=Soll gegen ur_soll_489 | [490] V-Scheibenzellen bei VOLL, NUR n%1024 == 0 (sonst ein Atomic je Zelle), Ist=Soll | [491] FREI in master (★ 05.10.2026: in den Worktrees tiling-aufholen und agent-a59b... als ZK-Attrappe belegt, ebenso [488] -- in master NICHT anders vergeben, beim Merge die Legenden vereinigen). | [492] ★ 05.10.2026 Korrektur A-M3/C-N7: ZELLBASEN-KONSTANTENSPIEGEL, atomic_or in stream_collide IM #ifdef-ZELLBASEN-Zweig neben load_f_zb (Bit 0; ein zweites Bit an store_f_zb kostete auf der iGPU 32 B Spill), Stichprobe t%zaehl_takt == 0 an n%1024 == 0; Soll 1 mit ZELLBASEN, 0 ohne (Abnahme berichte_dichteklemme, je Domaene). Puffer hits_n = 493 seit 05.10.2026. MERGE-HINWEIS: der Worktree agent-a3de... (M1 SPARSE-DIAG) fuehrt hits_n = 504 mit [500] belegt, [501..503] vorgehalten und 492..499 ausdruecklich frei fuer FLAGS4/U_RAND -- beim Merge hits_n = 504 nehmen, [492] bleibt ZELLBASEN.
+	// REK-PI 03.10.2026 (nur unter CFD_FAC_REKPI, JIT-Defines FAC_REKPI / FAC_REKPI_AN, PLAN-REK-PI.md §7; alle an Zaehlschritten t%zaehl_takt == 0 und saettigend, AUSSER [470] (Schritt danach)): [440] Besuche hinter dem ut-Tor (Soll [7]-[9]) | [441] Referenzpunkt gueltig, REK-PI gerechnet (unter _AN angewandt) | [442] kein Referenzpunkt (Sentinel der Sprungregel oder Referenz steht still; Soll [441]+[442] == [440]) | PROBEN Soll 0 (nur _AN): [443] Masse Sum Df | [444] Impuls Sum c Df | [445] Normal n.M.n | [446] Ist=Soll u_t (u.e1 = u_WM, u.e2 = 0; 1e-3) | [447] Ist=Soll Pi_t1n/Pi_t2n (1e-3) | [448..453] u_t,l.t_ref/u_WM <0 | 0-0,5 | 0,5-0,9 | 0,9-1,1 | 1,1-2 | >=2 | [454..458] Pi_lok/Pi_WM <0 | 0-0,5 | 0,5-2 | 2-10 | >=10 | [459] Richtungsumkehr cos(t_ref, t_lok) < 0 | [460] |Df|max < 2^-11 |f^|max (Quantum, No-Op-Gefahr) | [461] Sprung k = 2 | [462..465] y+_w <5 | 5-30 | 30-300 | >=300 | [466..468] |rho du|/tau_w <1e2 | 1e2-1e4 | >=1e4 | [469] du.t_ref > 0 an t%zaehl_takt == 0 | [470] dasselbe an t%zaehl_takt == 1 (Periode-2-Waechter) | [471] f_i < 0 nach Setzung+Tausch (nur _AN) | [472] w_WM in der Kollision angewandt (stream_collide, nur _AN; Soll == [441], unter Stufe 3/_NUR_U Soll 0). ★ 04.10.2026 (Pruefbefunde H1/NEU): [473] Nenner-Kollaps der Sekante u_k1.e1 - u_WM <= 0 (Teilmenge von [442], dort nicht gesetzt) | [474] nu_s an der molekularen Untergrenze geklemmt (Teilmenge von [441]) | NETTO-FLUSS (nur _AN, am Schritt t%zaehl_takt == 1): [475..481] T/(-rho u_tau^2) <0 | 0-0,5 | 0,5-0,9 | 0,9-1,1 | 1,1-2 | 2-10 | >=10, T = Ausflusshalbmoment der gesetzten Zelle nach der Kollision (roff+8) + Einflusshalbmoment des Folgeschritts | [482] Messbesuche (gesetzt am Folgeschritt) | [483] davon ohne gueltiges T_aus (Soll Sum[475..481] + [483] == [482]). Unter _AN feuern zusaetzlich die REK-Proben [328..334] und die R3-Slots [331], [370..392] an denselben Zellen (Soll [370] == [328] == [441]).
+	kernel_stream_collide = Kernel(device, N, "stream_collide", fi, rho, u, flags.k(), t, fx, fy, fz, felder_voll_h, rho_clamp_hits); // ★ TODO 2: rho_voll HINTER fz, damit set_parameters(4u, t, fx, fy, fz, rho_voll) zusammenhaengend bleibt; absolute Indizes gibt es nur fuer 0 und 4..7
+	sc_spill = kernel_stream_collide.spill_bytes(); // ★ 02.10. Laufzeit-Spill von stream_collide (jeder Lauf; Wirkpfad des Messarms SC_SIMD16, Soll dort 0)
+	sc_private = kernel_stream_collide.private_bytes(); // ★ 02.10. Pruefbefund SC16b N3: auch Scratch (private) muss 0 sein, Spill allein deckt ihn nicht
+	print_info("stream_collide auf "+device.info.name+": Register-Spill "+(!device.info.is_gpu ? string("ohne Bedeutung (CPU-Laufzeit meldet 0)") : (sc_spill==~0ull ? string("nicht abfragbar") : to_string(sc_spill)+" B"))+", private "+(sc_private==~0ull ? string("nicht abfragbar") : to_string(sc_private)+" B")+", max. Work-Group "+to_string(kernel_stream_collide.max_workgroup())+(sc_simd16_jit ? " (SC_SIMD16 aktiv)" : ""));
+	println("SC_SPILL geraet="+to_string(device.info.id)+" gpu="+string(device.info.is_gpu?"1":"0")+" sc16="+string(sc_simd16_jit?"1":"0")+" spill_B="+(sc_spill==~0ull ? string("na") : to_string(sc_spill))+" private_B="+(sc_private==~0ull ? string("na") : to_string(sc_private))); // ★ 02.10. Pruefbefund SC16b M1: EINE ungebrochene Zeile fuer grep (print_info bricht auf 79 Zeichen um)
+	kernel_update_fields = Kernel(device, N, "update_fields", fi, rho, u, flags.k(), t, fx, fy, fz);
+	kernel_boden_eq = Kernel(device, N, "boden_eq", fi, flags.k(), t, 0.0f, 0u, 0u, 0u, 0u, rho_clamp_hits); // Parameter t/u/nz/nz_down/x_split/abstand je Enqueue
 	boden_eq_n = s_boden_eq_n; boden_eq_u = s_boden_eq_u; boden_eq_down = s_boden_eq_down; boden_eq_split = s_boden_eq_split; boden_eq_abstand = s_boden_eq_abstand; // u_road = u_lat-Projektkonvention; Konstruktionszeit-Kopie (read-once-Doktrin)
-	kernel_einlass_eq = Kernel(device, N, "einlass_eq", fi, flags, t, 0.0f, 0u, rho_clamp_hits); // ★ EINLASS_EQ (V1-Port apply_inlet_velocity): Parameter t/u/nx je Enqueue
+	kernel_einlass_eq = Kernel(device, N, "einlass_eq", fi, flags.k(), t, 0.0f, 0u, rho_clamp_hits); // ★ EINLASS_EQ (V1-Port apply_inlet_velocity): Parameter t/u/nx je Enqueue
 	einlass_eq_n = s_einlass_eq_n; einlass_eq_u = s_einlass_eq_u; // Konstruktionszeit-Kopie (read-once-Doktrin)
 	rho_takt = s_rho_takt; // ★ TODO 2: Konstruktionszeit-Kopie wie die uebrigen (read-once-Doktrin)
 #ifdef SRT
@@ -876,19 +1133,19 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_stream_collide.add_parameters(F, f_maske);
 	f_param_uf = kernel_update_fields.get_number_of_parameters();
 	kernel_update_fields.add_parameters(F, f_maske);
-	kernel_update_force_field = Kernel(device, N, "update_force_field", fi, flags, t, F, f_maske, u, rho_clamp_hits); // ★ 2026-08-25 u + hits fuer den Bewegtwand-Term (Slot 59)
+	kernel_update_force_field = Kernel(device, N, "update_force_field", fi, flags.k(), t, F, f_maske, u, rho_clamp_hits); // ★ 2026-08-25 u + hits fuer den Bewegtwand-Term (Slot 59)
 	kernel_reset_force_field = Kernel(device, N, "reset_force_field", F, f_maske, rho_clamp_hits);
-	kernel_object_center_of_mass = Kernel(device, N, "object_center_of_mass", flags, (uchar)0u, object_sum);
+	kernel_object_center_of_mass = Kernel(device, N, "object_center_of_mass", flags.k(), (uchar)0u, object_sum);
 	of_groups = 1024u; // ★ 2026-08-25 feste Gittergroesse statt N -- Determinismus, s. Kernel-Kommentar
 	of_part = Memory<float>(device, 3ull*(ulong)of_groups);
-	kernel_object_force = Kernel(device, (ulong)of_groups*(ulong)WORKGROUP_SIZE, "object_force", F, f_maske, flags, (uchar)0u, of_part);
-	kernel_object_force_zband = Kernel(device, (ulong)of_groups*(ulong)WORKGROUP_SIZE, "object_force_zband", F, f_maske, flags, (uchar)0u, 0u, 0u, of_part); // FORK Kraft-Zerlegung: Aufrufe sequenziell
+	kernel_object_force = Kernel(device, (ulong)of_groups*(ulong)WORKGROUP_SIZE, "object_force", F, f_maske, flags.k(), (uchar)0u, of_part);
+	kernel_object_force_zband = Kernel(device, (ulong)of_groups*(ulong)WORKGROUP_SIZE, "object_force_zband", F, f_maske, flags.k(), (uchar)0u, 0u, 0u, of_part); // FORK Kraft-Zerlegung: Aufrufe sequenziell
 	kernel_object_force_final = Kernel(device, (ulong)WORKGROUP_SIZE, "object_force_final", of_part, of_groups, object_sum);
-	kernel_object_torque = Kernel(device, N, "object_torque", F, f_maske, flags, (uchar)0u, 0.0f, 0.0f, 0.0f, object_sum);
+	kernel_object_torque = Kernel(device, N, "object_torque", F, f_maske, flags.k(), (uchar)0u, 0.0f, 0.0f, 0.0f, object_sum);
 #endif // FORCE_FIELD
 
 #ifdef MOVING_BOUNDARIES
-	kernel_update_moving_boundaries = Kernel(device, N, "update_moving_boundaries", u, flags);
+	kernel_update_moving_boundaries = Kernel(device, N, "update_moving_boundaries", u, flags.k());
 #endif // MOVING_BOUNDARIES
 
 #ifdef SURFACE
@@ -897,10 +1154,10 @@ void LBM_Domain::allocate(Device& device) {
 	massex = Memory<float>(device, N, 1u, false);
 	kernel_initialize.add_parameters(mass, massex, phi);
 	kernel_stream_collide.add_parameters(mass);
-	kernel_surface_0 = Kernel(device, N, "surface_0", fi, rho, u, flags, mass, massex, phi, t, fx, fy, fz);
-	kernel_surface_1 = Kernel(device, N, "surface_1", flags);
-	kernel_surface_2 = Kernel(device, N, "surface_2", fi, rho, u, flags, t);
-	kernel_surface_3 = Kernel(device, N, "surface_3", rho, flags, mass, massex, phi);
+	kernel_surface_0 = Kernel(device, N, "surface_0", fi, rho, u, flags.k(), mass, massex, phi, t, fx, fy, fz);
+	kernel_surface_1 = Kernel(device, N, "surface_1", flags.k());
+	kernel_surface_2 = Kernel(device, N, "surface_2", fi, rho, u, flags.k(), t);
+	kernel_surface_3 = Kernel(device, N, "surface_3", rho, flags.k(), mass, massex, phi);
 #endif // SURFACE
 
 #ifdef TEMPERATURE
@@ -913,7 +1170,7 @@ void LBM_Domain::allocate(Device& device) {
 
 #ifdef PARTICLES
 	particles = Memory<float>(device, (ulong)particles_N, 3u);
-	kernel_integrate_particles = Kernel(device, (ulong)particles_N, "integrate_particles", particles, u, flags, 1.0f);
+	kernel_integrate_particles = Kernel(device, (ulong)particles_N, "integrate_particles", particles, u, flags.k(), 1.0f);
 #ifdef FORCE_FIELD
 	kernel_integrate_particles.add_parameters(F, fx, fy, fz);
 #endif // FORCE_FIELD
@@ -947,6 +1204,7 @@ void LBM_Domain::allocate(Device& device) {
 		// Die Formel MUSS zeichengleich zu der in device_defines() sein -- am 22.09. kostete genau diese
 		// Divergenz einen 2,5-fachen Pufferueberlauf auf der GPU. Eigene Zeile, kein Kommentar davor.
 		if(fac_rek_on) nb_stride += nb_rek_floats;
+		if(fac_rekpi_on) nb_stride += nb_rekpi_floats; // ★ 03.10. REK-PI: drei weitere Floats (u_tau, u_WM, nu_eff), ★ 04.10. vier (+ T_aus des Netto-Fluss-Zaehlers), zeichengleich zur Formel in device_defines()
 		timer_apg = apg_on ? s_timer_apg : 0u; // ★ 22.09.2026: timer_apg genau wie apg_haken an die INSTANZ gebunden -- das Fernfeld traegt kein APG und darf den Timer nicht tragen.
 		// ★★ 22.09.2026, EIGENER FEHLER, vom Pruefagenten gefunden: der Kommentar oben stand zuerst MITTEN in
 		// dieser Zeile, VOR der nb_stride-Zuweisung. Die Zuweisung lag damit vollstaendig im //-Kommentar,
@@ -1006,12 +1264,12 @@ void LBM_Domain::alloc_coupling_planes(const ulong max_plane_cells) { // FORK: D
 	kernel_extract_plane_macros = Kernel(device, max_plane_cells, "extract_plane_macros",
 		rho, u, coupling_plane, 0u, 0u, 0u, 0u, 1u, 1u);
 	kernel_drive_boundary_cubic_lift = Kernel(device, max_plane_cells, "drive_boundary_cubic_lift",
-		rho, u, flags, coupling_plane, 0u, 0u, 0u, 0u, 1u, 1u, 1u, 1u, 4u, rho_clamp_hits); // hits ANGEHAENGT (Slot 214, Betragstor auf u) -- set_parameters(4u, ...) bleibt davon unberuehrt
+		rho, u, flags.k(), coupling_plane, 0u, 0u, 0u, 0u, 1u, 1u, 1u, 1u, 4u, rho_clamp_hits); // hits ANGEHAENGT (Slot 214, Betragstor auf u) -- set_parameters(4u, ...) bleibt davon unberuehrt
 	// ★ Slice-Ebenen-Read 2026-08-26 (Hausmuster: Puffer anlegen und Kernel MIT echten Puffern
 	// erzeugen -- kein Platzhalter-Bind-spaeter, die DIAGZ-Use-after-free-Klasse).
 	slice_flags = Memory<uchar>(device, max_plane_cells, 1u);
 	kernel_extract_plane_flags = Kernel(device, max_plane_cells, "extract_plane_flags",
-		flags, slice_flags, 0u, 0u, 0u, 0u, 1u, 1u);
+		flags.k(), slice_flags, 0u, 0u, 0u, 0u, 1u, 1u);
 	print_info("Kopplungspuffer: "+to_string(max_plane_cells)+" Zellen a 4 floats = "
 		+to_string((float)(max_plane_cells*16ull)/1048576.0f,2u)+" MB auf "+device.info.name+".");
 }
@@ -1025,7 +1283,7 @@ void LBM_Domain::alloc_rho_rek(const ulong max_plane_cells) {
 	rho_rek_max = max_plane_cells;
 	rho_rek_out  = Memory<float>(device, max_plane_cells*4ull, 1u);
 	rho_rek_wort = Memory<rhoxx>(device, max_plane_cells, 1u);
-	kernel_rho_rek_ebene = Kernel(device, max_plane_cells, "rho_rek_ebene", fi, rho, u, flags, t, rho_rek_out, rho_rek_wort, 0u, 0u, 0u, 0u, 1u, 1u, 0u, rho_clamp_hits); // ★ C2a: modus an Index 13, hits 14, tile_slot 15
+	kernel_rho_rek_ebene = Kernel(device, max_plane_cells, "rho_rek_ebene", fi, rho, u, flags.k(), t, rho_rek_out, rho_rek_wort, 0u, 0u, 0u, 0u, 1u, 1u, 0u, rho_clamp_hits); // ★ C2a: modus an Index 13, hits 14, tile_slot 15
 	if(sparse_on) kernel_rho_rek_ebene.add_parameters(tile_slot); // Guard wie im Kernel (TS_P haengt an SPARSE_TILES, Falle 8)
 	print_info("rho-Rekonstruktion (RHO_RAND C1): Puffer fuer "+to_string(max_plane_cells)+" Ebenenzellen = "
 		+to_string((float)(max_plane_cells*(16ull+(ulong)sizeof(rhoxx)))/1.0e6f,2u)+" MB auf "+device.info.name+".");
@@ -1066,8 +1324,8 @@ void LBM_Domain::alloc_schale(const std::vector<ulong>& liste, const std::vector
 	schale_gewicht = Memory<float>(device, blendet ? n : 1ull); // Gradient-Blend: Zellgewichte (Lagen-Rampe), wirken als a = alpha*gewicht[gid]
 	if(blendet) for(ulong i=0ull; i<n; i++) schale_gewicht[i] = gewichte[i];
 	schale_gewicht.write_to_device();
-	kernel_schale_extract = Kernel(device, n, "schale_extract", u, flags, schale_liste, (uint)n, ratio, 1u, schale_uout); // mittel (Pos. 5) je Enqueue
-	kernel_schale_blend   = Kernel(device, n, "schale_blend", fi, flags, t, 0.0f, schale_liste, (uint)n, schale_unear, schale_gewicht, modus, rho_clamp_hits); // t/alpha (Pos. 2/3) je Enqueue; gewicht+modus VOR diag (Plan-Vorgabe)
+	kernel_schale_extract = Kernel(device, n, "schale_extract", u, flags.k(), schale_liste, (uint)n, ratio, 1u, schale_uout, rho_clamp_hits); // mittel (Pos. 5) je Enqueue; ★ 05.10.2026 A-M1/C-M1: hits (Pos. 7, Slot 484 unter U_RAND)
+	kernel_schale_blend   = Kernel(device, n, "schale_blend", fi, flags.k(), t, 0.0f, schale_liste, (uint)n, schale_unear, schale_gewicht, modus, rho_clamp_hits); // t/alpha (Pos. 2/3) je Enqueue; gewicht+modus VOR diag (Plan-Vorgabe)
 	if(sparse_on) kernel_schale_blend.add_parameters(tile_slot); // TS_P haengt NUR an SPARSE_TILES (XL-Audit-B1-Lektion); der Blend laeuft zwar nur im Fernfeld (ohne Tiling), aber die Signatur muss zur Emission der Domaene passen
 	print_info("N2F-Schale: "+to_string(n)+" Zellen a 2x3+1 floats + Indexliste = "
 		+to_string((float)(n*(blendet?32ull:16ull))/1048576.0f,2u)+" MB auf "+device.info.name+" (alpha dieser Domaene: "+to_string(schale_alpha,3u)+", modus "+to_string(modus)+(modus==2u?" IDENT-Debug":modus==1u?" FNEQ":" EQ")+").");
@@ -1310,15 +1568,16 @@ void LBM_Domain::alloc_sgs_band(const uchar* flags_host, const uint Nx, const ui
 		kernel_stream_collide.set_parameters(band_param_pos, band_idx, band_sb);
 	} else {
 	kernel_stream_collide.set_parameters(band_param_pos, band_idx, band_sbar);
-	kernel_sgs_band = Kernel(device, band_N, "sgs_fdwand", u, flags, band_zellen, (uint)band_N, band_sbar);
+	kernel_sgs_band = Kernel(device, band_N, "sgs_fdwand", u, flags.k(), band_zellen, (uint)band_N, band_sbar);
 	if(sism_on) kernel_sgs_band.add_parameters(t, band_sb, rho_clamp_hits, 1u); // sbar_out = 1: der Bandkernel liefert Sbar, kein w
+	else if(u_rand_on) kernel_sgs_band.add_parameters(rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: wie kernel_sgs_fdwand -- ohne SISM mit U_RAND nur der Zaehlerpuffer, VOR tile_slot
 	if(sparse_on) kernel_sgs_band.add_parameters(tile_slot); // ★ 22.09. Pruefbefund M1: TS_P ist der letzte Parameter von sgs_fdwand -- der Lage-1-Kernel bekam ihn (B-7-Lehre), der Bandkernel nicht; mit CFD_SPARSE_TILES waere der Band-Launch mit CL_INVALID_KERNEL_ARGS gestorben (bisher nie kombiniert)
 	}
 	if(gdiag_on) { // ★ 22.09.2026 BAND-g-DIAGNOSE: zweite Instanz desselben Kernels ueber die Bandliste (Liste traegt n, s. o.). Kein Kernel-, kein JIT-Text geaendert.
 		band_gd = Memory<float>(device, 8ull*band_N);
 		for(ulong q8=0ull; q8<8ull*band_N; q8++) band_gd[q8]=0.0f;
 		band_gd.write_to_device();
-		kernel_band_gdiag = Kernel(device, band_N, "sgs_gdiag", fi, u, flags, band_zellen, (uint)band_N, band_gd, t, fx, fy, fz, s_sgs_guo?1u:0u);
+		kernel_band_gdiag = Kernel(device, band_N, "sgs_gdiag", fi, u, flags.k(), band_zellen, (uint)band_N, band_gd, t, fx, fy, fz, s_sgs_guo?1u:0u);
 		if(sparse_on) kernel_band_gdiag.add_parameters(tile_slot); // TS_P zuletzt, wie bei kernel_sgs_gdiag (B-7)
 		band_gdiag_on = true;
 		print_info("BAND-g-DIAGNOSE (CFD_SGS_GDIAG x CFD_SGS_BAND): "+to_string(band_N)+" Bandzellen, "+to_string((ulong)(32ull*band_N/1048576ull))+" MB -- misst |S|_FD, |S|_Pi, D_WALE, D_Sigma, |Omega| je Bandzelle (Lage 2.."+to_string(lagen)+"); Physik unangetastet.");
@@ -1529,13 +1788,582 @@ uint LBM_Domain::pruefe_rho_rand_c0(const uchar* flags_host, const uint Nx, cons
 	return bad;
 }
 
-void LBM_Domain::alloc_f_liste(const uchar* flags_host, const uint Nx, const uint Ny, const uint Nz) {
-	if(!f_liste_on) return;
-#if defined(PARTICLES)||defined(GRAPHICS)
-	print_error("CFD_F_LISTE ist mit PARTICLES/GRAPHICS nicht verdrahtet -- integrate_particles/graphics_flags hielten den F-Platzhalter (Diff-Pruefung D7).");
+// ★ 04.10.2026 U_RAND U0 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.8/B.10, Schritt U0). REINE HOSTPRUEFUNG: kein Kernel, kein
+// Geraetepuffer, kein Eingriff in den Rechenweg. Beantwortet am echten Gitter, wie gross die Lesemenge von u wirklich ist, und
+// legt die Mengen in ur_mengen ab, aus denen ab U1d der kompakte Speicher gebaut wird. Die Leser (Inventar Plan B.3):
+//   R1-Pflicht: TYPE_E (stream_collide liest u dort, KLEMM_BILANZ), ihre Achsnachbarn (deriv_reg), po_cells/po_interior
+//               (apply_pressure_outlet). Muessen in R1 liegen -- R1 wird unter U_RAND IMMER gespeichert.
+//   E (eng):    L1 = Facettenzellen; sgs_fdwand liest die 6 Achsnachbarn ohne reines TYPE_S; fac_nachbar_ab liest unter den 18
+//               (D3Q27: 26) Nachbarn nur reines Fluid; update_force_field liest u an JEDER Wandsolidzelle (Solid mit einem Nicht-
+//               Solid-Nachbarn, ganze Domaene); apply_moving_boundaries liest u an ALLEN Solidnachbarn einer kuenftigen TYPE_MS-
+//               Zelle (Fluid neben Solid mit u != 0, Regel aus initialize). E darf R1 schneiden; gespeichert wird dort ueber R1.
+//   C:          N2F-Bloecke, Fenster [c-2, c+1]^3 je Zentrum c (schale_extract), Block(x) = (x+2)/4 (fd = (grob-NF_O)*ratio).
+//   Init-Regel: initialize liest u an JEDER Zelle. Ausserhalb der Speichermenge muss der Hostspiegel daher wortgleich der Regel
+//               folgen: Nicht-Solid (u_lat, 0, 0), reines Solid (0, 0, 0) -- als gepackte Speicherwoerter verglichen.
+// Testhaken (CFD_U_RAND_TESTHAKEN): 1 = eine sgs_fdwand-Nachbarzelle aus der eng-Speichermenge nehmen -> Abdeckung meldet 1;
+//   4 = die Init-Regel an einer ungespeicherten Fluidzelle um ein Quant verletzen -> Init-Waechter meldet 1.
+// Alle Befunde werden gesammelt; die Rueckgabe ist ihre Zahl (Abbruch EINMAL im Setup, Werkzeugfalle 24).
+// ★ 05.10.2026 Korrektur A-H1 (AUDIT-LOOP-2026-10-05-A): die N2F-Bloecke waren fest 4^3 ([c-2, c+1], Block (x+2)/4), schale_extract mittelt aber
+//   ueber ratio^3 ([c-ratio/2, c-ratio/2+ratio)). Bei CFD_RATIO = 8 bestand die Rasterpruefung (fd = (grob-NF_O)*8 ist auch ein Vielfaches von 4),
+//   448 von 512 Fensterzellen hatten keinen Slot und das Blockmittel fiel still auf ~u/8. Jetzt Blockkante cr = ratio, Versatz ch = ratio/2,
+//   Raster x % ratio == 0, Block(x) = (x+ch)/cr -- bei ratio 4 wortgleich zu vorher (ch = 2). Zusaetzlich prueft alloc_u_rand NACH dem Layout
+//   jede Fluidzelle jedes Kernelfensters gegen ur_idx_host (Fensterprobe, harter Abbruch vor run(0)).
+// Laufzeit-Testhaken (★ 05.10.2026, Negativtest der Papierkorb-Zaehler A-M1/C-M1; nur Modus 3): 6 = EINE sgs_fdwand-Nachbarzelle (nicht in N2F-
+//   Bloecken, nicht Wandsolid/MS-Nachbar, ohne NACHBAR auch kein Linkziel) aus dem LAYOUT nehmen; 7 = ALLE Linkziele von fac_nachbar_ab, die
+//   kein sgs_fdwand-Nachbar, keine Blockzelle und kein Solid-Leser sind; 8 = die Fluid-Blockzellen ausserhalb E EINES N2F-Blocks (alle Bloecke leer kippt die Schale, kc_cpu_h8). Der Zensus selbst meldet 0
+//   (die Mengen bleiben), Soll ist dann Slot 484 > 0 zur Laufzeit (U_RAND ABNAHME kehrt die Sollrichtung um).
+uint LBM_Domain::pruefe_u_rand_c0(const uchar* fl, const velxx* uh, const uint Nx, const uint Ny, const uint Nz, const std::vector<ulong>& n2f_zentren, const uint ratio, const float u_lat, const uint testhaken) {
+	uint bad = 0u;
+	const ulong NxNy = (ulong)Nx*(ulong)Ny, NN = NxNy*(ulong)Nz;
+	if(NN!=get_N()) { print_warning("U_RAND C0: Gittermasse passen nicht zur Domaene."); return 1u; }
+	if(Nx<6u||Ny<6u||Nz<6u) { print_warning("U_RAND C0: eine Gitterkante < 6 -- die Randschale R1 ist dort nicht definiert."); return 1u; }
+	URandMengen& M = ur_mengen;
+	M = URandMengen();
+	if(ratio<2u) { print_warning("U_RAND C0: ratio "+to_string(ratio)+" < 2."); return 1u; }
+	M.cr = ratio; M.ch = ratio/2u; // ★ A-H1
+	const uint cr = M.cr, ch = M.ch;
+	const ulong cr3 = (ulong)cr*(ulong)cr*(ulong)cr;
+	const ulong NW = (NN+63ull)/64ull;
+	M.e_bits.assign((size_t)NW, 0ull);
+	auto bget = [](const std::vector<ulong>& v, const ulong i) { return ((v[(size_t)(i>>6)]>>(uint)(i&63ull))&1ull)!=0ull; };
+	auto bset = [](std::vector<ulong>& v, const ulong i) { v[(size_t)(i>>6)] |= 1ull<<(uint)(i&63ull); };
+	auto bclr = [](std::vector<ulong>& v, const ulong i) { v[(size_t)(i>>6)] &= ~(1ull<<(uint)(i&63ull)); };
+	auto in_r1 = [&](const uint x, const uint y, const uint z) { return x<2u||x+2u>=Nx||y<2u||y+2u>=Ny||z<2u||z+2u>=Nz; };
+	auto in_r1_n = [&](const ulong n) { return in_r1((uint)(n%(ulong)Nx), (uint)((n/(ulong)Nx)%(ulong)Ny), (uint)(n/NxNy)); };
+	auto nb = [&](const uint x, const uint y, const uint z, const int dx, const int dy, const int dz) { // periodisch wie neighbors() im Kernel
+		const uint xn = (uint)((((int)x+dx)%(int)Nx+(int)Nx)%(int)Nx);
+		const uint yn = (uint)((((int)y+dy)%(int)Ny+(int)Ny)%(int)Ny);
+		const uint zn = (uint)((((int)z+dz)%(int)Nz+(int)Nz)%(int)Nz);
+		return (ulong)xn+((ulong)yn+(ulong)zn*(ulong)Ny)*(ulong)Nx;
+	};
+	auto rein_s = [&](const ulong n) { return (fl[n]&(TYPE_S|TYPE_E))==TYPE_S; };
+#ifndef D3Q27
+	static const int DV[18][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},{1,1,0},{-1,-1,0},{1,0,1},{-1,0,-1},{0,1,1},{0,-1,-1},{1,-1,0},{-1,1,0},{1,0,-1},{-1,0,1},{0,1,-1},{0,-1,1}};
+	const uint nv = 18u;
+#else
+	static const int DV[26][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},{1,1,0},{-1,-1,0},{1,0,1},{-1,0,-1},{0,1,1},{0,-1,-1},{1,-1,0},{-1,1,0},{1,0,-1},{-1,0,1},{0,1,-1},{0,-1,1},
+		{1,1,1},{-1,-1,-1},{1,1,-1},{-1,-1,1},{1,-1,1},{-1,1,-1},{-1,1,1},{1,-1,-1}};
+	const uint nv = 26u;
 #endif
+	auto u_ungleich_null = [&](const ulong n) { return u_unpack(uh[n])!=0.0f||u_unpack(uh[NN+n])!=0.0f||u_unpack(uh[2ull*NN+n])!=0.0f; }; // wie initialize: load_u(...) != 0.0f
+	// ---- (1) R1-Pflichten
+	ulong n_e = 0ull, v_e = 0ull, v_e_nb = 0ull, v_po = 0ull;
+	for(uint z=0u; z<Nz; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+		const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+		if((fl[n]&(TYPE_S|TYPE_E))!=TYPE_E) continue;
+		n_e++;
+		if(!in_r1(x,y,z)) v_e++;
+		for(uint i=0u; i<6u; i++) { const ulong m = nb(x,y,z,DV[i][0],DV[i][1],DV[i][2]); if((fl[m]&(TYPE_S|TYPE_E))==0u&&!in_r1_n(m)) v_e_nb++; } // deriv_reg liest nur echtes Fluid (weder S noch E)
+	}
+	for(uint i=0u; i<po_N_active; i++) { if(!in_r1_n((ulong)po_interior[i])) v_po++; if(!in_r1_n((ulong)po_cells[i])) v_po++; }
+	// ---- (2) E aufbauen, getrennt nach Lesern gezaehlt (Mehrfachzugehoerigkeit zaehlt je Leser)
+	ulong n_l1 = 0ull, n_fd = 0ull, n_nbz = 0ull, n_wand = 0ull, n_ms = 0ull, n_ms_s = 0ull;
+	std::vector<ulong> fd_bits((size_t)NW, 0ull); // nur fuer Testhaken 1 und die Abdeckungspruefung: sgs_fdwand-Lesemenge allein
+	const bool lhaken = testhaken==6u||testhaken==7u||testhaken==8u; // ★ 05.10.2026 Laufzeit-Testhaken
+	std::vector<ulong> nbz_bits, sol_bits; // nur unter Haken 6/7: Linkziele bzw. Solid-Leser (Wandsolid, MS-Solidnachbarn)
+	if(lhaken) { nbz_bits.assign((size_t)NW, 0ull); sol_bits.assign((size_t)NW, 0ull); }
 	const ulong FN = (ulong)fbnx*(ulong)fbny*(ulong)fbnz;
-	const ulong FNB = (FN+31ull)/32ull;
+	if(fac_N>0ull&&FN>0ull) {
+		for(uint zb=0u; zb<fbnz; zb++) for(uint yb=0u; yb<fbny; yb++) for(uint xb=0u; xb<fbnx; xb++) {
+			const ulong fbi = (ulong)xb+((ulong)yb+(ulong)zb*(ulong)fbny)*(ulong)fbnx;
+			const bool ist = fac_idx_voll_on ? fac_idx[fbi]!=0xFFFFFFFFu : ((fac_idx[2ull*(fbi>>5)]>>(uint)(fbi&31ull))&1u)!=0u;
+			if(!ist) continue;
+			const uint x = fbx0+xb, y = fby0+yb, z = fbz0+zb;
+			const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+			bset(M.e_bits, n); n_l1++;
+			if(fdwand_on) for(uint i=0u; i<6u; i++) { const ulong m = nb(x,y,z,DV[i][0],DV[i][1],DV[i][2]); if(!rein_s(m)) { bset(M.e_bits, m); bset(fd_bits, m); n_fd++; } }
+			if(nachbar_on) for(uint i=0u; i<nv; i++) { const ulong m = nb(x,y,z,DV[i][0],DV[i][1],DV[i][2]); if((fl[m]&(TYPE_S|TYPE_E))==0u) { bset(M.e_bits, m); n_nbz++; if(lhaken) bset(nbz_bits, m); } }
+		}
+	}
+	for(uint z=0u; z<Nz; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+		const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+		const uchar bo = fl[n]&(TYPE_S|TYPE_E);
+		if(bo==TYPE_S) {
+			bool wand = false; // update_force_field: Solid mit mindestens einem Nicht-Solid-Nachbarn (Kernel wickelt periodisch)
+			for(uint i=0u; i<nv&&!wand; i++) if(!rein_s(nb(x,y,z,DV[i][0],DV[i][1],DV[i][2]))) wand = true;
+			if(wand) { bset(M.e_bits, n); n_wand++; if(lhaken) bset(sol_bits, n); }
+		} else if(bo==0u) { // kuenftige TYPE_MS-Zelle (initialize): Fluid neben einem Solid mit u != 0
+			bool ms = false;
+			for(uint i=0u; i<nv&&!ms; i++) { const ulong m = nb(x,y,z,DV[i][0],DV[i][1],DV[i][2]); if(rein_s(m)&&u_ungleich_null(m)) ms = true; }
+			if(!ms) continue;
+			n_ms++;
+			for(uint i=0u; i<nv; i++) { const ulong m = nb(x,y,z,DV[i][0],DV[i][1],DV[i][2]); if(rein_s(m)) { bset(M.e_bits, m); n_ms_s++; if(lhaken) bset(sol_bits, m); } } // apply_moving_boundaries liest ALLE Solidnachbarn
+		}
+	}
+	// ---- (3) E zaehlen, Huelle von E ohne R1
+	uint ex0=Nx, ey0=Ny, ez0=Nz, ex1=0u, ey1=0u, ez1=0u;
+	for(uint z=0u; z<Nz; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+		const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+		if(!bget(M.e_bits, n)) continue;
+		if(in_r1(x,y,z)) { M.n_e_r1++; continue; }
+		M.n_e_aus++;
+		ex0=min(ex0,x); ey0=min(ey0,y); ez0=min(ez0,z); ex1=max(ex1,x+1u); ey1=max(ey1,y+1u); ez1=max(ez1,z+1u);
+	}
+	if(M.n_e_aus>0ull) { M.ex0=ex0; M.ey0=ey0; M.ez0=ez0; M.enx=ex1-ex0; M.eny=ey1-ey0; M.enz=ez1-ez0; }
+	// ---- (4) N2F-Bloecke
+	ulong v_c = 0ull; // Zentrum nicht auf dem ratio-Raster oder Fenster ausserhalb des Gitters (★ A-H1: vorher fest 4)
+	uint bx0=0xFFFFFFFFu, by0=0xFFFFFFFFu, bz0=0xFFFFFFFFu, bx1=0u, by1=0u, bz1=0u;
+	for(const ulong c : n2f_zentren) {
+		const uint x = (uint)(c%(ulong)Nx), y = (uint)((c/(ulong)Nx)%(ulong)Ny), z = (uint)(c/NxNy);
+		if(x<ch||y<ch||z<ch||x-ch+cr>Nx||y-ch+cr>Ny||z-ch+cr>Nz||x%cr!=0u||y%cr!=0u||z%cr!=0u) { v_c++; continue; } // Fenster [c-ch, c-ch+cr) wie schale_extract
+		const uint bx=(x+ch)/cr, by=(y+ch)/cr, bz=(z+ch)/cr;
+		bx0=min(bx0,bx); by0=min(by0,by); bz0=min(bz0,bz); bx1=max(bx1,bx+1u); by1=max(by1,by+1u); bz1=max(bz1,bz+1u);
+	}
+	if(v_c==0ull&&!n2f_zentren.empty()) {
+		M.cbx0=bx0; M.cby0=by0; M.cbz0=bz0; M.cbnx=bx1-bx0; M.cbny=by1-by0; M.cbnz=bz1-bz0;
+		const ulong CB = (ulong)M.cbnx*(ulong)M.cbny*(ulong)M.cbnz;
+		M.c_bits.assign((size_t)((CB+63ull)/64ull), 0ull);
+		for(const ulong c : n2f_zentren) {
+			const uint x = (uint)(c%(ulong)Nx), y = (uint)((c/(ulong)Nx)%(ulong)Ny), z = (uint)(c/NxNy);
+			const ulong b = (ulong)((x+ch)/cr-bx0)+((ulong)((y+ch)/cr-by0)+(ulong)((z+ch)/cr-bz0)*(ulong)M.cbny)*(ulong)M.cbnx;
+			if(!bget(M.c_bits, b)) { bset(M.c_bits, b); M.n_bloecke++; }
+		}
+	}
+	// Bloecke ganz/teilweise/gar nicht in R1 u E (Vorrang R1 > A > C)
+	ulong c_ganz = 0ull, c_teil = 0ull, c_frei = 0ull, c_extra = 0ull; // c_extra: Blockzellen ausserhalb R1 u E (kommen im Modus eng zu A dazu)
+	uint gx0=ex0, gy0=ey0, gz0=ez0, gx1=ex1, gy1=ey1, gz1=ez1; // Grossbox = Huelle(E ohne R1) u Blockzellen
+	if(M.n_e_aus==0ull) { gx0=Nx; gy0=Ny; gz0=Nz; gx1=0u; gy1=0u; gz1=0u; }
+	if(M.n_bloecke>0ull) for(uint bz=0u; bz<M.cbnz; bz++) for(uint by=0u; by<M.cbny; by++) for(uint bx=0u; bx<M.cbnx; bx++) {
+		if(!bget(M.c_bits, (ulong)bx+((ulong)by+(ulong)bz*(ulong)M.cbny)*(ulong)M.cbnx)) continue;
+		const uint x0 = cr*(M.cbx0+bx)-ch, y0 = cr*(M.cby0+by)-ch, z0 = cr*(M.cbz0+bz)-ch;
+		gx0=min(gx0,x0); gy0=min(gy0,y0); gz0=min(gz0,z0); gx1=max(gx1,x0+cr); gy1=max(gy1,y0+cr); gz1=max(gz1,z0+cr);
+		ulong drin = 0ull;
+		for(ulong k=0ull; k<cr3; k++) { const uint x=x0+(uint)(k%cr), y=y0+(uint)((k/cr)%cr), z=z0+(uint)(k/((ulong)cr*cr)); if(in_r1(x,y,z)||bget(M.e_bits, (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx)) drin++; else c_extra++; }
+		if(drin==cr3) c_ganz++; else if(drin>0ull) c_teil++; else c_frei++;
+	}
+	if(gx1>gx0) { M.gx0=gx0; M.gy0=gy0; M.gz0=gz0; M.gnx=gx1-gx0; M.gny=gy1-gy0; M.gnz=gz1-gz0; }
+	const ulong r1_N = NN-(ulong)(Nx-4u)*(ulong)(Ny-4u)*(ulong)(Nz-4u);
+	const ulong n_gross = (ulong)M.gnx*(ulong)M.gny*(ulong)M.gnz;
+	ulong n_gross_r1 = 0ull; // Grossbox-Zellen, die zugleich in R1 liegen (dort ueber R1 gespeichert, der Boxslot bleibt leer)
+	for(uint z=M.gz0; z<M.gz0+M.gnz; z++) for(uint y=M.gy0; y<M.gy0+M.gny; y++) for(uint x=M.gx0; x<M.gx0+M.gnx; x++) if(in_r1(x,y,z)) n_gross_r1++;
+	// ---- (5) Abdeckung der Leser durch die Speichermengen beider Modi (Grossbox U1d / eng U2), Testhaken 1
+	std::vector<ulong> a_eng = M.e_bits; // eng-Speichermenge ausserhalb R1 (Testhaken 1 nimmt hier eine Zelle heraus, NICHT in M.e_bits)
+	if(testhaken==1u) {
+		ulong opfer = NN;
+		for(ulong w=0ull; w<NW&&opfer==NN; w++) if(fd_bits[(size_t)w]!=0ull) for(uint b=0u; b<64u&&opfer==NN; b++) { const ulong n = w*64ull+b; if(n<NN&&bget(fd_bits, n)&&!in_r1_n(n)) opfer = n; }
+		if(opfer<NN) { bclr(a_eng, opfer); println("U_RAND-TESTHAKEN 1: sgs_fdwand-Nachbarzelle "+to_string(opfer)+" aus der eng-Speichermenge genommen. Soll: Abdeckung eng meldet 1."); }
+		else { print_warning("U_RAND-TESTHAKEN 1: keine sgs_fdwand-Nachbarzelle ausserhalb R1 gefunden -- Haken wirkungslos."); bad++; }
+	}
+	auto in_gross = [&](const uint x, const uint y, const uint z) { return x>=M.gx0&&x<M.gx0+M.gnx&&y>=M.gy0&&y<M.gy0+M.gny&&z>=M.gz0&&z<M.gz0+M.gnz; };
+	ulong v_eng = 0ull, v_gross = 0ull; // Zellen von E, die die jeweilige Speichermenge NICHT traegt (Soll 0)
+	for(uint z=0u; z<Nz; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+		const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+		if(!bget(M.e_bits, n)||in_r1(x,y,z)) continue;
+		if(!bget(a_eng, n)) v_eng++;
+		if(!in_gross(x,y,z)) v_gross++;
+	}
+	// ---- (6) Init-Regel an den NICHT gespeicherten Zellen (beide Modi)
+	const velxx w_ul = u_pack(u_lat), w_0 = u_pack(0.0f);
+	ulong v_init_eng = 0ull, v_init_gross = 0ull, n_frei_eng = 0ull, n_frei_gross = 0ull; ulong erst_v = NN;
+	ulong haken4 = NN;
+	for(uint z=0u; z<Nz; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+		const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+		if(in_r1(x,y,z)) continue;
+		const bool s = rein_s(n);
+		velxx wx = uh[n]; const velxx wy = uh[NN+n], wz = uh[2ull*NN+n];
+		const bool frei_eng = !bget(a_eng, n)&&!(M.n_bloecke>0ull&&((x+ch)/cr)>=M.cbx0&&((x+ch)/cr)<M.cbx0+M.cbnx&&((y+ch)/cr)>=M.cby0&&((y+ch)/cr)<M.cby0+M.cbny&&((z+ch)/cr)>=M.cbz0&&((z+ch)/cr)<M.cbz0+M.cbnz
+			&&bget(M.c_bits, (ulong)((x+ch)/cr-M.cbx0)+((ulong)((y+ch)/cr-M.cby0)+(ulong)((z+ch)/cr-M.cbz0)*(ulong)M.cbny)*(ulong)M.cbnx));
+		const bool frei_gross = !in_gross(x,y,z);
+		if(testhaken==4u&&haken4==NN&&frei_eng&&frei_gross&&!s) { haken4 = n; wx = (velxx)(wx+1u); println("U_RAND-TESTHAKEN 4: Init-Regel an Zelle "+to_string(n)+" um ein Quant verletzt. Soll: Init-Waechter meldet 1 je Modus."); }
+		const bool ok = s ? (wx==w_0&&wy==w_0&&wz==w_0) : (wx==w_ul&&wy==w_0&&wz==w_0);
+		if(frei_eng) { n_frei_eng++; if(!ok) { v_init_eng++; if(erst_v==NN) erst_v = n; } }
+		if(frei_gross) { n_frei_gross++; if(!ok) { v_init_gross++; if(erst_v==NN) erst_v = n; } }
+	}
+	// ---- (7) Bericht, je Kennzahl eine ungebrochene Zeile (grep-Abnahme, Werkzeugfalle 27)
+	auto mib = [](const double b) { return to_string((float)(b/1048576.0), 2u); };
+	const double b_heute = 3.0*(double)NN*(double)sizeof(velxx);
+	const ulong vblock = cr3*M.n_bloecke;
+	const double hdr = 4096.0; // Kopf + Reserve, Groessenordnung
+	const double b_gross = 3.0*(double)sizeof(velxx)*(double)(r1_N+n_gross+1ull)+hdr;
+	const ulong ebox = (ulong)M.enx*(ulong)M.eny*(ulong)M.enz;
+	const ulong cbox = (ulong)M.cbnx*(ulong)M.cbny*(ulong)M.cbnz;
+	// ★ U1c-Bauabweichung: im Modus eng liegen die Bloecke in A (Maske ueber die Grossbox), kein Segment C, keine Blockmaske.
+	const double b_eng = 3.0*(double)sizeof(velxx)*(double)(r1_N+M.n_e_aus+c_extra+1ull)+8.0*(double)((n_gross+31ull)/32ull)+hdr;
+	(void)cbox; // ★ 05.10.2026 C-N9: TOT (Blockhuelle nur fuer die alte C-Segment-Rechnung; bleibt fuer den Bericht stehen, gelesen wird sie nicht)
+	println("U_RAND C0 N "+to_string(NN)+" R1 "+to_string(r1_N)+" TYPE_E "+to_string(n_e));
+	println("U_RAND C0 Leser L1 "+to_string(n_l1)+" fdwand_nb "+to_string(n_fd)+" nachbar_ziele "+to_string(n_nbz)+" wandsolid "+to_string(n_wand)+" ms_zellen "+to_string(n_ms)+" ms_solidnb "+to_string(n_ms_s)+" (Mehrfachzaehlung je Leser)");
+	println("U_RAND C0 E gesamt "+to_string(M.n_e_aus+M.n_e_r1)+" davon_in_R1 "+to_string(M.n_e_r1)+" ausserhalb_R1 "+to_string(M.n_e_aus));
+	println("U_RAND C0 E-Huelle "+to_string(M.ex0)+","+to_string(M.ey0)+","+to_string(M.ez0)+" + "+to_string(M.enx)+"x"+to_string(M.eny)+"x"+to_string(M.enz)+" = "+to_string(ebox)+" Zellen");
+	println("U_RAND C0 N2F Zentren "+to_string((ulong)n2f_zentren.size())+" Bloecke "+to_string(M.n_bloecke)+" Zellen "+to_string(vblock)+" Blockhuelle "+to_string(M.cbnx)+"x"+to_string(M.cbny)+"x"+to_string(M.cbnz)+" ganz_in_R1uE "+to_string(c_ganz)+" teilweise "+to_string(c_teil)+" frei "+to_string(c_frei));
+	println("U_RAND C0 Grossbox "+to_string(M.gx0)+","+to_string(M.gy0)+","+to_string(M.gz0)+" + "+to_string(M.gnx)+"x"+to_string(M.gny)+"x"+to_string(M.gnz)+" = "+to_string(n_gross)+" Zellen, davon in R1 "+to_string(n_gross_r1));
+	println("U_RAND C0 eng Slots R1 "+to_string(r1_N)+" + E "+to_string(M.n_e_aus)+" + Blockzellen_extra "+to_string(c_extra)+" Maske_Grossbox "+mib(8.0*(double)((n_gross+31ull)/32ull))+" MiB");
+	println("U_RAND C0 MiB heute "+mib(b_heute)+" grossbox "+mib(b_gross)+" eng "+mib(b_eng)+" ersparnis_grossbox "+mib(b_heute-b_gross)+" ersparnis_eng "+mib(b_heute-b_eng)+" (ohne Ausgabe V)");
+	println("U_RAND C0 Abdeckung R1: TYPE_E_aussen "+to_string(v_e)+" TYPE_E_nachbar_aussen "+to_string(v_e_nb)+" po_aussen "+to_string(v_po)+" N2F_raster "+to_string(v_c)+" (Soll 0/0/0/0)");
+	println("U_RAND C0 Abdeckung E: eng "+to_string(v_eng)+" grossbox "+to_string(v_gross)+" (Soll 0/0"+string(testhaken==1u?"; Testhaken 1: eng Soll 1":"")+")");
+	println("U_RAND C0 Init-Regel: frei_eng "+to_string(n_frei_eng)+" verletzt "+to_string(v_init_eng)+" frei_grossbox "+to_string(n_frei_gross)+" verletzt "+to_string(v_init_gross)+" (Soll 0/0"+string(testhaken==4u?"; Testhaken 4: je 1":"")+")");
+	if(v_e>0ull||v_e_nb>0ull||v_po>0ull) { print_warning("U_RAND C0: R1-Pflicht verletzt (TYPE_E "+to_string(v_e)+", deren Achsnachbarn "+to_string(v_e_nb)+", po "+to_string(v_po)+") -- diese Leser liegen ausserhalb der Randschale."); bad++; }
+	if(v_c>0ull) { print_warning("U_RAND C0: "+to_string(v_c)+" N2F-Zentren liegen nicht auf dem ratio-Raster (x mod "+to_string(cr)+" = 0) oder ihr Fenster ragt aus dem Gitter -- Block(x) = (x+"+to_string(ch)+")/"+to_string(cr)+" waere falsch."); bad++; }
+	if(n2f_zentren.empty()) println("U_RAND C0: keine N2F-Zentren (N2F-Schale aus) -- keine Blockzellen in A; schale_extract laeuft dann nicht.");
+	if(v_eng>0ull) { print_warning("U_RAND C0: "+to_string(v_eng)+" Zelle(n) der Lesemenge E fehlen in der eng-Speichermenge."); bad++; }
+	if(v_gross>0ull) { print_warning("U_RAND C0: "+to_string(v_gross)+" Zelle(n) der Lesemenge E liegen ausserhalb der Grossbox."); bad++; }
+	if(v_init_eng>0ull||v_init_gross>0ull) { const uint x=(uint)(erst_v%(ulong)Nx), y=(uint)((erst_v/(ulong)Nx)%(ulong)Ny), z=(uint)(erst_v/NxNy); print_warning("U_RAND C0 Init-Regel verletzt (eng "+to_string(v_init_eng)+", grossbox "+to_string(v_init_gross)+"), erste bei ("+to_string(x)+","+to_string(y)+","+to_string(z)+") -- initialize laese dort einen anderen Startwert als heute."); bad++; }
+	if(testhaken==4u&&haken4==NN) { print_warning("U_RAND-TESTHAKEN 4: keine ungespeicherte Fluidzelle gefunden -- Haken wirkungslos."); bad++; }
+	M.zentren = n2f_zentren; // ★ A-H1: fuer die Fensterprobe nach dem Layout (alloc_u_rand leert sie danach)
+	if(lhaken) { // ★ 05.10.2026 Laufzeit-Testhaken 6/7/8: Zellen aus dem LAYOUT nehmen (nicht aus den Mengen) -- Soll Slot 484 > 0 zur Laufzeit
+		if(ur_modus_soll!=3u) { print_warning("U_RAND-TESTHAKEN "+to_string(testhaken)+": wirkt nur im Modus 3 (Maske) -- wirkungslos."); bad++; }
+		M.haken_aus.assign((size_t)NW, 0ull);
+		auto in_block = [&](const uint x, const uint y, const uint z) {
+			if(M.n_bloecke==0ull) return false;
+			const uint bx=(x+ch)/cr, by=(y+ch)/cr, bz=(z+ch)/cr;
+			if(bx<M.cbx0||by<M.cby0||bz<M.cbz0||bx>=M.cbx0+M.cbnx||by>=M.cby0+M.cbny||bz>=M.cbz0+M.cbnz) return false;
+			return bget(M.c_bits, (ulong)(bx-M.cbx0)+((ulong)(by-M.cby0)+(ulong)(bz-M.cbz0)*(ulong)M.cbny)*(ulong)M.cbnx);
+		};
+		ulong n_aus = 0ull;
+		uint h8x = 0u, h8y = 0u, h8z = 0u; // Haken 8: der Block der ersten gefundenen Zelle
+		for(uint z=0u; z<Nz; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+			if(in_r1(x,y,z)) continue;
+			const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+			bool nimm = false;
+			if(testhaken==6u) nimm = n_aus==0ull&&bget(fd_bits, n)&&!bget(nbz_bits, n)&&!bget(sol_bits, n)&&!in_block(x,y,z);
+			else if(testhaken==7u) nimm = bget(nbz_bits, n)&&!bget(fd_bits, n)&&!bget(sol_bits, n)&&!in_block(x,y,z);
+			else nimm = !bget(M.e_bits, n)&&in_block(x,y,z)&&(fl[n]&(TYPE_S|TYPE_E))==0u&&(n_aus==0ull||((x+ch)/cr==h8x&&(y+ch)/cr==h8y&&(z+ch)/cr==h8z)); // nur EIN Block (alle Bloecke leer: Schale kippt, 05.10. kc_cpu_h8)
+			if(nimm&&testhaken==8u&&n_aus==0ull) { h8x = (x+ch)/cr; h8y = (y+ch)/cr; h8z = (z+ch)/cr; }
+			if(nimm) { bset(M.haken_aus, n); n_aus++; }
+		}
+		println("U_RAND-TESTHAKEN "+to_string(testhaken)+" (Laufzeit): "+to_string(n_aus)+" Zelle(n) ohne Slot im Layout ("+string(testhaken==6u?"sgs_fdwand-Nachbar":testhaken==7u?"fac_nachbar_ab-Linkziele":"N2F-Blockzellen ausserhalb E, ein Block")+"). Soll: U_RAND ABNAHME P_gelesen[484] > 0.");
+		if(n_aus==0ull) { print_warning("U_RAND-TESTHAKEN "+to_string(testhaken)+": keine passende Zelle gefunden -- Haken wirkungslos"+string(testhaken==6u&&nachbar_on?" (mit CFD_FAC_NACHBAR=1 ist jeder Fluid-Achsnachbar auch Linkziel -- NACHBAR=0 fahren)":"")+"."); bad++; }
+	}
+	println("U_RAND C0 Beanstandungen "+to_string(bad));
+	return bad;
+}
+
+// ★ 04.10.2026 U_RAND U1a (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.4/B.5): Host-Seite des kompakten u-Puffers.
+// Layout in velxx-Woertern: [Kopf + Masken: ur_DOFF] [x: US Slots] [y: US] [z: US]; Slots je Komponente R1 | A | V | Papierkorb (P = US-1). (★ C-N8: Segment C entfallen.)
+// ur_idx_host ist der AUSDRUCKSGLEICHE Zwilling von ur_idx (kernel.cpp); ur_selbsttest beweist die Bijektion auf [0, P).
+ulong LBM_Domain::ur_idx_host(const ulong n) const {
+	const uint Nx = (uint)get_Nx(), Ny = (uint)get_Ny(), Nz = (uint)get_Nz();
+	const ulong a = (ulong)Nx*(ulong)Ny;
+	const uint x = (uint)(n%(ulong)Nx), y = (uint)((n/(ulong)Nx)%(ulong)Ny), z = (uint)(n/a);
+	if(x<2u||x+2u>=Nx||y<2u||y+2u>=Ny||z<2u||z+2u>=Nz) return rr_idx_host(n, Nx, Ny, Nz);
+	const uint* k = ur_kopf.data();
+	const uint ax = x-k[ur_k::AX0], ay = y-k[ur_k::AY0], az = z-k[ur_k::AZ0];
+	if(ax<k[ur_k::ANX]&&ay<k[ur_k::ANY]&&az<k[ur_k::ANZ]) {
+		const uint b = ax+(ay+az*k[ur_k::ANY])*k[ur_k::ANX];
+		if(k[ur_k::AMASK]==0u) return (ulong)k[ur_k::R1N]+(ulong)b;
+		const uint mo = k[ur_k::AMOFF]+2u*(b>>5), m = k[mo], bit = b&31u;
+		if(((m>>bit)&1u)!=0u) return (ulong)k[ur_k::R1N]+(ulong)(k[mo+1u]+(uint)__builtin_popcount(m&((1u<<bit)-1u)));
+	}
+	return (ulong)k[ur_k::P];
+}
+// ★ 04.10.2026 U_RAND: Layout je Modus (Plan B.4/B.7). Modus 1: A = ganzes Gitter, dicht (Pruefstand, Speicher wie heute + R1).
+// Modus 2 (U1d, "Grossbox"): A = dichte Box ueber die Huelle von E ohne R1 und den N2F-Bloecken (ur_mengen aus pruefe_u_rand_c0).
+// ★ 05.10.2026 C-N9: Modus 2 ist KEIN Produktionsarm (Standard ist 3, Pruefarm ist 1) und traegt den eigenen 60-%-Zweig in ur_vorpruef_bytes.
+// Bewusst NICHT entfernt (Auftrag Heiko/Koordinator 05.10.): Streichkandidat, bis er gestrichen wird gilt er als ungefahrener Zweig.
+// Modus 3 (U2, "eng"): dieselbe Huelle, aber Bitmaske + Praefix (2 uint je 32 Zellen, direkt hinter dem Kopf): gesetzt sind die Zellen
+// von E und alle 64 Zellen jedes N2F-Blocks, jeweils ohne R1 (R1 hat Vorrang). Bauabweichung: die Bloecke liegen in A (kein C-Segment).
+void LBM_Domain::ur_layout(const uint modus) {
+	const uint Nx = (uint)get_Nx(), Ny = (uint)get_Ny(), Nz = (uint)get_Nz();
+	const ulong N = get_N(), NxNy = (ulong)Nx*(ulong)Ny;
+	ur_modus = modus;
+	ur_R1N = r1_anzahl(Nx, Ny, Nz);
+	uint ax0 = 0u, ay0 = 0u, az0 = 0u, anx = Nx, any = Ny, anz = Nz;
+	std::vector<uint> maske;
+	if(modus>=2u) {
+		const URandMengen& M = ur_mengen;
+		if(M.gnx==0u||M.e_bits.empty()) { print_error("U_RAND Modus "+to_string(modus)+": die Mengen fehlen -- pruefe_u_rand_c0 muss vor alloc_u_rand laufen."); return; }
+		ax0 = M.gx0; ay0 = M.gy0; az0 = M.gz0; anx = M.gnx; any = M.gny; anz = M.gnz;
+	}
+	const ulong AB = (ulong)anx*(ulong)any*(ulong)anz;
+	if(modus<=2u) ur_AN = AB;
+	else {
+		const URandMengen& M = ur_mengen;
+		const ulong AW = (AB+31ull)/32ull;
+		maske.assign((size_t)(2ull*AW), 0u);
+		for(uint z=0u; z<anz; z++) for(uint y=0u; y<any; y++) for(uint x=0u; x<anx; x++) {
+			const uint gx = ax0+x, gy = ay0+y, gz = az0+z;
+			if(gx<2u||gx+2u>=Nx||gy<2u||gy+2u>=Ny||gz<2u||gz+2u>=Nz) continue; // R1 hat Vorrang
+			const ulong n = (ulong)gx+((ulong)gy+(ulong)gz*(ulong)Ny)*(ulong)Nx;
+			bool drin = ((M.e_bits[(size_t)(n>>6)]>>(uint)(n&63ull))&1ull)!=0ull;
+			if(!drin&&M.n_bloecke>0ull) { // ★ A-H1: Block(x) = (x+ch)/cr wie im Zensus (vorher fest (x+2)/4)
+				const uint bx = (gx+M.ch)/M.cr-M.cbx0, by = (gy+M.ch)/M.cr-M.cby0, bz = (gz+M.ch)/M.cr-M.cbz0;
+				if(bx<M.cbnx&&by<M.cbny&&bz<M.cbnz) { const ulong bi = (ulong)bx+((ulong)by+(ulong)bz*(ulong)M.cbny)*(ulong)M.cbnx; drin = ((M.c_bits[(size_t)(bi>>6)]>>(uint)(bi&63ull))&1ull)!=0ull; }
+			}
+			if(drin&&!M.haken_aus.empty()&&((M.haken_aus[(size_t)(n>>6)]>>(uint)(n&63ull))&1ull)!=0ull) drin = false; // ★ 05.10.2026 Laufzeit-Testhaken 6/7/8
+			if(!drin) continue;
+			const ulong b = (ulong)x+((ulong)y+(ulong)z*(ulong)any)*(ulong)anx;
+			maske[(size_t)(2ull*(b>>5))] |= 1u<<(uint)(b&31ull);
+		}
+		ulong lauf = 0ull;
+		for(ulong w=0ull; w<AW; w++) { maske[(size_t)(2ull*w+1ull)] = (uint)lauf; lauf += (ulong)__builtin_popcount(maske[(size_t)(2ull*w)]); }
+		ur_AN = lauf;
+	}
+	ur_kopf.assign((size_t)ur_k::KOPF_W, 0u);
+	if(!maske.empty()) ur_kopf.insert(ur_kopf.end(), maske.begin(), maske.end()); // Maske direkt hinter dem Kopf (AMOFF = KOPF_W)
+	ur_v_anlegen(); // V hinter A, setzt ur_VOFF/ur_VN und die Scheiben
+	ur_US = ur_VOFF+ur_VN+1ull; ur_P = ur_US-1ull;
+	uint* k = ur_kopf.data();
+	k[ur_k::MAGIC] = ur_k::GUELTIG; k[ur_k::US] = (uint)ur_US; k[ur_k::R1N] = (uint)ur_R1N; k[ur_k::AN] = (uint)ur_AN;
+	k[ur_k::AX0] = ax0; k[ur_k::AY0] = ay0; k[ur_k::AZ0] = az0; k[ur_k::ANX] = anx; k[ur_k::ANY] = any; k[ur_k::ANZ] = anz;
+	k[ur_k::AMASK] = modus==3u ? 1u : 0u; k[ur_k::AMOFF] = modus==3u ? ur_k::KOPF_W : 0u;
+	k[ur_k::VOFF] = (uint)ur_VOFF; k[ur_k::VN] = (uint)ur_VN; k[ur_k::P] = (uint)ur_P; // V-Box leer (VBNX = 0)
+	ur_DOFF = 2ull*(ulong)ur_kopf.size();
+	k[ur_k::DOFF] = (uint)ur_DOFF;
+	ur_len = ur_DOFF+3ull*ur_US;
+	if(ur_US>=0xFFFFFFFFull||ur_len>=0xFFFFFFFFull||N>0xFFFFFFFFull) print_error("U_RAND: Slotzahl oder Pufferlaenge ueber 2^32 -- die Kopfwoerter sind uint.");
+	(void)NxNy; // ★ 05.10.2026 C-N9: TOT (Rest der alten Blockformel)
+	const string nm = modus==1u ? "A = ganzes Gitter" : (modus==2u ? "Grossbox" : "eng (Maske)");
+	println("U_RAND LAYOUT modus "+to_string(modus)+" ("+nm+") R1 "+to_string(ur_R1N)+" A "+to_string(ur_AN)+" Box "+to_string(ax0)+","+to_string(ay0)+","+to_string(az0)+" + "+to_string(anx)+"x"+to_string(any)+"x"+to_string(anz)+" Maske "+to_string((ulong)maske.size())+" Worte V "+to_string(ur_VN)+" ("+to_string((ulong)(ur_scheiben.size()-1u))+" Scheiben) US "+to_string(ur_US));
+	println("U_RAND LAYOUT MiB u_kompakt "+to_string((float)((double)ur_len*(double)sizeof(velxx)/1048576.0),2u)+" u_voll "+to_string((float)(3.0*(double)N*(double)sizeof(velxx)/1048576.0),2u)+" ersparnis "+to_string((float)((3.0*(double)N-(double)ur_len)*(double)sizeof(velxx)/1048576.0),2u));
+}
+void LBM_Domain::ur_platzhalter() { // Kopf ohne Slots; jeder Kernel, der ihn liest, findet Magic PLATZHALTER (Slot 485) und P = 0
+	ur_kopf.assign((size_t)ur_k::KOPF_W, 0u);
+	ur_kopf[ur_k::MAGIC] = ur_k::PLATZHALTER;
+	ur_US = 0ull; ur_P = 0ull; ur_R1N = 0ull; ur_AN = 0ull; ur_VOFF = 0ull; ur_VN = 0ull;
+	ur_DOFF = 2ull*(ulong)ur_kopf.size(); ur_len = ur_DOFF;
+	u = Memory<velxx>(device, ur_len, 1u);
+	ur_kopf_in_puffer();
+	u.write_to_device();
+	ur_alloziert = false;
+}
+// ★ 04.10.2026 U_RAND U1b: spaete Allokation. Reihenfolge wie alloc_f_liste: Layout -> anlegen -> Kopf/Regel schreiben -> ALLE Bindungen neu.
+// Init-Regel (Plan B.5): an ungespeicherten Zellen liest initialize das gepackte Wort von (u_lat,0,0) bzw. (0,0,0) aus dem Kopf.
+void LBM_Domain::alloc_u_rand(const uint modus, const float u_lat) {
+	if(!u_rand_on) { print_error("alloc_u_rand ohne U_RAND."); return; }
+	if(ur_alloziert) { print_error("alloc_u_rand zweimal gerufen."); return; }
+	if(modus<1u||modus>3u) { print_error("alloc_u_rand: Modus "+to_string(modus)+" unbekannt."); return; }
+	// ★ 05.10.2026 Korrektur M2 (Plan B.15): REGEL_VX ist ein velxx-Index und ur_DOFF rechnet 2 velxx je uint -- beides nur mit 2-Byte-velxx
+	// (U_FP16). Mit float schrieben die sechs Regelwoerter hinter den 64-Wort-Kopf (Heap-Ueberlauf bzw. ueber die Maske). Zweite Sperre
+	// neben der in allocate, an der Schreibstelle selbst.
+	if(sizeof(velxx)!=2u||(ulong)(ur_k::REGEL_VX+6u)*(ulong)sizeof(velxx)>(ulong)ur_k::KOPF_W*(ulong)sizeof(uint)) { print_error("alloc_u_rand: U_RAND braucht U_FP16 (velxx = 2 Byte) -- REGEL_VX und ur_DOFF sind in 2-Byte-Woertern adressiert."); return; }
+	ur_layout(modus);
+	{	// ★ 05.10.2026 Korrektur A-H1: FENSTERPROBE gegen das fertige Layout. Fuer jedes N2F-Zentrum c das Kernelfenster von schale_extract
+		// (Offsets -(r/2) .. r-r/2-1 je Achse, r = ratio, nur Zellen ohne TYPE_S/TYPE_E, im Gitter) gegen ur_idx_host -- dieselbe Abbildung,
+		// die der Kernel ueber ur_idx nimmt. Jede Zelle ohne Slot lieferte im Blockmittel still den Papierkorb (0). Soll 0, sonst Abbruch vor run(0).
+		// Unter Testhaken 8 (Blockzellen absichtlich ohne Slot) nur Meldung.
+		const URandMengen& M = ur_mengen;
+		const uint Nx = (uint)get_Nx(), Ny = (uint)get_Ny(), Nz = (uint)get_Nz();
+		const int r = (int)M.cr, o0 = -(r/2);
+		const uchar* fh = flags.data();
+		ulong geprueft = 0ull, ohne = 0ull;
+		for(const ulong c : M.zentren) {
+			const int x = (int)(c%(ulong)Nx), y = (int)((c/(ulong)Nx)%(ulong)Ny), z = (int)(c/((ulong)Nx*(ulong)Ny));
+			for(int dz=o0; dz<o0+r; dz++) for(int dy=o0; dy<o0+r; dy++) for(int dx=o0; dx<o0+r; dx++) {
+				const int xx=x+dx, yy=y+dy, zz=z+dz;
+				if(xx<0||yy<0||zz<0||xx>=(int)Nx||yy>=(int)Ny||zz>=(int)Nz) continue;
+				const ulong nn = (ulong)xx+((ulong)yy+(ulong)zz*(ulong)Ny)*(ulong)Nx;
+				const uchar bo = fh[nn]&(TYPE_S|TYPE_E);
+				if(bo==TYPE_S||bo==TYPE_E) continue;
+				geprueft++;
+				if(ur_idx_host(nn)>=ur_P) ohne++;
+			}
+		}
+		println("U_RAND LAYOUT N2F-Fensterprobe ratio "+to_string(M.cr)+" Zentren "+to_string((ulong)M.zentren.size())+" Fluidzellen "+to_string(geprueft)+" ohne_Slot "+to_string(ohne)+" (Soll 0"+string(ur_haken==8u?"; Testhaken 8: > 0":"")+")");
+		if(ohne>0ull&&ur_haken!=8u) print_error("U_RAND LAYOUT: "+to_string(ohne)+" Fluidzellen in N2F-Fenstern (schale_extract, ratio "+to_string(M.cr)+") ohne Slot -- das Blockmittel laese dort still den Papierkorb (Pruefbefund A-H1). Lauf nicht gestartet.");
+		ur_mengen.zentren.clear(); ur_mengen.zentren.shrink_to_fit();
+	}
+	{	velxx* r = (velxx*)ur_kopf.data(); // Init-Regel als Speicherwoerter (Hostpacker, dieselben Woerter wie der Hostspiegel sie traegt)
+		r[ur_k::REGEL_VX+0u] = u_pack(u_lat); r[ur_k::REGEL_VX+1u] = u_pack(0.0f); r[ur_k::REGEL_VX+2u] = u_pack(0.0f);
+		r[ur_k::REGEL_VX+3u] = u_pack(0.0f); r[ur_k::REGEL_VX+4u] = u_pack(0.0f); r[ur_k::REGEL_VX+5u] = u_pack(0.0f); }
+	const ulong mib = (ur_len*(ulong)sizeof(velxx)+1048575ull)/1048576ull;
+	if(!device.info.uses_ram) { // Plan B.5: gegen den GEMESSENEN freien VRAM pruefen (Vorpruefung zaehlt u unter U_RAND nicht verlaesslich)
+		const ulong frei = vram_frei_gemessen((ulong)device.info.memory);
+		if(frei>0ull&&mib+1024ull>frei) print_error("alloc_u_rand: "+to_string(mib)+" MiB fuer u, gemessen frei nur "+to_string(frei)+" MiB (Mindestluft 1024 MiB).");
+		println("U_RAND ALLOC VRAM frei vorher "+to_string(frei)+" MiB ("+string(vram_quelle())+"), u kompakt "+to_string(mib)+" MiB");
+	}
+	u = Memory<velxx>(device, ur_len, 1u); // gibt den Platzhalter frei (klein)
+	ur_kopf_in_puffer();
+	u.write_to_device();
+	ur_alloziert = true;
+	const uint nb = ur_neu_binden();
+	println("U_RAND ALLOC modus "+to_string(modus)+" Puffer "+to_string(mib)+" MiB, neu gebunden "+to_string(nb)+" Kernel");
+	{	// ★ 05.10.2026 Korrektur M1: die Konstruktor-Vorpruefung buchte ur_vorpruef_bytes -- hier gegen den echten Puffer
+		const ulong geb = ur_vorpruef_bytes((uint)get_Nx(), (uint)get_Ny(), (uint)get_Nz(), modus), echt = ur_len*(ulong)sizeof(velxx);
+		println("U_RAND VORPRUEFUNG gebucht "+to_string((float)((double)geb/1048576.0),2u)+" MiB echt "+to_string((float)((double)echt/1048576.0),2u)+" MiB (Soll echt <= gebucht) "+string(echt<=geb?"ok":"UEBERSCHRITTEN"));
+		if(echt>geb) print_warning("U_RAND VORPRUEFUNG: der echte kompakte Puffer ("+to_string((ulong)(echt/1048576ull))+" MiB) uebersteigt die Konstruktor-Buchung ("+to_string((ulong)(geb/1048576ull))+" MiB). Die deklarierten Anteile in ur_vorpruef_bytes sind fuer diese Geometrie zu knapp und neu herzuleiten; den harten Schutz traegt die Pruefung oben gegen den gemessenen freien VRAM.");
+	}
+}
+uint LBM_Domain::ur_neu_binden() { // alle Kernel, die u als Parameter tragen (Plan B.3 Bindungen); nur bereits gebaute (Parameterzahl > 0)
+	uint nb = 0u;
+	auto b = [&](Kernel& k, const uint pos) { if(k.get_number_of_parameters()>0u) { k.set_parameters(pos, u); nb++; } };
+	b(kernel_initialize, 2u); b(kernel_stream_collide, 2u); b(kernel_update_fields, 2u);
+#ifdef FORCE_FIELD
+	b(kernel_update_force_field, 5u);
+#endif // FORCE_FIELD
+#ifdef MOVING_BOUNDARIES
+	b(kernel_update_moving_boundaries, 0u);
+#endif // MOVING_BOUNDARIES
+	b(kernel_rho_rek_ebene, 2u); b(kernel_schale_extract, 0u); b(kernel_sgs_band, 0u); b(kernel_band_gdiag, 1u);
+	b(kernel_fac_nachbar, 0u); b(kernel_sgs_fdwand, 0u); b(kernel_sgs_gdiag, 1u);
+	b(kernel_extract_plane_macros, 1u); b(kernel_drive_boundary_cubic_lift, 1u); b(kernel_apply_pressure_outlet, 0u);
+	return nb;
+}
+// ★ 04.10.2026 U_RAND U1c: Ausgabebereich V. Groesse = max(Ebene Nx*Nz + Saeule Nz, groesste VOLL-Scheibe). Scheibengrenzen liegen
+// auf Vielfachen der Arbeitsgruppe (gleiche Arbeitsgruppen wie im Volllauf) UND mitten in der Zeile y = Ny/2 einer z-Schicht: so
+// liegen eine TYPE_E-Zelle und ihre +-x/+-y-Nachbarn immer in DERSELBEN Scheibe (deriv_reg liest u der Nachbarn im selben Launch --
+// die Lese-Schreib-Reihenfolge innerhalb einer Scheibe ist die des Volllaufs; zwischen Scheiben gilt "frueher fertig" wie dort fuer
+// die z-Nachbarn, die NxNy Zellen entfernt liegen). Mindestens 2^21 Zellen je Scheibe (bei 4 mm rund 330 Scheiben je VOLL).
+ulong ur_v_layout(const ulong Nx, const ulong Ny, const ulong Nz, std::vector<ulong>* scheiben) { // ★ 05.10.2026 (B.15 M1): aus ur_v_anlegen herausgezogen, wortgleich
+	const ulong NxNy = Nx*Ny, N = NxNy*Nz, wg = (ulong)WORKGROUP_SIZE;
+	const ulong ziel = std::max((ulong)2097152ull, (ulong)(NxNy+2ull*wg));
+	const ulong k = std::max((ulong)1ull, (ulong)((ziel-2ull*wg)/NxNy)); // z-Schichten je Scheibe
+	std::vector<ulong> sch;
+	sch.push_back(0ull);
+	for(ulong z=k; z<Nz; z+=k) sch.push_back(((z*NxNy+(Ny/2ull)*Nx+Nx/2ull)/wg)*wg);
+	sch.push_back(((N+wg-1ull)/wg)*wg);
+	ulong maxs = 0ull; // groesste V-Box einer Scheibe: alle z-Schichten, die die Scheibe beruehrt
+	for(size_t i=1u; i<sch.size(); i++) { const ulong za = sch[i-1u]/NxNy, zb = (min(sch[i], N)-1ull)/NxNy; maxs = max(maxs, (zb-za+1ull)*NxNy); }
+	if(scheiben!=nullptr) *scheiben = sch;
+	return max(maxs, Nx*Nz);
+}
+// ★ 05.10.2026 U_RAND Korrektur M1 (Plan B.15): OBERGRENZE des kompakten u-Puffers fuer die VRAM-Vorpruefung im Konstruktor. Die echte
+// Groesse haengt am Zensus (Facetten, Band, N2F-Liste), der erst nach dem Konstruktor laeuft. Exakt sind R1, V, Kopf und in Modus 1 A = N.
+// Fuer Modus 2/3 ist A eine DEKLARIERTE Obergrenze aus den Messungen (Interim, keine Eichbasis -- Gedaechtnis "Keine Handwerte"):
+//   Grossbox/N: 8 mm 36 274 176/83 511 861 = 43,4 % (b_z2.log), 4 mm 293 092 800/654 941 133 = 44,8 % (Hochrechnung Plan B.1)  -> 60 %
+//   eng ohne R1 (E + Blockzellen)/N: 8 mm (2 212 594 + 16 809 216)/83 511 861 = 22,8 %, 4 mm (9,64 + 148,24) Mio/654,9 Mio = 24,1 % -> 35 %
+//   Maske (Modus 3) ueber die Grossbox: 2 uint je 32 Zellen ueber 60 % N.
+// alloc_u_rand druckt gebucht gegen echt und WARNT, wenn der echte Puffer die Buchung uebersteigt (dann ist die Grenze neu herzuleiten);
+// den harten Schutz behaelt alloc_u_rand gegen den GEMESSENEN freien VRAM.
+ulong ur_vorpruef_bytes(const uint Nx, const uint Ny, const uint Nz, const uint modus) {
+	const ulong N = (ulong)Nx*(ulong)Ny*(ulong)Nz;
+	const ulong R1 = r1_anzahl(Nx, Ny, Nz), VN = ur_v_layout((ulong)Nx, (ulong)Ny, (ulong)Nz, nullptr);
+	ulong a = N, maske_w = 0ull;
+	if(modus==2u) a = (ulong)std::ceil(0.60*(double)N);
+	if(modus==3u) {
+		a = (ulong)std::ceil(0.35*(double)N);
+		maske_w = 2ull*(((ulong)std::ceil(0.60*(double)N)+31ull)/32ull);
+	}
+	a = min(a, N);
+	return (ulong)ur_k::KOPF_W*(ulong)sizeof(uint) + maske_w*(ulong)sizeof(uint) + 3ull*(R1+a+VN+1ull)*(ulong)sizeof(velxx);
+}
+void LBM_Domain::ur_v_anlegen() {
+	const ulong Nx = get_Nx(), Ny = get_Ny(), Nz = get_Nz(), wg = (ulong)WORKGROUP_SIZE;
+	if(Nx<2ull*wg+8ull) print_error("U_RAND: Nx < 2*Arbeitsgruppe+8 -- die Scheibengrenze passt nicht ins Zeileninnere.");
+	ur_VN = ur_v_layout(Nx, Ny, Nz, &ur_scheiben);
+	ur_VOFF = ur_R1N+ur_AN;
+	ur_v_y = (uint)(Ny/2ull);
+}
+void LBM_Domain::ur_saeule_setzen(const uint x, const uint y, const uint zn) {
+	if(!ur_alloziert) { print_error("ur_saeule_setzen vor alloc_u_rand."); return; }
+	if(y!=ur_v_y) print_error("U_RAND: die Wandprofil-Saeule liegt nicht in der Slice-Ebene y = "+to_string(ur_v_y)+" -- eine V-Box kann nicht beide decken.");
+	ur_saeule_x = x; ur_saeule_y = y; ur_saeule_zn = zn;
+	println("U_RAND SAEULE x "+to_string(x)+" y "+to_string(y)+" z < "+to_string(zn));
+}
+void LBM_Domain::ur_vbox(const uint x0, const uint y0, const uint z0, const uint nx, const uint ny, const uint nz) {
+	finish_queue(); // Zero-Copy: der Host schreibt in denselben Speicher, den laufende Kernel lesen
+	ur_kopf[ur_k::VBX0] = x0; ur_kopf[ur_k::VBY0] = y0; ur_kopf[ur_k::VBZ0] = z0; ur_kopf[ur_k::VBNX] = nx; ur_kopf[ur_k::VBNY] = ny; ur_kopf[ur_k::VBNZ] = nz;
+	// ★ 05.10.2026 Korrektur N2 (Plan B.15): nur die KOPF_W Kopfwoerter (64 uint = 128 velxx). Die Maske dahinter steht seit alloc_u_rand
+	// unveraendert auf dem Geraet; vorher gingen bei 4 mm Modus 3 je Aufruf ~73 MB Kopf+Maske ueber den Bus (493 Aufrufe je VOLL).
+	if(u.length()<(ulong)ur_k::KOPF_W*(ulong)sizeof(uint)/(ulong)sizeof(velxx)) print_error("U_RAND: kompakter Puffer kuerzer als der Kopf.");
+	std::memcpy((void*)u.data(), (const void*)ur_kopf.data(), (size_t)ur_k::KOPF_W*sizeof(uint));
+	u.write_to_device(0ull, (ulong)ur_k::KOPF_W*(ulong)sizeof(uint)/(ulong)sizeof(velxx)); // blockierend
+	ur_vbox_aktiv = nx>0u;
+}
+void LBM_Domain::ur_voll_scheiben(const uint fv) { // VOLL am letzten Substep: Scheibe fuer Scheibe rechnen, V lesen, Nicht-R1-Fluid streuen
+	const ulong N = get_N(), Nx = get_Nx(), Ny = get_Ny(), Nz = get_Nz(), NxNy = Nx*Ny;
+	const uchar* fl = flags.data();
+	velxx* m = u_spiegel.data(); const velxx* d = u.data();
+	for(size_t i=1u; i<ur_scheiben.size(); i++) {
+		const ulong a = ur_scheiben[i-1u], b = ur_scheiben[i], e = min(b, N);
+		const ulong za = a/NxNy, zb = (e-1ull)/NxNy, vb = za*NxNy; // V-Box = die beruehrten z-Schichten, V-Index = n - vb
+		ur_vbox(0u, 0u, (uint)za, (uint)Nx, (uint)Ny, (uint)(zb-za+1ull));
+		kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, fv|12u).enqueue_run_bereich(a, b-a);
+		for(uint kk=0u; kk<3u; kk++) u.read_from_device(ur_DOFF+(ulong)kk*ur_US+ur_VOFF+(a-vb), e-a); // blockierend (Zero-Copy: finish)
+		parallel_for(e-a, [&](ulong q) {
+			const ulong n = a+q;
+			if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S) return; // Solid: Spiegel ist statisch (stream_collide schreibt dort nichts)
+			const uint x = (uint)(n%Nx), y = (uint)((n/Nx)%Ny), z = (uint)(n/NxNy);
+			if(x<2u||x+2u>=(uint)Nx||y<2u||y+2u>=(uint)Ny||z<2u||z+2u>=(uint)Nz) return; // R1: aus dem kompakten Puffer (u_rand_ausgabe)
+			for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = d[ur_DOFF+(ulong)kk*ur_US+ur_VOFF+(n-vb)];
+		});
+		for(ulong n=((a+1023ull)/1024ull)*1024ull; n<e; n+=1024ull) {
+			const uchar f_ = fl[n]&(TYPE_S|TYPE_E);
+			if(f_!=TYPE_S&&f_!=TYPE_E) ur_soll_490++; // ★ 05.10.: TYPE_E kehrt in stream_collide vor dem U_RAND-Block zurueck
+		}
+	}
+	ur_vbox(0u, 0u, 0u, 0u, 0u, 0u);
+	ur_n_voll++;
+}
+void LBM_Domain::ur_kopf_in_puffer() {
+	if(u.length()<ur_DOFF) print_error("U_RAND: kompakter Puffer kuerzer als Kopf + Masken.");
+	std::memcpy((void*)u.data(), (const void*)ur_kopf.data(), ur_kopf.size()*sizeof(uint));
+}
+void LBM_Domain::ur_packen() {
+	if(!ur_alloziert) { print_error("U_RAND: ur_packen vor alloc_u_rand -- der Puffer ist noch der Platzhalter."); return; }
+	const ulong N = get_N();
+	velxx* d = u.data(); const velxx* m = u_spiegel.data();
+	parallel_for(N, [&](ulong n) {
+		const ulong s = ur_idx_host(n);
+		if(s<ur_P) for(uint kk=0u; kk<3u; kk++) d[ur_DOFF+(ulong)kk*ur_US+s] = m[(ulong)kk*N+n];
+	});
+	for(uint kk=0u; kk<3u; kk++) d[ur_DOFF+(ulong)kk*ur_US+ur_P] = u_pack(0.0f); // Papierkorb: Wort 0 = 0,0 (wird nie beschrieben)
+}
+void LBM_Domain::ur_streuen() {
+	if(!ur_alloziert) return; // Platzhalter: nichts gespeichert (Voxelierung liest u vor alloc_u_rand)
+	const ulong N = get_N();
+	const velxx* d = u.data(); velxx* m = u_spiegel.data();
+	parallel_for(N, [&](ulong n) {
+		const ulong s = ur_idx_host(n);
+		if(s<ur_P) for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = d[ur_DOFF+(ulong)kk*ur_US+s];
+	});
+}
+// ★ 05.10.2026 Korrektur A-N2: initialize setzt u an GESPEICHERTEN reinen Solids, deren Nachbarn alle Solid sind (TYPE_ONLY_S), auf 0 (kernel.cpp
+// initialize). VOLL streut Solids nie (V schreibt nur stream_collide, das an Solids zurueckkehrt) -- der Hostspiegel trug dort bis zur naechsten
+// kompakten Lesung den Setup-Wert, im U_RAND=0-Arm steht nach jeder Lesung 0. Hier denselben Schritt am Spiegel nachziehen. Heute inert (dd setzt
+// u nur auf der Fahrbahn z = 0, deren Nachbarn bei z = 1 Fluid sind); der Zaehler sagt es an.
+void LBM_Domain::ur_spiegel_init_nachziehen() {
+	const ulong N = get_N();
+	const uint Nx = (uint)get_Nx(), Ny = (uint)get_Ny(), Nz = (uint)get_Nz();
+	velxx* m = u_spiegel.data(); const uchar* fl = flags.data();
+	const velxx w0 = u_pack(0.0f);
+#ifndef D3Q27
+	static const int DV[18][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},{1,1,0},{-1,-1,0},{1,0,1},{-1,0,-1},{0,1,1},{0,-1,-1},{1,-1,0},{-1,1,0},{1,0,-1},{-1,0,1},{0,1,-1},{0,-1,1}};
+	const uint nv = 18u;
+#else
+	static const int DV[26][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},{1,1,0},{-1,-1,0},{1,0,1},{-1,0,-1},{0,1,1},{0,-1,-1},{1,-1,0},{-1,1,0},{1,0,-1},{-1,0,1},{0,1,-1},{0,-1,1},
+		{1,1,1},{-1,-1,-1},{1,1,-1},{-1,-1,1},{1,-1,1},{-1,1,-1},{-1,1,1},{1,-1,-1}};
+	const uint nv = 26u;
+#endif
+	std::atomic<ulong> gesetzt(0ull);
+	parallel_for(N, [&](ulong n) {
+		if((fl[n]&(TYPE_S|TYPE_E))!=TYPE_S) return;
+		if(m[n]==w0&&m[N+n]==w0&&m[2ull*N+n]==w0) return; // schon 0: nichts zu tun (fast jede Zelle endet hier)
+		if(ur_idx_host(n)>=ur_P) return; // ungespeichert: der Init-Regel-Waechter verlangt dort ohnehin 0
+		const uint x = (uint)(n%(ulong)Nx), y = (uint)((n/(ulong)Nx)%(ulong)Ny), z = (uint)(n/((ulong)Nx*(ulong)Ny));
+		for(uint i=0u; i<nv; i++) { // periodisch wie neighbors() im Kernel
+			const uint xn = (uint)((((int)x+DV[i][0])%(int)Nx+(int)Nx)%(int)Nx), yn = (uint)((((int)y+DV[i][1])%(int)Ny+(int)Ny)%(int)Ny), zn = (uint)((((int)z+DV[i][2])%(int)Nz+(int)Nz)%(int)Nz);
+			if((fl[(ulong)xn+((ulong)yn+(ulong)zn*(ulong)Ny)*(ulong)Nx]&(TYPE_S|TYPE_E))!=TYPE_S) return; // nicht TYPE_ONLY_S
+		}
+		m[n] = w0; m[N+n] = w0; m[2ull*N+n] = w0; gesetzt++;
+	});
+	println("U_RAND SPIEGEL nach initialize: "+to_string(gesetzt.load())+" gespeicherte reine Innensolids mit u != 0 auf 0 gesetzt (wie der Kernel; heute Soll 0 im dd)");
+}
+// ★ 04.10.2026 U_RAND U1d: INIT-REGEL-WAECHTER vor dem Upload (Plan B.5). initialize liest an ungespeicherten Zellen das Regelwort aus
+// dem Kopf statt des Spiegelwerts -- das ist nur bitgleich, wenn der Spiegel dort wortgleich der Regel folgt. Liefert die Verletzungen.
+ulong LBM_Domain::ur_init_waechter() {
+	const ulong N = get_N();
+	const velxx* m = u_spiegel.data(); const uchar* fl = flags.data();
+	const velxx* r = (const velxx*)ur_kopf.data();
+	std::atomic<ulong> v(0ull), frei(0ull);
+	parallel_for(N, [&](ulong n) {
+		if(ur_idx_host(n)<ur_P) return;
+		frei++;
+		const uint o = (fl[n]&(TYPE_S|TYPE_E))==TYPE_S ? 3u : 0u;
+		if(m[n]!=r[ur_k::REGEL_VX+o]||m[N+n]!=r[ur_k::REGEL_VX+o+1u]||m[2ull*N+n]!=r[ur_k::REGEL_VX+o+2u]) v++;
+	});
+	println("U_RAND INIT-REGEL ungespeichert "+to_string(frei.load())+" verletzt "+to_string(v.load())+" (Soll 0)");
+	return v.load();
+}
+uint LBM_Domain::ur_selbsttest() { // Bijektion der Slots auf [0, P) und Kopf-Gegenlese vom Geraet (Muster Stride-Transport alloc_f_liste)
+	uint bad = 0u;
+	const ulong N = get_N();
+	std::vector<ulong> belegt((size_t)((ur_US+63ull)/64ull), 0ull);
+	ulong n_gesp = 0ull, n_doppelt = 0ull, n_aus = 0ull;
+	for(ulong n=0ull; n<N; n++) {
+		const ulong s = ur_idx_host(n);
+		if(s==ur_P) continue;
+		if(s>ur_P) { n_aus++; continue; }
+		ulong& w = belegt[(size_t)(s>>6)]; const ulong b = 1ull<<(uint)(s&63ull);
+		if(w&b) n_doppelt++; else { w |= b; n_gesp++; }
+	}
+	if(n_doppelt>0ull||n_aus>0ull) { print_warning("U_RAND SELBSTTEST: Slots doppelt "+to_string(n_doppelt)+", jenseits des Papierkorbs "+to_string(n_aus)+" (Soll 0/0)."); bad++; }
+	u.read_from_device(0ull, ur_DOFF);
+	ulong n_kopf = 0ull; for(size_t i=0u; i<ur_kopf.size(); i++) if(((const uint*)u.data())[i]!=ur_kopf[i]) n_kopf++;
+	if(n_kopf>0ull) { print_warning("U_RAND SELBSTTEST: "+to_string(n_kopf)+" Kopfwoerter vom Geraet weichen vom Host-Zwilling ab."); bad++; }
+	println("U_RAND SELBSTTEST gespeichert "+to_string(n_gesp)+" Slots_ohne_P "+to_string(ur_P)+" doppelt "+to_string(n_doppelt)+" ausserhalb "+to_string(n_aus)+" Kopf_abweichend "+to_string(n_kopf)+" (Soll: gespeichert <= Slots, 0/0/0)");
+	return bad;
+}
+// ★ 04.10.2026 KF-FILTER (Pruefbefund M1): Wandsolid-Praedikat, wortgleich aus alloc_f_liste herausgezogen.
+bool LBM_Domain::wand_solid_host(const uchar* flags_host, const uint x, const uint y, const uint z, const uint Nx, const uint Ny, const uint Nz) {
 #ifndef D3Q27
 	static const int FZ18[18][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},
 		{1,1,0},{-1,-1,0},{1,0,1},{-1,0,-1},{0,1,1},{0,-1,-1},{1,-1,0},{-1,1,0},{1,0,-1},{-1,0,1},{0,1,-1},{0,-1,1}};
@@ -1549,6 +2377,27 @@ void LBM_Domain::alloc_f_liste(const uchar* flags_host, const uint Nx, const uin
 		{1,1,1},{-1,-1,-1},{1,1,-1},{-1,-1,1},{1,-1,1},{-1,1,-1},{-1,1,1},{1,-1,-1}};
 	const uint n_fz = 26u;
 #endif
+	if((flags_host[(ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx]&(TYPE_S|TYPE_E))!=TYPE_S) return false; // kein Solid (oder TYPE_BO): nie Wandsolid
+	for(uint i=0u; i<n_fz; i++) {
+		const int zn0=(int)z+FZ18[i][2];
+		// OBERMENGE: liegt der Nachbar ausserhalb des Gitters in z, gilt die Zelle als Wandzelle
+		// (der Kernel wickelt dort und koennte einen Nicht-Solid treffen -- wir raten zugunsten
+		// eines Slots, nie dagegen).
+		if(zn0<0||zn0>=(int)Nz) return true;
+		const uint xn=(uint)((((int)x+FZ18[i][0])%(int)Nx+(int)Nx)%(int)Nx);
+		const uint yn=(uint)((((int)y+FZ18[i][1])%(int)Ny+(int)Ny)%(int)Ny);
+		const ulong nn=(ulong)xn+((ulong)yn+(ulong)zn0*(ulong)Ny)*(ulong)Nx;
+		if((flags_host[nn]&(TYPE_S|TYPE_E))!=TYPE_S) return true;
+	}
+	return false;
+}
+void LBM_Domain::alloc_f_liste(const uchar* flags_host, const uint Nx, const uint Ny, const uint Nz) {
+	if(!f_liste_on) return;
+#if defined(PARTICLES)||defined(GRAPHICS)
+	print_error("CFD_F_LISTE ist mit PARTICLES/GRAPHICS nicht verdrahtet -- integrate_particles/graphics_flags hielten den F-Platzhalter (Diff-Pruefung D7).");
+#endif
+	const ulong FN = (ulong)fbnx*(ulong)fbny*(ulong)fbnz;
+	const ulong FNB = (FN+31ull)/32ull;
 	for(ulong i=0ull; i<2ull*FNB; i++) f_maske[i]=0u;
 	ulong n_solid=0ull, n_wand=0ull;
 	for(uint zb=0u; zb<fbnz; zb++) for(uint yb=0u; yb<fbny; yb++) for(uint xb=0u; xb<fbnx; xb++) {
@@ -1556,19 +2405,7 @@ void LBM_Domain::alloc_f_liste(const uchar* flags_host, const uint Nx, const uin
 		const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
 		if((flags_host[n]&(TYPE_S|TYPE_E))!=TYPE_S) continue; // Host-Maske fuer TYPE_BO (device-seitig 0x03)
 		n_solid++;
-		bool wand=false;
-		for(uint i=0u; i<n_fz&&!wand; i++) {
-			const int zn0=(int)z+FZ18[i][2];
-			// OBERMENGE: liegt der Nachbar ausserhalb des Gitters in z, gilt die Zelle als Wandzelle
-			// (der Kernel wickelt dort und koennte einen Nicht-Solid treffen -- wir raten zugunsten
-			// eines Slots, nie dagegen).
-			if(zn0<0||zn0>=(int)Nz) { wand=true; break; }
-			const uint xn=(uint)((((int)x+FZ18[i][0])%(int)Nx+(int)Nx)%(int)Nx);
-			const uint yn=(uint)((((int)y+FZ18[i][1])%(int)Ny+(int)Ny)%(int)Ny);
-			const ulong nn=(ulong)xn+((ulong)yn+(ulong)zn0*(ulong)Ny)*(ulong)Nx;
-			if((flags_host[nn]&(TYPE_S|TYPE_E))!=TYPE_S) wand=true;
-		}
-		if(!wand) continue;
+		if(!wand_solid_host(flags_host, x, y, z, Nx, Ny, Nz)) continue; // ★ 04.10.2026: Praedikat herausgezogen (KF-FILTER M1), Schleife wortgleich verschoben
 		n_wand++;
 		const ulong fbi=(ulong)xb+((ulong)yb+(ulong)zb*(ulong)fbny)*(ulong)fbnx;
 		f_maske[2ull*(fbi>>5)] |= 1u<<(uint)(fbi&31ull);
@@ -1797,9 +2634,10 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 	}
 	// ★ 22.09.2026 S0 (Lehre M2 vom selben Tag): Host- und Kernelzustand muessen denselben Modus meinen. Am 22.09. kostete die
 	// umgekehrte Reihenfolge (Host FD, Kernel Pi) einen 6-fachen Pufferueberlauf, der nur ueber Symptome zu finden war.
-	if(fac_r1q_an_jit!=(fac_r1q_stufe>=2u)||fac_r1q_vr_jit!=(fac_r1q_stufe>=3u)||fac_r1q_od_jit!=(fac_r1q_stufe>=4u)) print_error("alloc_facetten_domain: KOHAERENZ R1Q-Unterstufen verletzt -- Stufe "+to_string(fac_r1q_stufe)+", Kernel-Text _AN/_VR/_OHNE_DRUCK = "+to_string(fac_r1q_an_jit?1u:0u)+"/"+to_string(fac_r1q_vr_jit?1u:0u)+"/"+to_string(fac_r1q_od_jit?1u:0u)+"."); // ★ 28.09. Audit B N2
+	if(fac_r1q_an_jit!=(fac_r1q_stufe>=2u)||fac_r1q_vr_jit!=(fac_r1q_stufe>=3u)||fac_r1q_od_jit!=(fac_r1q_stufe>=4u)||fac_r1q_k2_jit!=(fac_r1q_stufe>=5u)) print_error("alloc_facetten_domain: KOHAERENZ R1Q-Unterstufen verletzt -- Stufe "+to_string(fac_r1q_stufe)+", Kernel-Text _AN/_VR/_OHNE_DRUCK/_SPALTE1 = "+to_string(fac_r1q_an_jit?1u:0u)+"/"+to_string(fac_r1q_vr_jit?1u:0u)+"/"+to_string(fac_r1q_od_jit?1u:0u)+"/"+to_string(fac_r1q_k2_jit?1u:0u)+"."); // ★ 28.09. Audit B N2
 	if(fac_r1q_jit!=fac_r1q_on) print_error("alloc_facetten_domain: KOHAERENZ Host/Kernel verletzt -- Kernel-Text "+string(fac_r1q_jit?"MIT":"OHNE")+" FAC_R1Q, Host fac_r1q_on = "+to_string(fac_r1q_on?1u:0u)+"."); // ★ 28.09. R1Q
 	if(fac_rek_jit!=fac_rek_on) print_error("alloc_facetten_domain: KOHAERENZ Host/Kernel verletzt -- Kernel-Text "+string(fac_rek_jit?"MIT":"OHNE")+" FAC_REK, Host fac_rek_on = "+to_string(fac_rek_on?1u:0u)+".");
+	if(fac_rekpi_jit!=fac_rekpi_on||fac_rekpi_an_jit!=(fac_rekpi_stufe>=2u)||fac_rekpi_nur_u_jit!=(fac_rekpi_stufe==3u)||(fac_rekpi_stufe>=2u&&!fac_rek_r3_jit)) print_error("alloc_facetten_domain: KOHAERENZ REK-PI verletzt -- Stufe "+to_string(fac_rekpi_stufe)+" (Host fac_rekpi_on = "+to_string(fac_rekpi_on?1u:0u)+"), Kernel-Text FAC_REKPI/_AN/_NUR_U/FAC_REK_R3 = "+to_string(fac_rekpi_jit?1u:0u)+"/"+to_string(fac_rekpi_an_jit?1u:0u)+"/"+to_string(fac_rekpi_nur_u_jit?1u:0u)+"/"+to_string(fac_rek_r3_jit?1u:0u)+". Stufe 2 braucht FAC_REKPI, _AN und FAC_REK_R3, Stufe 3 zusaetzlich _NUR_U, Stufe 1 nur FAC_REKPI."); // ★ 03.10. REK-PI (Lehre M2 vom 22.09.: Host und Kernel muessen denselben Modus meinen)
 	fac_geo.write_to_device(); fac_idx.write_to_device(); fac_tau.write_to_device(); fac_tau_n.write_to_device();
 	kernel_stream_collide.set_parameters(fac_param_pos, fac_geo, fac_idx, fac_tau, fac_tau_n);
 	if(fac_ema_on) { fac_us = Memory<float>(device, 3ull*aktiv); for(ulong q3=0ull;q3<3ull*aktiv;q3++) fac_us[q3]=0.0f; fac_us.write_to_device(); kernel_stream_collide.set_parameters(fac_param_pos+4u, fac_us); }
@@ -1819,7 +2657,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		// DIE BEDINGUNG IST EINSEITIG UND DESHALB SICHER: is_zero_copy verlangt uses_ram, also
 		// schliesst !uses_ram Zero-Copy aus. Auf der iGPU IST der Host-Puffer der Geraetespeicher,
 		// dort wuerde die Freigabe die laufende Rechnung lautlos zerstoeren -- deshalb nur dGPU.
-		if(!device.info.uses_ram) gd_zellen.delete_host_buffer();
+		if(!device.info.uses_ram&&!fac_rekpi_on) gd_zellen.delete_host_buffer(); // ★ 03.10. REK-PI: Spiegel bleibt, der Sprungregel-Zensus in setup.cpp (pruefe_rekpi_wirkpfad) liest fid -> Zelle (System-RAM 4 B je Facette, kein VRAM)
 	}
 	if(nachbar_on) { // ★ 03.09. DETERMINISTISCHE NACHBARABTASTUNG: Puffer bauen, Kernel binden, stream_collide-Rebind (fac_wfd-Muster, B70-bewiesen)
 		const ulong nbs = nb_stride; // ★ 16.09. HOCH-1: Instanzwert, eingefroren in allocate() // ★ 16.09. Stride = def_nb_stride der Emission (2, unter APG 5: grad rho in [2..4])
@@ -1832,7 +2670,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		// Puffers, 2,5-facher Ueberlauf ohne Schranke auf der GPU (Wedge-Klasse auf der B70).
 		// ★ 23.09. Stufe A: die Erwartung traegt jetzt auch die drei Richtungsfloats. Wer sie hier vergisst,
 		// baut genau den Ueberlauf vom 22.09. nach -- deshalb steht die Formel an BEIDEN Stellen ausgeschrieben.
-		const ulong nbs_soll = (apg_on ? 5ull : 2ull) + (fac_rek_on ? nb_rek_floats : 0ull);
+		const ulong nbs_soll = (apg_on ? 5ull : 2ull) + (fac_rek_on ? nb_rek_floats : 0ull) + (fac_rekpi_on ? nb_rekpi_floats : 0ull); // ★ 03.10. REK-PI
 		// ★ 23.09. abends, Pruefbefund M3/M5: nb_roff war unbewacht, waehrend nb_stride einen Waechter hat.
 		// ★ 24.09. BERICHTIGT, Pruefbefund M1: der Kommentar behauptete hier, der Waechter schuetze die
 		// SCHREIBseite des Impuls-Akkumulators. Das trifft NICHT zu -- die Schreibseite benutzt
@@ -1864,9 +2702,11 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		// Kosten des Spiegels (System-RAM, NICHT VRAM): nb_stride*fac_N*4 B, bei 4 mm mit 3,13 Mio
 		// Facetten 113 MB unter APG+REK, 75 MB ohne APG -- und nur unter CFD_FAC_REK.
 		if(!device.info.uses_ram&&apg_haken==0u&&!fac_rek_on) fac_nb.delete_host_buffer(); // ★ 16.09.: unter CFD_FAC_APG_HAKEN bleibt der Host-Spiegel -- der Bericht liest grad rho zurueck
-		kernel_fac_nachbar = Kernel(device, aktiv, "fac_nachbar_ab", u, flags, fac_geo, gd_zellen, (uint)aktiv, fac_nb);
+		kernel_fac_nachbar = Kernel(device, aktiv, "fac_nachbar_ab", u, flags.k(), fac_geo, gd_zellen, (uint)aktiv, fac_nb);
+		if(fac_rekpi_on) kernel_fac_nachbar.add_parameters(fac_idx); // ★ 03.10. REK-PI: Signaturposition 6 (#ifdef FAC_REKPI, VOR TS_P) -- Bindung unter DERSELBEN Bedingung wie die Emission (Werkzeugfalle 8), und VOR tile_slot
+		if(u_rand_on) kernel_fac_nachbar.add_parameters(rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: #ifdef U_RAND in der Signatur (nach fac_idx, VOR TS_P) -- U_RAND wird genau bei u_rand_on emittiert (s_u_rand, eingefroren im Konstruktor)
 		if(apg_on) { // ★ 16.09. APG-Vorkernel: eigener Kernel (Gate-Befund Spill), liest die DDFs, schreibt grad rho nach fac_nb[2..4]; t (Position 5) wird je Schritt nachgesetzt
-			kernel_fac_apg = Kernel(device, aktiv, "fac_apg_ab", flags, gd_zellen, (uint)aktiv, fac_nb, fi, t, rho_clamp_hits);
+			kernel_fac_apg = Kernel(device, aktiv, "fac_apg_ab", flags.k(), gd_zellen, (uint)aktiv, fac_nb, fi, t, rho_clamp_hits);
 			if(sparse_on) kernel_fac_apg.add_parameters(tile_slot);
 			print_info("APG-VORKERNEL fac_apg_ab gebunden (16.09.): grad rho aus den DDFs der 6 Achsnachbarn je Facette, "+to_string((float)(12ull*aktiv)/1048576.0f,1u)+" MB in fac_nb[2..4], Launch je Schritt nach fac_nachbar_ab.");
 		}
@@ -1887,7 +2727,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		// schliesst !uses_ram Zero-Copy aus. Auf der iGPU IST der Host-Puffer der Geraetespeicher,
 		// dort wuerde die Freigabe die laufende Rechnung lautlos zerstoeren -- deshalb nur dGPU.
 		if(!device.info.uses_ram) fac_wfd.delete_host_buffer();
-		kernel_sgs_fdwand = Kernel(device, aktiv, "sgs_fdwand", u, flags, gd_zellen, (uint)aktiv, fac_wfd);
+		kernel_sgs_fdwand = Kernel(device, aktiv, "sgs_fdwand", u, flags.k(), gd_zellen, (uint)aktiv, fac_wfd);
 		if(sism_on) { // ★ 07.09. SISM: EMA-Puffer (6 float je Facette, Start 0 -- KEIN Warmstart mit S, der liefert nu_t = 0 im ersten Schritt), t + Zaehler als Kernelargumente. Reihenfolge = Kernel-Signatur unter #ifdef SGS_SISM (t, fac_sb, rho_clamp_hits), zwingend VOR tile_slot (TS_P ist der letzte Parameter)
 			fac_sb = Memory<float>(device, 6ull*aktiv);
 			for(ulong q=0ull;q<6ull*aktiv;q++) fac_sb[q]=0.0f;
@@ -1895,6 +2735,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 			kernel_sgs_fdwand.add_parameters(t, fac_sb, rho_clamp_hits, 0u); // sbar_out = 0: Lage 1 bekommt wie bisher ein fertiges w (Geistermoden-Fix) // Position 5/6/7; rho_clamp_hits haengt schon an stream_collide -- Mehrfachbindung desselben cl_mem ist unproblematisch
 			print_info("SISM gebunden: fac_sb "+to_string((float)(24ull*aktiv)/1048576.0f,1u)+" MB fuer "+to_string(aktiv)+" Facetten, EMA T = "+to_string((ulong)sism_T)+" Schritte (alpha = 1/T im Kernel), klassisch bis Schritt "+to_string(sism_ab)+"; Slot 126/127 am Laufende.");
 		}
+		else if(u_rand_on) kernel_sgs_fdwand.add_parameters(rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: ohne SISM, aber mit U_RAND traegt die Signatur den Zaehlerpuffer allein (#else-Zweig SGS_SISM), VOR tile_slot
 		if(sparse_on) kernel_sgs_fdwand.add_parameters(tile_slot); // gleiche B-7-Lehre wie sgs_gdiag
 		{ const uint fwix=fac_param_pos+4u+(fac_ema_on?1u:0u)+(fac_pema_on?1u:0u)+(diagz_gebaut?1u:0u)+(fac_elibb_on?1u:0u)+(fac_kdiag_on?1u:0u)+(nachbar_on?1u:0u); // +nachbar_on (03.09.): fac_nb sitzt VOR fac_wfd
 		  kernel_stream_collide.set_parameters(fwix, fac_wfd); band_param_pos = fwix+1u; } // ★ 08.09.: dieselbe Rechnung fuer das Band merken -- alloc_sgs_band laeuft spaeter und sieht diagz_gebaut nicht mehr // ★ Rebind NACH dem Neubau -- der Rebind stand zuerst VOR dem Move-Assignment und band den gleich darauf ZERSTOERTEN Platzhalter (CL -52 beim ersten Enqueue; exakt die DIAGZ-Use-after-free-Lektion, 02.09. erneut bezahlt)
@@ -1908,7 +2749,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		fac_gd = Memory<float>(device, 8ull*aktiv);
 		for(ulong q8=0ull;q8<8ull*aktiv;q8++) fac_gd[q8]=0.0f;
 		fac_gd.write_to_device();
-		kernel_sgs_gdiag = Kernel(device, aktiv, "sgs_gdiag", fi, u, flags, gd_zellen, (uint)aktiv, fac_gd, t, fx, fy, fz, s_sgs_guo?1u:0u);
+		kernel_sgs_gdiag = Kernel(device, aktiv, "sgs_gdiag", fi, u, flags.k(), gd_zellen, (uint)aktiv, fac_gd, t, fx, fy, fz, s_sgs_guo?1u:0u);
 		if(sparse_on) kernel_sgs_gdiag.add_parameters(tile_slot); // Pruefbefund B-7: TS_P haengt an SPARSE_TILES -- ohne dieses Argument stuerbe der erste Launch mit CL_INVALID_KERNEL_ARGS
 		print_info("g-DIAGNOSE (CFD_SGS_GDIAG): "+to_string(aktiv)+" Wandzellen, "+to_string((ulong)(40ull*aktiv/1048576ull))+" MB -- misst |S|_FD, |S|_Pi, D_WALE, D_Sigma, |Omega| je Zelle; Physik unangetastet.");
 	}
@@ -1966,6 +2807,7 @@ void LBM_Domain::finalize_sparse_tiles() {
 	if(apg_on&&fac_N>0ull) kernel_fac_apg.set_parameters(4u, fi); // ★ 16.09. (Pruefagent NIEDRIG): fi ist Position 4 in fac_apg_ab; heute nie erreicht (Alloc nach dem Init), aber ein frueherer Alloc hielte sonst das freigegebene fi
 #ifdef FORCE_FIELD
 	kernel_update_force_field.set_parameters(0u, fi);
+	if(kp1_bound) kernel_kraft_p1.set_parameters(0u, fi); // ★ 04.10. KRAFT-P1: heute nie erreicht (Bindung erst am ersten Kraftsample), aber ein frueherer Bind hielte sonst das freigegebene fi
 #endif // FORCE_FIELD
 	print_info("[SPARSE] "+to_string(n_active)+"/"+to_string(n_tiles)+" Tiles aktiv (T="+to_string(T)+") -> fi "
 		+to_string((float)sparse_gb,2u)+" GB statt "+to_string((float)full_gb,2u)+" GB, also "
@@ -1997,6 +2839,27 @@ void LBM_Domain::enqueue_stream_collide() { // call kernel_stream_collide to per
 	const uint rho_bit = (rho_takt==0u||rho_voll_zwang) ? 1u : 0u;
 	const uint u_bit   = (u_takt==0u  ||rho_voll_zwang||((t+1ull)%(ulong)u_takt)==0ull) ? 2u : 0u;
 	felder_voll_h = rho_bit|u_bit;
+	{ // ★ 05.10.2026 Slot-206-Waechter: der Kernel zaehlt 206/207 im Fenster t in [zaehl_takt+2, zaehl_takt+6); hier mitzaehlen, an wie vielen
+	  // dieser Schritte u NICHT erzwungen voll geschrieben wurde -- nur dann kann 206 > 0 verlangt werden (berichte_dichteklemme).
+	  const ulong zf_ = zaehl_takt()+2ull;
+	  if(t>=zf_&&t<zf_+4ull) { u_fenster_n++; if((u_bit&2u)==0u) u_fenster_frei++; }
+	}
+	if(u_rand_on) { // ★ 04.10.2026 U_RAND: Bit 1 haengt NUR am letzten Substep; dort wird der Leseplan ausgefuehrt. ★ 05.10.2026 Korrektur C-N8: hier stand
+	  // "Bit 1 heisst C schreiben" -- Segment C ist entfallen; unter U_RAND liest den Wert 2 im Kernel niemand (die einzige Lesestelle steht im #else-Zweig U_SPARSAM)
+		const bool letzter_ = ((t+1ull)%(ulong)max(1u, u_takt))==0ull;
+		felder_voll_h = rho_bit|(letzter_ ? 2u : 0u);
+		if(letzter_&&ur_plan!=0u) { ur_plan_lauf = ur_plan; ur_plan_t = t+1ull; ur_plan = 0u; }
+		else if(letzter_) ur_plan_lauf = 0u;
+		if(letzter_&&(ur_plan_lauf&8u)!=0u) ur_voll_scheiben(felder_voll_h);
+		else if(letzter_&&(ur_plan_lauf&20u)!=0u) { // Ebene (deckt die Saeule, gleiche y) oder Saeule allein
+			if((ur_plan_lauf&4u)!=0u) ur_vbox(0u, ur_v_y, 0u, (uint)get_Nx(), 1u, (uint)get_Nz());
+			else ur_vbox(ur_saeule_x, ur_saeule_y, 0u, 1u, 1u, ur_saeule_zn);
+			kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, felder_voll_h|4u).enqueue_run(); // V-Box bleibt gesetzt bis u_rand_ausgabe
+		} else {
+			if(ur_vbox_aktiv) ur_vbox(0u, 0u, 0u, 0u, 0u, 0u); // Rueckfall: nie mit gesetzter V-Box in einen Schritt ohne Plan
+			kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, felder_voll_h).enqueue_run();
+		}
+	} else
 	kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, felder_voll_h).enqueue_run();
 	if(fdwand_on&&fac_N>0ull) { if(sism_on) kernel_sgs_fdwand.set_parameters(5u, t); kernel_sgs_fdwand.enqueue_run(); }
 	if(band_on&&band_N>0ull&&!band_pi_on) { if(sism_on) kernel_sgs_band.set_parameters(5u, t); kernel_sgs_band.enqueue_run(); } // ★ 22.09. Plan C: im Pi-Modus kein FD-Bandkernel // ★ 08.09. SGS-BAND: zweiter Launch desselben Kernels ueber die Bandzellen, dieselbe In-Order-Queue -> derselbe Determinismus wie Lage 1 // ★ Audit-Befund 11 (07.09.): Waechter auf fac_N statt fac_wfd.length()>1 -- bei GENAU EINER aktiven Facette ist die Laenge 1 und der FD-Kernel wurde still uebersprungen (Platzhalter und Einzelfacette nicht unterscheidbar; dieselbe Falle wie fac_nb 03.09.). fac_N wird nur in alloc_facetten_domain gesetzt. // ★ 07.09. SISM: t je Schritt nachfuehren (Muster sgs_gdiag/boden_eq), Position 5 = erstes SGS_SISM-Argument; der FD-Kernel sieht dasselbe t wie der eben gerechnete Schritt (increment_time_step folgt erst danach)
@@ -2100,7 +2963,7 @@ void LBM_Domain::bind_kraft_facetten(const std::vector<ulong>& liste, const ucha
 	if(liste_n>0xFFFFFFFFull) print_error("kraft_facetten-Liste ueberschreitet 2^32 Zellen -- uint-Cast im Kernel-Argument wuerde stumm abschneiden (R1-N4)."); // praktisch unerreichbar, aber billig
 	if(band_slot) { kfb_N = liste_n; kfb_marker = marker; kfb_zper = z_per; kfb_bound = true; } // eigene Schluessel (Pruefagent M)
 	else { kf_N = liste_n; kf_marker = marker; kf_zper = z_per; kf_bound = true; }
-	if(liste_n==0ull) return; // leere Liste: kraft_facetten_gpu liefert Nullen ohne Launch
+	if(liste_n==0ull) return; // leere Liste: kraft_facetten_gpu liefert Nullen ohne Launch (KRAFT-P1 ebenso, kp1_bound bleibt wie es ist -- kraft_p1_gpu prueft kf_N zuerst)
 	liste_m = Memory<uint>(device, liste_n); // Ctor-Nullinit + zweiter Voll-Write = ein verschenkter 16-MB-Transfer, EINMALIG beim Bind -- bewusst toleriert (Pruefagent N2)
 	if(get_N()>0xFFFFFFFFull) print_error("kf_liste/kfb_liste sind seit 08.09. uint (VRAM) -- bei N > 2^32 wuerde jeder Zellindex still abgeschnitten. Der Waechter oben prueft die LISTENLAENGE, nicht den Indexwert (Pruefagent-Befund B1).");
 	for(ulong i=0ull; i<liste_n; i++) liste_m[i] = (uint)liste[i];
@@ -2127,6 +2990,17 @@ void LBM_Domain::bind_kraft_facetten(const std::vector<ulong>& liste, const ucha
 	}
 	kernel_m = Kernel(device, liste_n, "kraft_facetten_gpu", F, f_maske, liste_m, (uint)liste_n,
 		fac_idx, fac_tau_n, fac_geo, facetten_on?1u:0u, z_per?1u:0u, psum_m, pcnt_m);
+	if(!band_slot) {
+		// ★ 04.10.2026 KRAFT-P1: eigener Kernel auf DERSELBEN Markerliste (nur Hauptslot). Gruppenpuffer EINMAL anlegen (feste
+		// Groesse 1024 Gruppen); ein Neubau des Kernels bei Schluesselwechsel bindet sie neu, ohne einen gebundenen Puffer zu ersetzen.
+		if(kp1_f.length()==0ull) {
+			kp1_f = Memory<float>(device, 19ull*(ulong)kp1_groups);
+			kp1_u = Memory<uint>(device, 12ull*(ulong)kp1_groups);
+		}
+		kernel_kraft_p1 = Kernel(device, (ulong)kp1_groups*(ulong)WORKGROUP_SIZE, "kraft_p1_gpu", fi, flags.k(), f_maske, liste_m, (uint)liste_n, (ulong)0ull, 0u, kp1_f, kp1_u); // fi 0, flags 1, f_maske 2, kf_liste 3, kf_N 4, tt 5, haken 6, kp1_f 7, kp1_u 8, tile_slot 9
+		if(sparse_on) kernel_kraft_p1.add_parameters(tile_slot); // TS_P haengt NUR an SPARSE_TILES (Werkzeugfalle 8)
+		kp1_bound = true;
+	}
 }
 void LBM_Domain::kraft_facetten_gpu(double& px, double& py, double& pz, ulong& n_voll, ulong& n_proj, ulong& n_unklar, const bool band_slot) {
 	px=py=pz=0.0; n_voll=n_proj=n_unklar=0ull;
@@ -2148,6 +3022,33 @@ void LBM_Domain::kraft_facetten_gpu(double& px, double& py, double& pz, ulong& n
 		px += (double)psum_m[3ull*g]; py += (double)psum_m[3ull*g+1ull]; pz += (double)psum_m[3ull*g+2ull];
 		n_voll += (ulong)pcnt_m[3ull*g]; n_proj += (ulong)pcnt_m[3ull*g+1ull]; n_unklar += (ulong)pcnt_m[3ull*g+2ull];
 	}
+}
+// ★ 04.10.2026 KRAFT-P1: Kernel + double-Endsumme in fester Gruppenreihenfolge. tt = t-1 (Nachkollisions-Populationen des letzten
+// Schritts, Konvention rho_ausgabe_ebene); Waechter t >= 1. run() MIT finish (Zero-Copy-Falle, siehe kraft_facetten_gpu).
+void LBM_Domain::kraft_p1_gpu(KP1& k, const uint haken) {
+	k = KP1();
+	if(!kf_bound) return; // keine Markerliste: ok bleibt false
+	if(t<1ull) return; // t-1 braucht einen gerechneten Schritt
+	if(kf_N==0ull) { k.ok = true; return; } // leere Liste: Nullen, ohne Launch
+	if(!kp1_bound) return;
+	const ulong tt = (haken==1u) ? t : t-1ull;
+	kernel_kraft_p1.set_parameters(5u, tt, haken);
+	kernel_kraft_p1.run();
+	kp1_f.read_from_device();
+	kp1_u.read_from_device();
+	for(ulong g=0ull; g<(ulong)kp1_groups; g++) {
+		const ulong of = 19ull*g;
+		const ulong ou = 12ull*g;
+		k.px += (double)kp1_f[of];
+		k.py += (double)kp1_f[of+1ull];
+		k.pz += (double)kp1_f[of+2ull];
+		for(uint K=0u; K<8u; K++) { k.lx[K] += (double)kp1_f[of+3ull+K]; k.lz[K] += (double)kp1_f[of+11ull+K]; k.links_lage[K] += (unsigned long long)kp1_u[ou+1ull+K]; }
+		k.links += (unsigned long long)kp1_u[ou];
+		k.typ_e += (unsigned long long)kp1_u[ou+9ull];
+		k.klemme += (unsigned long long)kp1_u[ou+10ull];
+		k.wandzellen += (unsigned long long)kp1_u[ou+11ull];
+	}
+	k.ok = true;
 }
 #endif // FORCE_FIELD
 #ifdef MOVING_BOUNDARIES
@@ -2183,11 +3084,67 @@ void LBM_Domain::finish_queue() {
 	device.finish_queue();
 }
 
+// ★ 03.10.2026 CFD_GPU_PROFIL -- Schrittgrenzen und Auswertung (Begruendung bei den Membern in lbm.hpp).
+// Ohne Schalter kehren alle drei sofort zurueck: kein Event, kein Ziel, keine Treiberabfrage.
+void LBM_Domain::profil_schritt_beginnen() {
+	if(!profil_an) return;
+	profil_grenzen.push_back((ulong)profil_events.size());
+	device.profil_ziel = &profil_events;
+}
+void LBM_Domain::profil_schritt_beenden() {
+	if(!profil_an) return;
+	device.profil_ziel = nullptr; // Launches ausserhalb von do_time_step (Kopplung, Kraefte, Schnitte) zaehlen NICHT zum Schritt
+}
+void LBM_Domain::profil_auswerten() {
+	if(!profil_an||profil_grenzen.empty()) return;
+	if(device.profil_ziel!=nullptr) print_error("CFD_GPU_PROFIL: profil_auswerten() mitten in do_time_step gerufen -- der laufende Schritt wuerde halb ausgewertet.");
+	ulong k = 0ull; // Schritte, die hier verbraucht werden
+	const ulong n_grenzen = (ulong)profil_grenzen.size();
+	for(; k<n_grenzen; k++) {
+		const ulong a = profil_grenzen[k];
+		const ulong b = k+1ull<n_grenzen ? profil_grenzen[k+1ull] : (ulong)profil_events.size();
+		// Nur fertige Schritte. Abgefragt wird der STATUS (nicht blockierend) -- eine Barriere hat der Aufrufer gesetzt;
+		// steht ein Event noch aus (Mehr-Domaenen-Fall ohne Schlussbarriere), bleibt der Schritt fuer den naechsten Aufruf liegen.
+		bool fertig = true, defekt = false;
+		for(ulong e=a; e<b; e++) {
+			cl_int st = CL_QUEUED;
+			if(profil_events[e].getInfo(CL_EVENT_COMMAND_EXECUTION_STATUS, &st)!=CL_SUCCESS||st<0) { defekt = true; break; }
+			if(st!=CL_COMPLETE) { fertig = false; break; }
+		}
+		if(!fertig&&!defekt) break;
+		if(defekt) { profil_fehler++; continue; } // verbrauchen, damit ein abgebrochener Befehl die Auswertung nicht fuer immer anhaelt
+		cl_ulong s_min = ~(cl_ulong)0u, e_max = 0u, summe = 0u;
+		for(ulong e=a; e<b; e++) {
+			cl_ulong t0 = 0u, t1 = 0u;
+			if(profil_events[e].getProfilingInfo(CL_PROFILING_COMMAND_START, &t0)!=CL_SUCCESS||profil_events[e].getProfilingInfo(CL_PROFILING_COMMAND_END, &t1)!=CL_SUCCESS||t1<t0) { defekt = true; break; }
+			summe += t1-t0;
+			if(t0<s_min) s_min = t0;
+			if(t1>e_max) e_max = t1;
+		}
+		if(defekt) { profil_fehler++; continue; }
+		const cl_ulong spanne = b>a ? e_max-s_min : 0u;
+		if(!(summe>0u&&summe<=spanne)) profil_verletzt++; // Selbsttest: In-Order-Queue, die Launches eines Schritts ueberlappen nicht
+		profil_schritte++;
+		profil_kern_ns += (ulong)summe;
+		profil_spanne_ns += (ulong)spanne;
+	}
+	if(k==0ull) return;
+	if(k==n_grenzen) { profil_events.clear(); profil_grenzen.clear(); return; } // Normalfall: alles ausgewertet
+	const ulong ab = profil_grenzen[k]; // Rest nach vorn ziehen
+	profil_events.erase(profil_events.begin(), profil_events.begin()+(long)ab);
+	profil_grenzen.erase(profil_grenzen.begin(), profil_grenzen.begin()+(long)k);
+	for(ulong& g : profil_grenzen) g -= ab;
+}
+
 uint LBM_Domain::get_velocity_set() const {
 	return velocity_set;
 }
 
 void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, const float3& rotation_center, const float3& linear_velocity, const float3& rotational_velocity) { // voxelize triangle mesh
+	// ★ 05.10.2026 Korrektur C-M2: unter U_RAND schreibt voxelize_mesh u nur an gespeicherte Zellen (vor alloc_u_rand an KEINE), und
+	// update_moving_boundaries laese ungespeicherte Solids aus dem Papierkorb -- eine bewegte Wand verloere ihre Geschwindigkeit still
+	// (kein TYPE_MS, keine Mitbewegung, kein Zaehler). Bis der Zensus bewegte Solids kennt: harte Sperre.
+	if(u_rand_on&&(length(linear_velocity)>0.0f||length(rotational_velocity)>0.0f)) print_error("U_RAND x bewegte Voxelisierung (linear/rotational_velocity != 0): nicht gebaut -- die Wandgeschwindigkeit ginge im kompakten u-Puffer still verloren. CFD_U_RAND=0 fahren (Pruefbefund C-M2).");
 	Memory<float3> p0(device, mesh->triangle_number, 1u, mesh->p0);
 	Memory<float3> p1(device, mesh->triangle_number, 1u, mesh->p1);
 	Memory<float3> p2(device, mesh->triangle_number, 1u, mesh->p2);
@@ -2230,7 +3187,7 @@ void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, con
 		}
 	}
 	const ulong A[3] = { (ulong)Ny*(ulong)Nz, (ulong)Nz*(ulong)Nx, (ulong)Nx*(ulong)Ny };
-	Kernel kernel_voxelize_mesh(device, A[direction], "voxelize_mesh", direction, fi, u, flags, t+1ull, flag, p0, p1, p2, bounding_box_and_velocity);
+	Kernel kernel_voxelize_mesh(device, A[direction], "voxelize_mesh", direction, fi, u, flags.k(), t+1ull, flag, p0, p1, p2, bounding_box_and_velocity);
 #ifdef SURFACE
 	kernel_voxelize_mesh.add_parameters(mass, massex);
 #endif // SURFACE
@@ -2243,7 +3200,7 @@ void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, con
 }
 void LBM_Domain::enqueue_unvoxelize_mesh_on_device(const Mesh* mesh, const uchar flag) { // remove voxelized triangle mesh from LBM grid
 	const float x0=mesh->pmin.x, y0=mesh->pmin.y, z0=mesh->pmin.z, x1=mesh->pmax.x, y1=mesh->pmax.y, z1=mesh->pmax.z; // remove all flags in bounding box of mesh
-	Kernel kernel_unvoxelize_mesh(device, get_N(), "unvoxelize_mesh", flags, flag, x0, y0, z0, x1, y1, z1);
+	Kernel kernel_unvoxelize_mesh(device, get_N(), "unvoxelize_mesh", flags.k(), flag, x0, y0, z0, x1, y1, z1);
 	kernel_unvoxelize_mesh.run();
 }
 
@@ -2291,6 +3248,15 @@ string ptrt_defines() {
 #endif // D3Q19
 }
 
+// ★ 04.10.2026 U_RAND: die Kopfbelegung aus EINER Quelle (namespace ur_k, lbm.hpp) in den Geraetecode.
+string LBM_Domain::u_rand_defines() const {
+	string d = "\n	#define U_RAND\n	#define UR_MAGIC "+to_string(ur_k::GUELTIG)+"u\n	#define UR_REGEL_VX "+to_string(ur_k::REGEL_VX)+"u";
+	const char* nm[] = {"MAGIC","US","DOFF","R1N","AN","AX0","AY0","AZ0","ANX","ANY","ANZ","AMASK","AMOFF","VOFF","VN","VBX0","VBY0","VBZ0","VBNX","VBNY","VBNZ","P"};
+	const uint wt[] = {ur_k::MAGIC,ur_k::US,ur_k::DOFF,ur_k::R1N,ur_k::AN,ur_k::AX0,ur_k::AY0,ur_k::AZ0,ur_k::ANX,ur_k::ANY,ur_k::ANZ,ur_k::AMASK,ur_k::AMOFF,ur_k::VOFF,ur_k::VN,ur_k::VBX0,ur_k::VBY0,ur_k::VBZ0,ur_k::VBNX,ur_k::VBNY,ur_k::VBNZ,ur_k::P};
+	static_assert(sizeof(nm)/sizeof(nm[0])==sizeof(wt)/sizeof(wt[0]), "U_RAND: Namens- und Wertliste der Kopfwoerter muessen gleich lang sein");
+	for(uint i=0u; i<(uint)(sizeof(wt)/sizeof(wt[0])); i++) d += "\n	#define URK_"+string(nm[i])+" "+to_string(wt[i])+"u";
+	return d;
+}
 string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	"\n	#define def_Nx "+to_string(Nx)+"u"
 	"\n	#define def_Ny "+to_string(Ny)+"u"
@@ -2537,11 +3503,14 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	+((s_facetten&&s_fac_imem&&s_fac_messnur>0u) ? (string)"\n	#define FACETTEN_MESSNUR" : (string)"") // ★ 30.08. BB-Physik, nur messen
 	+((s_facetten&&s_fac_imem&&s_fac_nachbar>0u) ? (string)"\n	#define FACETTEN_NACHBAR" : (string)"") // ★ 30.08. Eingang aus der zweiten Fluidzelle
 	+(string)"\n	#define def_nb_roff "+string((s_facetten&&s_fac_imem&&s_fac_nachbar>0u&&s_fac_apg!=0.0f) ? "5ul" : "2ul") // ★ 23.09. Stufe A: Offset der Nachbar-RICHTUNG in fac_nb, HINTER den APG-Gradienten -- so wandert keine bestehende Lesestelle
-	+(string)"\n	#define def_nb_stride "+string(to_string((ulong)(((s_facetten&&s_fac_imem&&s_fac_nachbar>0u&&s_fac_apg!=0.0f) ? 5ull : 2ull) + (fac_rek_on ? nb_rek_floats : 0ull)))+"ul") // ★ 16.09. fac_nb: 2 float je Facette, unter APG 5 (grad rho in [2..4]) -- UNBEDINGT emittiert: fac_nachbar_ab steht in JEDER Domaene im Quelltext (Gate-Befund 16.09.: ohne NACHBAR undeclared identifier, das haette das Fernfeld im dd-Fall gekillt); Host-Allokation MUSS mitziehen
+	+(string)"\n	#define def_nb_stride "+string(to_string((ulong)(((s_facetten&&s_fac_imem&&s_fac_nachbar>0u&&s_fac_apg!=0.0f) ? 5ull : 2ull) + (fac_rek_on ? nb_rek_floats : 0ull) + (fac_rekpi_on ? nb_rekpi_floats : 0ull)))+"ul") // ★ 16.09. fac_nb: 2 float je Facette, unter APG 5 (grad rho in [2..4]) -- UNBEDINGT emittiert: fac_nachbar_ab steht in JEDER Domaene im Quelltext (Gate-Befund 16.09.: ohne NACHBAR undeclared identifier, das haette das Fernfeld im dd-Fall gekillt); Host-Allokation MUSS mitziehen
 	+((s_facetten&&s_fac_imem&&s_fac_apg!=0.0f&&s_fac_apg_haken==2u) ? (string)"\n	#define FACETTEN_APG_HAKEN" : (string)"") // ★ 16.09. Testhaken: Konstantgradient im Vorkernel
 	+((s_facetten&&s_fac_imem&&s_fac_apg!=0.0f&&s_fac_apg_haken==3u) ? (string)"\n	#define FACETTEN_APG_HAKEN3" : (string)"") // ★ 16.09. Testhaken 3 (Pruefagent MITTEL-1): analytisches rho = 1 + x/1024 im Vorkernel, gz := kx -- Host prueft gx exakt
 	+((s_facetten&&s_fac_imem&&s_fac_kdiag>0u) ? (string)"\n	#define FACETTEN_KDIAG" : (string)"") // ★ 30.08. Klassen-Diagnostik
 	+((s_rho_takt>0u&&s_smbox[3]>0u) ? (string)"\n	#define RHO_SMBOX" : (string)"") // ★ TODO 2: im Fernfeld deckt die rho-Maske auch die Entnahmeebenen ab
+	+(zellbasen_on ? (string)"\n	#define ZELLBASEN" : (string)"") // ★ 05.10.2026 ZELLBASEN (CFD_ZELLBASEN, Vorgabe 1): stream_collide mit Byte-Zellbasen; ohne das Define ist der Geraetecode zeichengleich zu vorher
+	+(flags4_on ? (string)"\n	#define FLAGS4" : (string)"") // ★ 05.10.2026 FLAGS4: fl()/st_fl() lesen/schreiben 4 Bit je Zelle; ohne das Define Byte wie bisher
+	+((s_u_rand>0u) ? u_rand_defines() : (string)"") // ★ 04.10.2026 U_RAND: Kopfbelegung (ur_k) und Init-Regel (★ C-N8: hier stand "+ Zaehlschritt fuer C" -- Segment C entfallen); ohne das Define ist der Geraetecode zeichengleich
 	+((s_u_takt>0u) ? (string)"\n	#define U_SPARSAM" : (string)"") // ★ TODO 2 Schritt 3: gattert die u-Schreibstelle; ohne das Define ist der Geraetecode dort zeichengleich zu vorher
 	+((s_rho_rand>0u) ? (string)"\n	#define RHO_RAND"+"\n	#define def_RR_N "+to_string(r1_anzahl((uint)get_Nx(), (uint)get_Ny(), (uint)get_Nz()))+"ul" : (string)"") // ★ 15.09. RHO_RAND C2c: rho nur in R1; Fernfeld bleibt ohne (Statik vor lbm_c genullt)
 	+((s_rho_takt>0u) ? (string)"\n	#define RHO_SPARSAM" : (string)"") // ★ TODO 2 Schritt 1: gattert die rho-Schreibstelle in stream_collide; ohne das Define ist der Geraetecode ZEICHENGLEICH zu vorher
@@ -2717,8 +3686,10 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	+(f_liste_on ? (string)"\n	#define F_LISTE" : (string)"")
 	+(fac_idx_voll_on ? (string)"\n	#define FAC_IDX_VOLL" : (string)"")
 	+(fac_pinv_on ? (string)"\n	#define FACETTEN_PINV" : (string)"")
-	+(fac_r1q_on ? (string)"\n	#define FAC_R1Q" : (string)"")+((fac_r1q_on&&s_fac_r1q>=2u) ? (string)"\n	#define FAC_R1Q_AN" : (string)"")+((fac_r1q_on&&s_fac_r1q>=3u) ? (string)"\n	#define FAC_R1Q_VR" : (string)"")+((fac_r1q_on&&s_fac_r1q>=4u) ? (string)"\n	#define FAC_R1Q_OHNE_DRUCK" : (string)"") // ★ 28.09. R1Q: Messblock / Anwendung getrennt, damit der Messarm quelltextgleich zum Anwendungsarm rechnet
-	+(fac_rek_on ? (string)"\n	#define FAC_REK" : (string)"")+((fac_rek_on&&s_fac_rek>=2u) ? (string)"\n	#define FAC_REK_R3" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define FAC_REK_S2" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define def_fac_rek_leiter "+to_string(s_fac_rek_leiter,4u)+"f" : (string)"") // ★ 24.09. Diagnoseleiter: NUR unter Arm 3 emittiert, damit der Kerneltext aller anderen Arme zeichengleich bleibt (die Preprozessor-Diff-Abnahme haengt daran) // ★ 23.09. R3: eigener Arm (CFD_FAC_REK=2) fuer Gate + Buchung, damit Tor-Wirkung und eps-Wirkung trennbar bleiben. ★ BERICHTIGT 23.09. spaet: hier stand, das Gate sei auch bei eps=0 eine Physikaenderung und schalte den Solve an ALLEN Rang-0-Facetten ab -- am kipp26 ist das GEMESSEN falsch (Slot 331 = 0, Hash = Anker), am 8-mm-Fahrzeug dagegen richtig (30 335). Die Trennung lohnt also, aber sie zeigt, WO das Tor ueberhaupt wirkt // ★ 22.09. S0: schaltet NUR den Block ein; die Amplitude kommt als Laufzeitwert aus fac_geo[8i+6], damit IGC die Identitaet bei eps=0 NICHT wegoptimieren kann
+	+((sc_simd16_geraet()>=0&&device_info.id==(uint)sc_simd16_geraet()) ? (string)"\n	#define SC_SIMD16" : (string)"") // ★ 02.10. Messarm: Wert = OpenCL-Geraete-ID (B70 = 1), NUR dort SIMD16 + Auto-256-GRF (iGPU: SIMD16 bei 128 GRF = private_size 9728, bei 256 GRF Spill 384 -- dort nie). Wirkpfad: Laufzeit-Spill
+	+(fac_r1q_on ? (string)"\n	#define FAC_R1Q" : (string)"")+((fac_r1q_on&&s_fac_r1q>=2u) ? (string)"\n	#define FAC_R1Q_AN" : (string)"")+((fac_r1q_on&&s_fac_r1q>=3u) ? (string)"\n	#define FAC_R1Q_VR" : (string)"")+((fac_r1q_on&&s_fac_r1q>=4u) ? (string)"\n	#define FAC_R1Q_OHNE_DRUCK" : (string)"")+((fac_r1q_on&&s_fac_r1q>=5u) ? (string)"\n	#define FAC_R1Q_SPALTE1" : (string)"") // ★ 28.09. R1Q: Messblock / Anwendung getrennt, damit der Messarm quelltextgleich zum Anwendungsarm rechnet
+	+(fac_rek_on ? (string)"\n	#define FAC_REK" : (string)"")+((fac_rek_on&&(s_fac_rek>=2u||fac_rekpi_stufe>=2u)) ? (string)"\n	#define FAC_REK_R3" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define FAC_REK_S2" : (string)"")+((fac_rek_on&&s_fac_rek>=3u) ? (string)"\n	#define def_fac_rek_leiter "+to_string(s_fac_rek_leiter,4u)+"f" : (string)"") // ★ 24.09. Diagnoseleiter: NUR unter Arm 3 emittiert, damit der Kerneltext aller anderen Arme zeichengleich bleibt (die Preprozessor-Diff-Abnahme haengt daran) // ★ 23.09. R3: eigener Arm (CFD_FAC_REK=2) fuer Gate + Buchung, damit Tor-Wirkung und eps-Wirkung trennbar bleiben. ★ BERICHTIGT 23.09. spaet: hier stand, das Gate sei auch bei eps=0 eine Physikaenderung und schalte den Solve an ALLEN Rang-0-Facetten ab -- am kipp26 ist das GEMESSEN falsch (Slot 331 = 0, Hash = Anker), am 8-mm-Fahrzeug dagegen richtig (30 335). Die Trennung lohnt also, aber sie zeigt, WO das Tor ueberhaupt wirkt // ★ 22.09. S0: schaltet NUR den Block ein; die Amplitude kommt als Laufzeitwert aus fac_geo[8i+6], damit IGC die Identitaet bei eps=0 NICHT wegoptimieren kann
+	+(fac_rekpi_on ? (string)"\n	#define FAC_REKPI" : (string)"")+((fac_rekpi_on&&fac_rekpi_stufe>=2u) ? (string)"\n	#define FAC_REKPI_AN" : (string)"")+((fac_rekpi_on&&fac_rekpi_stufe==3u) ? (string)"\n	#define FAC_REKPI_NUR_U" : (string)"") // ★ 04.10. Stufe 3 (Ausweichstufe b): wie 2, aber ohne Pi-Tausch und tau_eff // ★ 03.10. REK-PI (PLAN-REK-PI.md §6): 1 = FAC_REKPI (rechnen+zaehlen), 2 = + FAC_REKPI_AN (+ FAC_REK_R3 eine Zeile darueber). Instanzwerte aus dem Konstruktor, nicht die Statik
 	+(f_liste_on ? (string)"\n	#define F_STRIDE ((ulong)f_maske[2ul*((def_FBN+31ul)/32ul)])"
 	             : (string)"\n	#define F_STRIDE def_FBN")
 #ifndef PARTICLES
@@ -2752,7 +3723,7 @@ void LBM_Domain::Graphics::allocate(Device& device) {
 	zbuffer = Memory<int>(device, camera.width*camera.height, 1u, lbm->get_D()>1u); // if there are multiple domains, allocate zbuffer also on host side
 	camera_parameters = Memory<float>(device, 15u);
 	kernel_clear = Kernel(device, bitmap.length(), "graphics_clear", bitmap, zbuffer);
-	kernel_graphics_flags = Kernel(device, lbm->get_N(), "graphics_flags", camera_parameters, bitmap, zbuffer, lbm->flags);
+	kernel_graphics_flags = Kernel(device, lbm->get_N(), "graphics_flags", camera_parameters, bitmap, zbuffer, lbm->flags.k());
 	{
 #ifndef FORCE_FIELD
 		const uint cache_required = (cb(GRAPHICS_LSF+1u)* 1u+1023u)/1024u; // in KB
@@ -2763,14 +3734,14 @@ void LBM_Domain::Graphics::allocate(Device& device) {
 		if(GRAPHICS_LSF>0u&&!enable_ls) print_warning(device.info.name+" does not support local memory optimization with GRAPHICS_LSF = "+to_string(GRAPHICS_LSF)+" (max supported workgroup size: "+to_string(device.info.max_workgroup_size)+" (required: "+to_string(cb(GRAPHICS_LSF))+"), cache: "+to_string(device.info.local_cache)+"KB (required: "+to_string(cache_required)+"KB)). Disabling local memory optimization.");
 		const ulong N = enable_ls ? (ulong)((lbm->get_Nx()+GRAPHICS_LSF-2u)/GRAPHICS_LSF)*(ulong)((lbm->get_Ny()+GRAPHICS_LSF-2u)/GRAPHICS_LSF)*(ulong)((lbm->get_Nz()+GRAPHICS_LSF-2u)/GRAPHICS_LSF)*(ulong)cb(GRAPHICS_LSF) : (ulong)(lbm->get_Nx()-1u)*(ulong)(lbm->get_Ny()-1u)*(ulong)(lbm->get_Nz()-1u);
 		const uint workgroup_size = enable_ls ? cb(GRAPHICS_LSF) : WORKGROUP_SIZE;
-		kernel_graphics_flags_mc = Kernel(device, N, workgroup_size, "graphics_flags_mc", camera_parameters, bitmap, zbuffer, lbm->flags);
+		kernel_graphics_flags_mc = Kernel(device, N, workgroup_size, "graphics_flags_mc", camera_parameters, bitmap, zbuffer, lbm->flags.k());
 	}
-	kernel_graphics_field = Kernel(device, lbm->get_D()==1u ? camera.width*camera.height : lbm->get_N(), lbm->get_D()==1u ? "graphics_field_rt" : "graphics_field", camera_parameters, bitmap, zbuffer, 0, lbm->rho, lbm->u, lbm->flags); // raytraced field visualization only works for single-GPU
-	kernel_graphics_field_slice = Kernel(device, lbm->get_N(), "graphics_field_slice", camera_parameters, bitmap, zbuffer, 0, 0, 0, 0, 0, lbm->rho, lbm->u, lbm->flags);
+	kernel_graphics_field = Kernel(device, lbm->get_D()==1u ? camera.width*camera.height : lbm->get_N(), lbm->get_D()==1u ? "graphics_field_rt" : "graphics_field", camera_parameters, bitmap, zbuffer, 0, lbm->rho, lbm->u, lbm->flags.k()); // raytraced field visualization only works for single-GPU
+	kernel_graphics_field_slice = Kernel(device, lbm->get_N(), "graphics_field_slice", camera_parameters, bitmap, zbuffer, 0, 0, 0, 0, 0, lbm->rho, lbm->u, lbm->flags.k());
 #ifndef D2Q9
-	kernel_graphics_streamline = Kernel(device, (lbm->get_Nx()/GRAPHICS_STREAMLINE_SPARSE)*(lbm->get_Ny()/GRAPHICS_STREAMLINE_SPARSE)*(lbm->get_Nz()/GRAPHICS_STREAMLINE_SPARSE), "graphics_streamline", camera_parameters, bitmap, zbuffer, 0, 0, 0, 0, 0, lbm->rho, lbm->u, lbm->flags); // 3D
+	kernel_graphics_streamline = Kernel(device, (lbm->get_Nx()/GRAPHICS_STREAMLINE_SPARSE)*(lbm->get_Ny()/GRAPHICS_STREAMLINE_SPARSE)*(lbm->get_Nz()/GRAPHICS_STREAMLINE_SPARSE), "graphics_streamline", camera_parameters, bitmap, zbuffer, 0, 0, 0, 0, 0, lbm->rho, lbm->u, lbm->flags.k()); // 3D
 #else // D2Q9
-	kernel_graphics_streamline = Kernel(device, (lbm->get_Nx()/GRAPHICS_STREAMLINE_SPARSE)*(lbm->get_Ny()/GRAPHICS_STREAMLINE_SPARSE), "graphics_streamline", camera_parameters, bitmap, zbuffer, 0, 0, 0, 0, 0, lbm->rho, lbm->u, lbm->flags); // 2D
+	kernel_graphics_streamline = Kernel(device, (lbm->get_Nx()/GRAPHICS_STREAMLINE_SPARSE)*(lbm->get_Ny()/GRAPHICS_STREAMLINE_SPARSE), "graphics_streamline", camera_parameters, bitmap, zbuffer, 0, 0, 0, 0, 0, lbm->rho, lbm->u, lbm->flags.k()); // 2D
 #endif // D2Q9
 	{
 		const uint cache_required = (cb(GRAPHICS_LSQ+3u)*12u+1023u)/1024u; // in KB
@@ -2796,8 +3767,8 @@ void LBM_Domain::Graphics::allocate(Device& device) {
 		const uint workgroup_size = enable_ls ? cb(GRAPHICS_LSP) : WORKGROUP_SIZE;
 		kernel_graphics_rasterize_phi = Kernel(device, N, workgroup_size, "graphics_rasterize_phi", camera_parameters, bitmap, zbuffer, lbm->phi);
 	}
-	kernel_graphics_raytrace_phi = Kernel(device, bitmap.length(), "graphics_raytrace_phi", camera_parameters, bitmap, skybox, lbm->phi, lbm->flags);
-	kernel_graphics_q.add_parameters(lbm->flags);
+	kernel_graphics_raytrace_phi = Kernel(device, bitmap.length(), "graphics_raytrace_phi", camera_parameters, bitmap, skybox, lbm->phi, lbm->flags.k());
+	kernel_graphics_q.add_parameters(lbm->flags.k());
 #endif // SURFACE
 
 #ifdef TEMPERATURE
@@ -3018,12 +3989,14 @@ LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint 
 		if(lbm_domain[0]->rho_rand_on) rho.binde_rand(this); // ★ 15.09. RHO_RAND C2c: Fassade im RAND-Betrieb (Plan K5)
 	} {
 		Memory<velxx>** buffers_u = new Memory<velxx>*[D];
-		for(uint d=0u; d<D; d++) buffers_u[d] = &(lbm_domain[d]->u);
+		for(uint d=0u; d<D; d++) buffers_u[d] = lbm_domain[d]->u_rand_on ? &(lbm_domain[d]->u_spiegel) : &(lbm_domain[d]->u); // ★ 04.10.2026 U_RAND: Hostspiegel statt kompaktem Puffer
 		u = Memory_Container(this, buffers_u, "u");
+		if(lbm_domain[0]->u_rand_on) u.binde_rand(this);
 	} {
 		Memory<uchar>** buffers_flags = new Memory<uchar>*[D];
-		for(uint d=0u; d<D; d++) buffers_flags[d] = &(lbm_domain[d]->flags);
+		for(uint d=0u; d<D; d++) buffers_flags[d] = &(lbm_domain[d]->flags.host()); // ★ FLAGS4: der Container sieht nur das Hostfeld
 		flags = Memory_Container(this, buffers_flags, "flags");
+		flags.binde(this);
 	} {
 #ifdef FORCE_FIELD
 		Memory<float>** buffers_F = new Memory<float>*[D];
@@ -3069,12 +4042,14 @@ LBM::LBM(const uint3 N, const float nu, const Device_Info& device_info, const fl
 		if(lbm_domain[0]->rho_rand_on) rho.binde_rand(this); // ★ 15.09. RHO_RAND C2c: Fassade im RAND-Betrieb (Plan K5)
 	} {
 		Memory<velxx>** buffers_u = new Memory<velxx>*[1u];
-		buffers_u[0] = &(lbm_domain[0]->u);
+		buffers_u[0] = lbm_domain[0]->u_rand_on ? &(lbm_domain[0]->u_spiegel) : &(lbm_domain[0]->u); // ★ 04.10.2026 U_RAND: Hostspiegel statt kompaktem Puffer
 		u = Memory_Container(this, buffers_u, "u");
+		if(lbm_domain[0]->u_rand_on) u.binde_rand(this);
 	} {
 		Memory<uchar>** buffers_flags = new Memory<uchar>*[1u];
-		buffers_flags[0] = &(lbm_domain[0]->flags);
+		buffers_flags[0] = &(lbm_domain[0]->flags.host()); // ★ FLAGS4: der Container sieht nur das Hostfeld
 		flags = Memory_Container(this, buffers_flags, "flags");
+		flags.binde(this);
 	}
 #ifdef FORCE_FIELD
 	{
@@ -3176,7 +4151,7 @@ void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, con
 		ulong b_fac = 60ull;
 		if(LBM_Domain::s_fac_elibb>0u)  b_fac += 18ull;
 		if(LBM_Domain::s_sgs_fdwand>0u) b_fac += 8ull;
-		if(LBM_Domain::s_fac_nachbar>0u)b_fac += (LBM_Domain::s_fac_apg!=0.0f ? 20ull : 8ull) + (LBM_Domain::s_fac_rek>0u ? 4ull*LBM_Domain::nb_rek_floats : 0ull); // ★ 23.09. Stufe A2: +16 B (nb_rek_floats = 4: drei Richtungsfloats + der Impuls-Akkumulator), sonst ist der VRAM-Waechter darueber blind (KDIAG-Lehre) // ★ 16.09. MITTEL-2 (Pruefagent): unter APG 5 float je Facette
+		if(LBM_Domain::s_fac_nachbar>0u)b_fac += (LBM_Domain::s_fac_apg!=0.0f ? 20ull : 8ull) + ((LBM_Domain::s_fac_rek>0u||LBM_Domain::s_fac_rekpi>0u) ? 4ull*LBM_Domain::nb_rek_floats : 0ull) + (LBM_Domain::s_fac_rekpi>0u ? 4ull*LBM_Domain::nb_rekpi_floats : 0ull); // ★ 03.10. REK-PI: die 5 REK-Floats plus 3 eigene = 32 B je Facette (4 mm 3,13-3,28 Mio Facetten = 100-105 MB) // ★ 23.09. Stufe A2: +16 B (nb_rek_floats = 4: drei Richtungsfloats + der Impuls-Akkumulator), sonst ist der VRAM-Waechter darueber blind (KDIAG-Lehre) // ★ 16.09. MITTEL-2 (Pruefagent): unter APG 5 float je Facette
 		if(LBM_Domain::s_sgs_sism>0u)   b_fac += 24ull;
 		if(LBM_Domain::s_fac_kdiag>0u)  b_fac += 64ull;
 		const ulong fac_est = (ulong)(0.03*(double)F_N);
@@ -3190,6 +4165,16 @@ void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, con
 		bytes_bekannt -= N_dom*(ulong)sizeof(rhoxx);
 		bytes_bekannt += (r1_anzahl(Nx, Ny, Nz)+1ull)*(ulong)sizeof(rhoxx) + 4ull*std::max({(ulong)Nx*(ulong)Nz, (ulong)Nx*(ulong)Ny, (ulong)Ny*(ulong)Nz}); // dieselbe Formel wie der Lazy-Alloc in rho_ausgabe_ebene
 	}
+	if(LBM_Domain::s_flags4>0u&&Dx*Dy*Dz==1u) bytes_bekannt -= N_dom-flags4_bytes(N_dom); // ★ 05.10.2026 FLAGS4: flags 4 Bit statt 1 Byte je Zelle (bytes_per_cell_device zaehlt 1 B)
+	if(LBM_Domain::s_u_rand>0u&&Dx*Dy*Dz==1u) { // ★ 05.10.2026 U_RAND Korrektur M1 (Plan B.15): statt des vollen u die Obergrenze des kompakten Puffers
+		const ulong u_voll_b = N_dom*3ull*(ulong)sizeof(velxx), u_rand_b = ur_vorpruef_bytes(Nx, Ny, Nz, LBM_Domain::s_u_rand);
+		bytes_bekannt -= u_voll_b;
+		bytes_bekannt += u_rand_b;
+		println("U_RAND VORPRUEFUNG modus "+to_string(LBM_Domain::s_u_rand)+" u voll "+to_string((ulong)(u_voll_b/1048576ull))+" MiB -> gebucht "+to_string((ulong)(u_rand_b/1048576ull))+" MiB (Obergrenze vor dem Zensus; alloc_u_rand prueft gegen den gemessenen freien VRAM)");
+	}
+#ifdef FORCE_FIELD
+	bytes_bekannt += 1024ull*(19ull+12ull)*4ull; // ★ 04.10.2026 KRAFT-P1: kp1_f + kp1_u, feste 1024 Gruppen = 0,12 MB (Spaetpuffer, entsteht am ersten Kraftsample)
+#endif // FORCE_FIELD
 	uint memory_required = (uint)(bytes_bekannt/1048576ull); // in MB
 	// D1: RESERVE. ★ Pruefagent A-1: die Pruefung sieht `device_info.memory`, also den
 	// GESAMTspeicher -- `memory_used` wird hier nicht abgezogen (und Device_Info ist eine Kopie,
@@ -3324,8 +4309,23 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 #endif // BENCHMARK
 
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->rho.enqueue_write_to_device();
-	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->u.enqueue_write_to_device();
+	for(uint d=0u; d<get_D(); d++) {
+		if(lbm_domain[d]->u_rand_on) { // ★ 04.10.2026 U_RAND: Spiegel packen, Kopf schreiben, kompakt hochladen; danach Selbsttest (Bijektion, Kopf-Gegenlese)
+			if(!lbm_domain[d]->ur_alloziert) print_error("U_RAND: initialize vor alloc_u_rand -- der Setup muss alloc_u_rand vor run(0) rufen.");
+			lbm_domain[d]->ur_setup = false; // ★ U1b: ab hier ist das Geraet die Wahrheit; Stempel ungueltig bis zur ersten Lesung
+			lbm_domain[d]->ur_t_kompakt = ~0ull; lbm_domain[d]->ur_t_voll = ~0ull; lbm_domain[d]->ur_t_ebene = ~0ull; lbm_domain[d]->ur_t_saeule = ~0ull;
+			lbm_domain[d]->ur_packen();
+			lbm_domain[d]->ur_kopf_in_puffer();
+			lbm_domain[d]->u.write_to_device();
+			const uint ur_bad = lbm_domain[d]->ur_selbsttest()+(lbm_domain[d]->ur_init_waechter()>0ull ? 1u : 0u); // ★ U1d: Init-Regel-Waechter
+			if(ur_bad>0u) print_error("U_RAND SELBSTTEST/INIT-REGEL: Beanstandung(en) -- siehe oben. Lauf nicht gestartet.");
+			lbm_domain[d]->ur_spiegel_init_nachziehen(); // ★ 05.10.2026 Korrektur A-N2: Spiegel wie der Kernel an gespeicherten reinen Innensolids auf 0
+		} else lbm_domain[d]->u.enqueue_write_to_device();
+	}
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->flags.enqueue_write_to_device();
+	for(uint d=0u; d<get_D(); d++) if(lbm_domain[d]->flags4_pruef) { // ★ 05.10.2026 FLAGS4 (Plan C.4): Geraet gegen Host direkt nach dem Hochladen (testet Packer, Upload und fl())
+		if(lbm_domain[d]->flags4_geraeteprobe("nach dem Hochladen", true)>0u) print_error("FLAGS4 GERAETEPROBE nach dem Hochladen: Geraeteinhalt weicht vom Hostfeld ab -- siehe Zeile darueber. Lauf nicht gestartet.");
+	}
 #ifdef FORCE_FIELD
 #ifndef PARTICLES
 	// ★ F-Waechter (Wirkpfad-Absicherung des F-Null-Read-Gates, Bein 1): das Gate behauptet
@@ -3379,6 +4379,9 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 #endif // SURFACE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_initialize(); // odd time step is baked-in the kernel
 	communicate_rho_u_flags();
+	for(uint d=0u; d<get_D(); d++) if(lbm_domain[d]->flags4_pruef) { // ★ 05.10.2026 FLAGS4: nach initialize (TYPE_MS ueber st_fl gesetzt): Kernel-Dekodierung gegen die Host-Entpackung desselben Geraeteinhalts, dazu die MS-Zahl (Soll = Byte-Arm)
+		if(lbm_domain[d]->flags4_geraeteprobe("nach initialize", false)>0u) print_error("FLAGS4 GERAETEPROBE nach initialize: Kernel-Dekodierung und Host-Entpackung weichen ab -- siehe Zeile darueber. Lauf nicht gestartet.");
+	}
 #ifdef SURFACE
 	communicate_phi_massex_flags();
 #endif // SURFACE
@@ -3393,6 +4396,7 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 }
 
 void LBM::do_time_step(const bool sync_single_gpu) { // call kernel_stream_collide to perform one LBM time step
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->profil_schritt_beginnen(); // ★ 03.10.2026 CFD_GPU_PROFIL: Schrittgrenze (No-Op ohne Schalter)
 #ifdef SURFACE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_surface_0();
 #endif // SURFACE
@@ -3460,6 +4464,7 @@ void LBM::do_time_step(const bool sync_single_gpu) { // call kernel_stream_colli
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_integrate_particles(); // intgegrate particles forward in time and couple particles to fluid
 	communicate_particles(); // communicate_F() is not required in do_time_step()
 #endif // PARTICLES
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->profil_schritt_beenden(); // ★ 03.10.2026 CFD_GPU_PROFIL: letzter Launch des Schritts liegt in der Queue (No-Op ohne Schalter)
 	// FORK: sync_single_gpu=false ueberspringt diese Barriere -- dann wartet run_async() nicht, und der Aufrufer
 	// setzt die Barriere selbst per finish(). Im Mehr-Domaenen-Fall liefern die communicate_*-Aufrufe die Barrieren ohnehin.
 	if(sync_single_gpu && get_D()==1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // this additional domain synchronization barrier is only required in single-GPU, as communication calls already provide all necessary synchronization barriers in multi-GPU
@@ -3487,6 +4492,7 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 		clock.start();
 		do_time_step();
 		info.update(clock.stop());
+		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->profil_auswerten(); // ★ 03.10.2026 CFD_GPU_PROFIL: hinter der Schrittbarriere (D==1) und hinter info.update -- die Auswertung steckt NICHT im gemessenen dt; No-Op ohne Schalter
 	}
 	if(get_D()>1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // wait for everything to finish (multi-GPU only)
 }
@@ -3496,13 +4502,16 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 // auf der dGPU ihre r Unterschritte macht. Wer danach rho/u/flags/fi liest, MUSS vorher finish() rufen.
 void LBM::run_async(const ulong steps) {
 	if(!initialized) { print_error("LBM::run_async vor der Initialisierung aufgerufen. Erst run() einmal rufen, dann run_async."); return; }
-	info.append(steps, max_ulong, get_t());
+	// ★ 03.10.2026: hier stand info.append(steps, max_ulong, get_t()). Das setzte in JEDEM Aussenschritt steps, steps_last und
+	// runtime_total_last der Laufzeile zurueck (Prozent und Restzeit sprangen) -- mit der Schrittzahl des FERNfelds, waehrend die
+	// Schrittzeit aus dem Nahfeld kam. Der einzige Aufrufer (fahrzeug_dd) bindet die Laufzeile jetzt per info.lauf_binden() ans Nahfeld.
 	for(ulong i=1ull; i<=steps; i++) do_time_step(false);
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->flush_queue(); // Perf-Audit 2026-08-20: ohne Flush haengt die Submission am NEO-Treiberverhalten -- der iGPU-Overlap war bisher Glueck, jetzt Garantie
 }
 
 void LBM::finish() { // FORK: Barriere ueber alle Warteschlangen dieser LBM-Instanz
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->profil_auswerten(); // ★ 03.10.2026 CFD_GPU_PROFIL: hinter der Barriere (run_async-Schritte); No-Op ohne Schalter
 }
 
 void LBM::update_fields() { // update fields (rho, u, T) manually
@@ -3657,7 +4666,7 @@ void LBM_Domain::set_pressure_outlet_faces(const uint face_mask, const float rho
 	po_part = Memory<float>(device, (ulong)po_groups);
 	kernel_po_reduce_mean = Kernel(device, (ulong)N_po, "po_reduce_mean", rho, po_interior, N_po, po_part);
 	kernel_po_final_mean  = Kernel(device, 1ull, "po_final_mean", po_part, po_groups, N_po, po_mean);
-	kernel_apply_pressure_outlet = Kernel(device, (ulong)N_po, "apply_pressure_outlet", u, rho, po_cells, po_interior, N_po, po_rho, po_sigma, po_mean, po_hart);
+	kernel_apply_pressure_outlet = Kernel(device, (ulong)N_po, "apply_pressure_outlet", u, rho, po_cells, po_interior, N_po, po_rho, po_sigma, po_mean, po_hart, rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: hits (Pos. 9, Slot 484 unter U_RAND)
 	print_info("Druck-Auslass REDUKTION: "+to_string(N_po)+" Innenzellen in "+to_string(po_groups)+" Arbeitsgruppen, Endsumme in Indexordnung (atomikfrei, bitreproduzierbar seit 2026-08-24).");
 	print_info(po_hart ? ("Druck-Auslass: HARTE Klemme rho = "+to_string(po_rho,4u)+" je Zelle (CFD_PO_HART=1, der alte Zustand als Kontrollarm), u aus der Innenzelle.")
 		: ("Druck-Auslass: rho_out = "+to_string(po_rho,4u)+" als FLAECHENMITTEL verankert (Ankerrate sigma = "+to_string(po_sigma,4u)
@@ -3743,8 +4752,11 @@ bool LBM::plane_fits(const PlaneSpec& plane, const char* who) const {
 	return true;
 }
 
-void LBM::extract_plane_macros(const PlaneSpec& plane, std::vector<float>& host_buf) {
+void LBM::extract_plane_macros(const PlaneSpec& plane, std::vector<float>& host_buf, const bool u_verwerfen) {
 	LBM_Domain* dom = lbm_domain[0];
+	// ★ 05.10.2026 Korrektur C-N2: unter U_RAND tragen die u-Spalten an ungespeicherten Zellen den Papierkorb (0). Der einzige Nahfeld-Aufrufer
+	// (lese_yslice_in_host) verwirft u und holt es aus V; jeder andere Aufrufer bekaeme still 0 -- deshalb muss er das Verwerfen ausdruecklich zusagen.
+	if(dom->u_rand_on&&!u_verwerfen) print_error("extract_plane_macros auf einer U_RAND-Domaene: u ist dort an ungespeicherten Zellen 0 (Papierkorb). Nur mit u_verwerfen = true (wie lese_yslice_in_host) aufrufen (Pruefbefund C-N2).");
 	const ulong n_plane = (ulong)plane.extent_a*(ulong)plane.extent_b;
 	if(!plane_fits(plane, "extract_plane_macros")) return;
 	if(dom->coupling_max_plane_cells==0ull) { print_error("extract_plane_macros ohne alloc_coupling_planes."); return; }
@@ -3766,7 +4778,7 @@ void LBM_Domain::alloc_rho_ausgabe(const ulong max_plane_cells) {
 	if(rho_aus_max>0ull) { print_error("alloc_rho_ausgabe: Vergroesserung eines gebundenen Puffers ist die Use-after-free-Klasse -- einmal gross genug anlegen."); return; }
 	rho_aus_max = max_plane_cells;
 	rho_aus = Memory<float>(device, max_plane_cells, 1u);
-	kernel_rho_ausgabe_ebene = Kernel(device, max_plane_cells, "rho_ausgabe_ebene", fi, rho, flags, t, rho_aus, 0u, 0u, 0u, 0u, 1u, 1u, 0u, rho_clamp_hits); // fi 0, rho 1, flags 2, t 3, out 4, Ebene 5..10, zaehlen 11, hits 12, tile_slot 13
+	kernel_rho_ausgabe_ebene = Kernel(device, max_plane_cells, "rho_ausgabe_ebene", fi, rho, flags.k(), t, rho_aus, 0u, 0u, 0u, 0u, 1u, 1u, 0u, rho_clamp_hits); // fi 0, rho 1, flags 2, t 3, out 4, Ebene 5..10, zaehlen 11, hits 12, tile_slot 13
 	if(sparse_on) kernel_rho_ausgabe_ebene.add_parameters(tile_slot); // Guard wie im Kernel (Falle 8)
 	print_info("rho-Ausgabe (RHO_RAND C2a, Nachkollisionssumme): Puffer fuer "+to_string(max_plane_cells)+" Ebenenzellen = "+to_string((float)(4ull*max_plane_cells)/1.0e6f,2u)+" MB auf "+device.info.name+".");
 }
@@ -3853,6 +4865,49 @@ void LBM::rho_rek_ebene(const PlaneSpec& plane, const ulong t_rek, const uint mo
 // (4-mm-Nahdomaene: ~14 MB statt ~8,65 GB je Slice-Ereignis). Wertgleichheit per Konstruktion:
 // identische floats, Indexkonvention exakt plane_cell_index (x + y*Nx + z*Nx*Ny).
 // ★ 15.09.2026 RHO_RAND C2c: Fassade im RAND-Betrieb (lbm.hpp, Rho_Feld).
+// ★ 04.10.2026 U_RAND U1a: Fassade im RAND-Betrieb. c ist der volle Hostspiegel der Domaene (u_spiegel), der Geraetepuffer ist kompakt.
+void LBM::U_Feld::binde_rand(LBM* l) {
+	lbm_ = l; rand = true;
+	if(l->get_D()!=1u) print_error("U_RAND: U_Feld nur fuer eine Domaene gebaut.");
+}
+void LBM::U_Feld::read_rand() {
+	LBM_Domain* d = lbm_->lbm_domain[0];
+	d->u.read_from_device(); // Zero-Copy: read_from_device erzwingt finish (opencl.hpp)
+	if(!d->ur_alloziert) return; // vor alloc_u_rand (Voxelierung): Platzhalter, Spiegel bleibt Setup-Stand
+	d->ur_streuen();
+	d->ur_t_kompakt = lbm_->get_t(); // ★ U1b: gespeicherte Zellen gelten bei t
+	if(d->ur_modus==1u) d->ur_t_voll = lbm_->get_t(); // Modus 1: jede Zelle hat einen Slot
+}
+void LBM::U_Feld::pruefe_schreiben(const ulong n) const { // ★ 05.10.2026 Korrektur A-N3: Schreibsperre fuer u.x[n] = v nach initialize
+	const LBM_Domain* d = lbm_->lbm_domain[0];
+	if(d->ur_setup) return; // vor initialize ist der Spiegel die Wahrheit (ur_packen nimmt jeden Wert mit)
+	if(d->ur_idx_host(n)>=d->ur_P) {
+		const uint Nx = lbm_->get_Nx(), Ny = lbm_->get_Ny();
+		print_error("U_RAND: Hostschreibzugriff auf u an ("+to_string((uint)(n%(ulong)Nx))+","+to_string((uint)((n/(ulong)Nx)%(ulong)Ny))+","+to_string((uint)(n/((ulong)Nx*(ulong)Ny)))+") nach initialize -- die Zelle hat keinen Slot im kompakten Puffer, der Wert ginge beim naechsten write_to_device still verloren (Pruefbefund A-N3).");
+	}
+}
+void LBM::U_Feld::pruefe_zugriff(const ulong n) const { // ★ 04.10.2026 U_RAND U1b: Zugriffssperre (Plan B.5)
+	const LBM_Domain* d = lbm_->lbm_domain[0];
+	if(d->ur_setup) return;
+	const ulong t = lbm_->get_t();
+	if(d->ur_t_voll==t) return;
+	const uint Nx = lbm_->get_Nx(), Ny = lbm_->get_Ny();
+	const uint x = (uint)(n%(ulong)Nx), y = (uint)((n/(ulong)Nx)%(ulong)Ny), z = (uint)(n/((ulong)Nx*(ulong)Ny));
+	if(d->ur_t_ebene==t&&y==d->ur_ebene_y) return;
+	if(d->ur_t_saeule==t&&x==d->ur_saeule_x&&y==d->ur_saeule_y&&z<d->ur_saeule_zn) return;
+	if(d->ur_t_kompakt==t&&d->ur_idx_host(n)<d->ur_P) return;
+	print_error("U_RAND: Hostzugriff auf u an ("+to_string(x)+","+to_string(y)+","+to_string(z)+") bei t="+to_string(t)+" -- weder VOLL ("+to_string(d->ur_t_voll)+") noch kompakt mit Slot ("+to_string(d->ur_t_kompakt)+") noch Ebene y="+to_string(d->ur_ebene_y)+" ("+to_string(d->ur_t_ebene)+") noch Saeule ("+to_string(d->ur_t_saeule)+"). Zugriffssperre: der Leseplan deckt diese Lesung nicht.");
+}
+void LBM::U_Feld::write_rand() {
+	LBM_Domain* d = lbm_->lbm_domain[0];
+	// ★ 05.10.2026 Korrektur B-M1: ur_packen packt den GANZEN Spiegel in alle gespeicherten Slots. Nach initialize gilt der Spiegel dort aber nur,
+	// wenn er bei t vollstaendig aus dem kompakten Puffer gestreut wurde (read_rand -> ur_t_kompakt == t); sonst schriebe der Upload alte Werte
+	// (z. B. R1/A aus einer frueheren VOLL-Lesung) still ins Feld. Die Schreibrichtung steht damit unter derselben Sperre wie das Lesen.
+	if(!d->ur_setup&&d->ur_t_kompakt!=lbm_->get_t()) print_error("U_RAND: u.write_to_device() bei t="+to_string(lbm_->get_t())+" ohne vollstaendig gueltigen Spiegel (letzte kompakte Lesung bei t="+to_string(d->ur_t_kompakt)+") -- vorher u.read_from_device() bei demselben t (Pruefbefund B-M1).");
+	d->ur_packen();
+	d->ur_kopf_in_puffer();
+	d->u.write_to_device();
+}
 void LBM::Rho_Feld::binde_rand(LBM* l) {
 	lbm_ = l; rand = true;
 	if(l->get_D()!=1u) print_error("RHO_RAND: Rho_Feld nur fuer eine Domaene gebaut.");
@@ -3887,7 +4942,186 @@ void LBM::rho_schicht_in_host(const uint z, const bool zaehlen) {
 	rho_ausgabe_ebene(plane, get_t()-1ull, zaehlen, w);
 	rho.setze_ebene(2u, z, get_t(), w);
 }
-
+// ★ 04.10.2026 U_RAND U1c: nach dem Grobschritt mit Leseplan. R1-Zellen kommen aus dem KOMPAKTEN Puffer (dort wirken die Schreiber NACH
+// stream_collide: apply_pressure_outlet an po_cells, alle in R1), alle anderen Nicht-Solid-Zellen aus V (Wert von stream_collide; ausserhalb
+// R1 schreibt danach niemand). Solid ist statisch (Spiegel). Stempel: Ebene/Saeule/VOLL bei t. Pruefarm (Modus 1): V gegen kompakt.
+// ★ 05.10.2026 Korrektur H1 (Plan B.15): faellt VOLL mit Ebene und/oder Saeule in denselben Grobschritt (bits 12/24/28), dann liegt V im
+// SCHEIBENLAYOUT der letzten VOLL-Scheibe (n - za*NxNy), und ur_voll_scheiben hat ALLE Nicht-R1-Fluidzellen -- Ebene und Saeule
+// eingeschlossen -- schon richtig gestreut. Dann gibt es hier fuer Ebene/Saeule KEINE V-Lesung und KEIN Ueberschreiben, nur die Stempel,
+// und Soll [489] steigt nicht (der Kernel zaehlt diese Zellen unter VOLL in [490]). Vorher las dieser Block V im Ebenen-/Saeulenlayout
+// und ueberschrieb die richtigen Werte (Pruefbefund H1: Saeule 6 Zellen, Ebene transponierte Horizontalschicht, Stempel "gueltig").
+// ★ 05.10.2026 Korrektur M3: V GEGEN KOMPAKT in JEDEM Modus (s. unten), faengt H1 und den Vektorisierer-Befund an gespeicherten Zellen.
+void LBM::u_rand_ausgabe() {
+	LBM_Domain* d = lbm_domain[0];
+	if(!d->u_rand_on||d->ur_plan_lauf==0u) return;
+	const ulong t = get_t();
+	if(t!=d->ur_plan_t) print_error("U_RAND: u_rand_ausgabe bei t="+to_string(t)+", der Leseplan lief aber bei t="+to_string(d->ur_plan_t)+".");
+	const uint bits = d->ur_plan_lauf;
+	d->ur_plan_lauf = 0u;
+	d->ur_n_bits[(bits>>2)&7u]++;
+	const ulong N = get_N(), NxNy = (ulong)Nx*(ulong)Ny;
+	const ulong DO = d->ur_DOFF, US = d->ur_US, VO = d->ur_VOFF;
+	const uchar* fl = d->flags.data();
+	velxx* m = d->u_spiegel.data(); velxx* cb = d->u.data();
+	auto in_r1 = [&](const uint x, const uint y, const uint z) { return x<2u||x+2u>=Nx||y<2u||y+2u>=Ny||z<2u||z+2u>=Nz; };
+	const bool ebene_ = (bits&4u)!=0u;
+	const bool voll_ = (bits&8u)!=0u;
+	const bool saeule_ = (bits&16u)!=0u;
+	const bool haken5 = d->ur_haken==5u&&voll_&&(ebene_||saeule_); // TESTHAKEN 5: H1 nachstellen (alter Pfad), Soll: V gegen kompakt >= 1
+	if((bits&12u)!=0u) for(uint kk=0u; kk<3u; kk++) d->u.read_from_device(DO+(ulong)kk*US, d->ur_R1N); // R1-Segment
+	if((!voll_&&(ebene_||saeule_))||haken5) for(uint kk=0u; kk<3u; kk++) d->u.read_from_device(DO+(ulong)kk*US+VO, ebene_ ? (ulong)Nx*(ulong)Nz : (ulong)d->ur_saeule_zn); // V: Ebene (x + z*Nx) oder Saeule (z) -- NUR ohne VOLL (H1)
+	if(d->ur_vbox_aktiv) d->ur_vbox(0u, 0u, 0u, 0u, 0u, 0u);
+	const uint vy = d->ur_v_y;
+	if(ebene_) { // Ebene
+		if(!voll_) for(uint z=0u; z<Nz; z++) for(uint x=0u; x<Nx; x++) {
+			const ulong n = (ulong)x+((ulong)vy+(ulong)z*(ulong)Ny)*(ulong)Nx;
+			if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S) continue;
+			if((fl[n]&(TYPE_S|TYPE_E))!=TYPE_E) d->ur_soll_489++; // ★ 05.10.: TYPE_E kehrt in stream_collide vor dem U_RAND-Block zurueck (schreibt kein V); gestreut wird es aus R1
+			const ulong q = in_r1(x, vy, z) ? DO+rr_idx_host(n, Nx, Ny, Nz) : DO+VO+(ulong)x+(ulong)z*(ulong)Nx;
+			for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = cb[q+(ulong)kk*US];
+		}
+		d->ur_t_ebene = t; d->ur_ebene_y = vy; d->ur_n_ebene++;
+	}
+	if(saeule_) { // Saeule (liegt in der Ebene y = vy; ohne Ebene eigene V-Box mit Index z)
+		const uint sx = d->ur_saeule_x, sy = d->ur_saeule_y, zn = d->ur_saeule_zn;
+		if(!voll_) for(uint z=0u; z<zn; z++) {
+			const ulong n = (ulong)sx+((ulong)sy+(ulong)z*(ulong)Ny)*(ulong)Nx;
+			if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S) continue;
+			if(!ebene_&&(fl[n]&(TYPE_S|TYPE_E))!=TYPE_E) d->ur_soll_489++; // ★ 05.10.: TYPE_E schreibt kein V (s. Ebene)
+			const bool r1_ = in_r1(sx, sy, z);
+			const ulong q = r1_ ? DO+rr_idx_host(n, Nx, Ny, Nz) : DO+VO+(ebene_ ? (ulong)sx+(ulong)z*(ulong)Nx : (ulong)z);
+			if(r1_&&(bits&12u)==0u) for(uint kk=0u; kk<3u; kk++) d->u.read_from_device(q+(ulong)kk*US, 1ull); // R1-Zelle der Saeule einzeln (das R1-Segment wird nur fuer Ebene/VOLL gelesen)
+			for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = cb[q+(ulong)kk*US];
+		}
+		d->ur_t_saeule = t; d->ur_n_saeule++;
+	}
+	if(voll_) { // VOLL: Nicht-R1 hat ur_voll_scheiben schon gestreut (Ebene und Saeule eingeschlossen); hier R1
+		parallel_for(N, [&](ulong n) {
+			const uint x = (uint)(n%(ulong)Nx), y = (uint)((n/(ulong)Nx)%(ulong)Ny), z = (uint)(n/NxNy);
+			if(!in_r1(x, y, z)||(fl[n]&(TYPE_S|TYPE_E))==TYPE_S) return;
+			const ulong q = DO+rr_idx_host(n, Nx, Ny, Nz);
+			for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = cb[q+(ulong)kk*US];
+		});
+		d->ur_t_voll = t;
+	}
+	if(haken5) { // TESTHAKEN 5: genau der Pfad vor der Korrektur H1 -- Nicht-R1-Zellen der Ebene (bzw. der Saeule) aus V im falschen Layout
+		ulong k5 = 0ull;
+		if(ebene_) {
+			for(uint z=0u; z<Nz; z++) for(uint x=0u; x<Nx; x++) {
+				const ulong n = (ulong)x+((ulong)vy+(ulong)z*(ulong)Ny)*(ulong)Nx;
+				if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S||in_r1(x, vy, z)) continue;
+				for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = cb[DO+VO+(ulong)x+(ulong)z*(ulong)Nx+(ulong)kk*US];
+				k5++;
+			}
+		} else {
+			for(uint z=0u; z<d->ur_saeule_zn; z++) {
+				const ulong n = (ulong)d->ur_saeule_x+((ulong)d->ur_saeule_y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+				if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S||in_r1(d->ur_saeule_x, d->ur_saeule_y, z)) continue;
+				for(uint kk=0u; kk<3u; kk++) m[(ulong)kk*N+n] = cb[DO+VO+(ulong)z+(ulong)kk*US];
+				k5++;
+			}
+		}
+		println("U_RAND-TESTHAKEN 5: H1 nachgestellt bei t "+to_string(t)+" bits "+to_string(bits)+": "+to_string(k5)+" Nicht-R1-Zellen der "+string(ebene_?"Ebene":"Saeule")+" aus V im falschen Layout ueberschrieben. Soll: V gegen kompakt meldet >= 1 Abweichung.");
+	}
+	ulong n_haken2 = ~0ull; // TESTHAKEN 2: erste gespeicherte Nicht-R1-Fluidzelle der Ebene (Modus 1: jede Zelle hat einen Slot -> dieselbe Zelle wie vor der Korrektur)
+	if(d->ur_haken==2u&&ebene_) {
+		for(uint z=0u; z<Nz&&n_haken2==~0ull; z++) for(uint x=0u; x<Nx; x++) {
+			const ulong n = (ulong)x+((ulong)vy+(ulong)z*(ulong)Ny)*(ulong)Nx;
+			if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S||in_r1(x, vy, z)||d->ur_idx_host(n)>=d->ur_P) continue;
+			n_haken2 = n;
+			break;
+		}
+	}
+	if(n_haken2!=~0ull) { m[n_haken2] = (velxx)(m[n_haken2]^1u); println("U_RAND-TESTHAKEN 2: ein Wort der Ebene im Spiegel um ein Bit veraendert. Soll: Pruefarm und V gegen kompakt melden je >= 1 Abweichung."); }
+	{	// ★ 05.10.2026 Korrektur M3 (Plan B.15): V GEGEN KOMPAKT, in JEDEM Modus. Verglichen werden die GESPEICHERTEN Nicht-R1-Fluidzellen des
+		// Lesebereichs: der Spiegel NACH allen Streuungen (also genau das, was VTK/Slice/Sonde/Hash gleich lesen) gegen den kompakten Puffer,
+		// den stream_collide im selben Schritt geschrieben hat (ausserhalb R1 schreibt danach niemand). R1 kommt ohnehin aus dem kompakten
+		// Puffer und waere eine Tautologie. Kosten: VOLL liest das A-Segment einmal (3*AN*2 B; 8 mm Modus 3 ~114 MB, 4 mm ~950 MB gegen
+		// ~3,7 GB V-Transfer der VOLL selbst); Ebene/Saeule lesen nur die Slotbereiche ihrer gespeicherten Zellen (zusammengefasst bis 32768
+		// Slots Luecke, nicht blockierend eingereiht, ein finish). Der Vergleich selbst ist ein Hostdurchlauf. Zeit und Bytes in die Abnahme.
+		const auto t0_ = std::chrono::steady_clock::now();
+		const ulong R1N = d->ur_R1N, AN = d->ur_AN, P = d->ur_P;
+		std::atomic<ulong> anz(0ull), abw(0ull);
+		ulong bytes_ = 0ull, ber_ = 0ull;
+		if(voll_) {
+			if(AN>0ull) {
+				for(uint kk=0u; kk<3u; kk++) d->u.read_from_device(DO+(ulong)kk*US+R1N, AN, false);
+				bytes_ += 3ull*AN*(ulong)sizeof(velxx);
+				ber_ += 1ull;
+			}
+			d->finish_queue();
+			// Nur die A-Box ohne R1 durchlaufen (ausserhalb hat keine Nicht-R1-Zelle einen Slot), z-Schichten je Faden, Zaehler je Faden:
+			// die erste Fassung (parallel_for ueber alle N mit einem Atomic je Zelle) kostete 1,0 s je VOLL bei 8 mm (urk_b70_z3).
+			const uint* k_ = d->ur_kopf.data();
+			const uint bx0 = max(k_[ur_k::AX0], 2u), bx1 = min(k_[ur_k::AX0]+k_[ur_k::ANX], Nx-2u);
+			const uint by0 = max(k_[ur_k::AY0], 2u), by1 = min(k_[ur_k::AY0]+k_[ur_k::ANY], Ny-2u);
+			const uint bz0 = max(k_[ur_k::AZ0], 2u), bz1 = min(k_[ur_k::AZ0]+k_[ur_k::ANZ], Nz-2u);
+			const uint T_ = max(1u, (uint)std::thread::hardware_concurrency());
+			std::vector<ulong> anz_t((size_t)T_*8u, 0ull), abw_t((size_t)T_*8u, 0ull); // je Faden eine eigene Cachezeile
+			if(bx0<bx1&&by0<by1&&bz0<bz1) parallel_for((ulong)(bz1-bz0), T_, [&](ulong zi, uint th) {
+				const uint z = bz0+(uint)zi;
+				ulong a_ = 0ull, b_ = 0ull;
+				for(uint y=by0; y<by1; y++) for(uint x=bx0; x<bx1; x++) {
+					const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+					if((fl[n]&(TYPE_S|TYPE_E))==TYPE_S) continue;
+					const ulong s = d->ur_idx_host(n);
+					if(s>=P) continue;
+					a_++;
+					for(uint kk=0u; kk<3u; kk++) if(m[(ulong)kk*N+n]!=cb[DO+(ulong)kk*US+s]) { b_++; break; }
+				}
+				anz_t[(size_t)th*8u] += a_;
+				abw_t[(size_t)th*8u] += b_;
+			});
+			for(uint th=0u; th<T_; th++) { anz += anz_t[(size_t)th*8u]; abw += abw_t[(size_t)th*8u]; }
+		} else if(ebene_||saeule_) {
+			std::vector<std::pair<ulong, ulong>> sz; // (Slot, Zelle)
+			auto nimm = [&](const uint x, const uint y, const uint z) {
+				const ulong n = (ulong)x+((ulong)y+(ulong)z*(ulong)Ny)*(ulong)Nx;
+				if(in_r1(x, y, z)||(fl[n]&(TYPE_S|TYPE_E))==TYPE_S) return;
+				const ulong s = d->ur_idx_host(n);
+				if(s<P) sz.push_back(std::make_pair(s, n));
+			};
+			if(ebene_) { for(uint z=0u; z<Nz; z++) for(uint x=0u; x<Nx; x++) nimm(x, vy, z); }
+			else { for(uint z=0u; z<d->ur_saeule_zn; z++) nimm(d->ur_saeule_x, d->ur_saeule_y, z); }
+			std::sort(sz.begin(), sz.end());
+			size_t i = 0u;
+			while(i<sz.size()) {
+				const ulong s0 = sz[i].first;
+				ulong s1 = s0;
+				size_t j = i+1u;
+				while(j<sz.size()&&sz[j].first<=s1+32768ull) { s1 = sz[j].first; j++; }
+				for(uint kk=0u; kk<3u; kk++) d->u.read_from_device(DO+(ulong)kk*US+s0, s1-s0+1ull, false);
+				bytes_ += 3ull*(s1-s0+1ull)*(ulong)sizeof(velxx);
+				ber_ += 1ull;
+				i = j;
+			}
+			d->finish_queue();
+			for(const std::pair<ulong, ulong>& e : sz) {
+				anz++;
+				for(uint kk=0u; kk<3u; kk++) if(m[(ulong)kk*N+e.second]!=cb[DO+(ulong)kk*US+e.first]) { abw++; break; }
+			}
+		}
+		const double dt_ = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0_).count();
+		d->ur_vgl_n += anz.load(); d->ur_vgl_abw += abw.load(); d->ur_vgl_bytes += bytes_; d->ur_vgl_bereiche += ber_; d->ur_vgl_s += dt_;
+		if(voll_||abw.load()>0ull) println("U_RAND V-GEGEN-KOMPAKT t "+to_string(t)+" bits "+to_string(bits)+" verglichen "+to_string(anz.load())+" abweichend "+to_string(abw.load())+" (Soll 0"+string(d->ur_haken==5u||d->ur_haken==2u?", Testhaken: >= 1":"")+") gelesen "+to_string((float)((double)bytes_/1.0e6),2u)+" MB in "+to_string(ber_)+" Bereichen, "+to_string((float)(dt_*1000.0),1u)+" ms");
+	}
+	if(d->ur_pruef>0u&&d->ur_modus==1u) { // PRUEFARM: im Modus 1 hat JEDE Zelle einen Slot -- V/Spiegel muss wortgleich zum kompakten Puffer sein
+		d->u.read_from_device(); // voller kompakter Puffer (Zero-Copy: finish)
+		std::atomic<ulong> abw(0ull), anz(0ull);
+		parallel_for(N, [&](ulong n) {
+			const uint x = (uint)(n%(ulong)Nx), y = (uint)((n/(ulong)Nx)%(ulong)Ny), z = (uint)(n/NxNy);
+			if(in_r1(x, y, z)||(fl[n]&(TYPE_S|TYPE_E))==TYPE_S) return;
+			const bool drin = (bits&8u)!=0u||((bits&4u)!=0u&&y==vy)||((bits&16u)!=0u&&x==d->ur_saeule_x&&y==d->ur_saeule_y&&z<d->ur_saeule_zn);
+			if(!drin) return;
+			anz++;
+			const ulong s = d->ur_idx_host(n);
+			for(uint kk=0u; kk<3u; kk++) if(m[(ulong)kk*N+n]!=cb[DO+(ulong)kk*US+s]) { abw++; break; }
+		});
+		d->ur_pruef_n += anz.load(); d->ur_pruef_abw += abw.load();
+		println("U_RAND PRUEFARM t "+to_string(t)+" bits "+to_string(bits)+" verglichen "+to_string(anz.load())+" abweichend "+to_string(abw.load())+" (Soll 0"+string(d->ur_haken==2u?", Testhaken 2: >= 1":"")+")");
+	}
+	if(n_haken2!=~0ull) m[n_haken2] = (velxx)(m[n_haken2]^1u); // zuruecknehmen, die Ausgabe bleibt unverfaelscht
+}
 void LBM::lese_yslice_in_host(const uint y) {
 	LBM_Domain* dom = lbm_domain[0];
 #ifndef UPDATE_FIELDS
@@ -3896,7 +5130,7 @@ void LBM::lese_yslice_in_host(const uint y) {
 	PlaneSpec plane; plane.origin = uint3(0u, y, 0u); plane.extent_a = Nx; plane.extent_b = Nz; plane.axis = 1u;
 	static std::vector<float> ebene; // sequenzielle Nutzung im Hauptthread; vor jedem Aufruf geleert
 	ebene.clear();
-	extract_plane_macros(plane, ebene);
+	extract_plane_macros(plane, ebene, dom->u_rand_on); // ★ C-N2: unter U_RAND wird u unten verworfen (kommt aus V)
 	const ulong n_plane = (ulong)Nx*(ulong)Nz;
 	if(ebene.size()<n_plane*4ull) return; // Verteidigung: heute unerreichbar (jeder Wrapper-Abbruch endet in print_error/exit), bleibt fuer den Fall, dass print_error je nicht-fatal wird (Auditor-A NIEDRIG-1)
 	dom->kernel_extract_plane_flags.set_ranges(n_plane);
@@ -3910,9 +5144,10 @@ void LBM::lese_yslice_in_host(const uint y) {
 		const ulong n = (ulong)x + ((ulong)y + (ulong)z*(ulong)Ny)*(ulong)Nx;         // Domaenen-Index
 		const ulong o = g*4ull;
 		if(!dom->rho_rand_on) rho.set(n, ebene[o]); // ★ C2c: unter RHO_RAND traegt ebene[o] den NaN-Marker; rho kommt unten aus der Ausgabe
-		u.x[n] = ebene[o+1ull]; u.y[n] = ebene[o+2ull]; u.z[n] = ebene[o+3ull];
+		if(!dom->u_rand_on) { u.x[n] = ebene[o+1ull]; u.y[n] = ebene[o+2ull]; u.z[n] = ebene[o+3ull]; } // ★ 04.10.2026 U_RAND U1c: u der Ebene kommt aus V (Leseplan), nicht aus extract
 		flags[n] = dom->slice_flags[g];
 	}
+	if(dom->u_rand_on&&!(dom->ur_t_ebene==get_t()&&dom->ur_ebene_y==y)) print_error("U_RAND: lese_yslice_in_host("+to_string(y)+") bei t="+to_string(get_t())+", aber die Ebene ist nicht aus dem Leseplan gestempelt (Ebene y="+to_string(dom->ur_ebene_y)+" bei t="+to_string(dom->ur_t_ebene)+"). Leseplan und Slice-Kadenz laufen auseinander.");
 	if(dom->rho_rand_on) { // ★ 15.09. RHO_RAND C2c: rho der Ebene als Nachkollisionssumme (Entscheidung (b)); der erste Aufruf wird gezaehlt
 		std::vector<float> w;
 		const bool zaehlen = rho_aus_gezaehlt_zellen==0ull;
@@ -4025,6 +5260,7 @@ float3 LBM::object_torque(const float3& rotation_center, const uchar flag_marker
 
 #ifdef MOVING_BOUNDARIES
 void LBM::update_moving_boundaries() { // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+	for(uint d=0u; d<get_D(); d++) if(lbm_domain[d]->u_rand_on) print_error("U_RAND x update_moving_boundaries: nicht gebaut -- der Kernel laese ungespeicherte Solids aus dem Papierkorb (u = 0) und naehme ihnen TYPE_MS still weg. CFD_U_RAND=0 fahren (Pruefbefund C-M2).");
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_update_moving_boundaries();
 	communicate_flags();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
@@ -4324,17 +5560,17 @@ void LBM_Domain::allocate_transfer(Device& device) { // allocate all memory for 
 
 	kernel_transfer[enum_transfer_field::fi              ][0] = Kernel(device, 0ull, "transfer_extract_fi"              , 0u, t, transfer_buffer_p, transfer_buffer_m, fi);
 	kernel_transfer[enum_transfer_field::fi              ][1] = Kernel(device, 0ull, "transfer__insert_fi"              , 0u, t, transfer_buffer_p, transfer_buffer_m, fi);
-	kernel_transfer[enum_transfer_field::rho_u_flags     ][0] = Kernel(device, 0ull, "transfer_extract_rho_u_flags"     , 0u, t, transfer_buffer_p, transfer_buffer_m, rho, u, flags);
-	kernel_transfer[enum_transfer_field::rho_u_flags     ][1] = Kernel(device, 0ull, "transfer__insert_rho_u_flags"     , 0u, t, transfer_buffer_p, transfer_buffer_m, rho, u, flags);
-	kernel_transfer[enum_transfer_field::flags           ][0] = Kernel(device, 0ull, "transfer_extract_flags"           , 0u, t, transfer_buffer_p, transfer_buffer_m, flags);
-	kernel_transfer[enum_transfer_field::flags           ][1] = Kernel(device, 0ull, "transfer__insert_flags"           , 0u, t, transfer_buffer_p, transfer_buffer_m, flags);
+	kernel_transfer[enum_transfer_field::rho_u_flags     ][0] = Kernel(device, 0ull, "transfer_extract_rho_u_flags"     , 0u, t, transfer_buffer_p, transfer_buffer_m, rho, u, flags.k());
+	kernel_transfer[enum_transfer_field::rho_u_flags     ][1] = Kernel(device, 0ull, "transfer__insert_rho_u_flags"     , 0u, t, transfer_buffer_p, transfer_buffer_m, rho, u, flags.k());
+	kernel_transfer[enum_transfer_field::flags           ][0] = Kernel(device, 0ull, "transfer_extract_flags"           , 0u, t, transfer_buffer_p, transfer_buffer_m, flags.k());
+	kernel_transfer[enum_transfer_field::flags           ][1] = Kernel(device, 0ull, "transfer__insert_flags"           , 0u, t, transfer_buffer_p, transfer_buffer_m, flags.k());
 #ifdef FORCE_FIELD
 	kernel_transfer[enum_transfer_field::F               ][0] = Kernel(device, 0ull, "transfer_extract_F"               , 0u, t, transfer_buffer_p, transfer_buffer_m, F);
 	kernel_transfer[enum_transfer_field::F               ][1] = Kernel(device, 0ull, "transfer__insert_F"               , 0u, t, transfer_buffer_p, transfer_buffer_m, F);
 #endif // FORCE_FIELD
 #ifdef SURFACE
-	kernel_transfer[enum_transfer_field::phi_massex_flags][0] = Kernel(device, 0ull, "transfer_extract_phi_massex_flags", 0u, t, transfer_buffer_p, transfer_buffer_m, phi, massex, flags);
-	kernel_transfer[enum_transfer_field::phi_massex_flags][1] = Kernel(device, 0ull, "transfer__insert_phi_massex_flags", 0u, t, transfer_buffer_p, transfer_buffer_m, phi, massex, flags);
+	kernel_transfer[enum_transfer_field::phi_massex_flags][0] = Kernel(device, 0ull, "transfer_extract_phi_massex_flags", 0u, t, transfer_buffer_p, transfer_buffer_m, phi, massex, flags.k());
+	kernel_transfer[enum_transfer_field::phi_massex_flags][1] = Kernel(device, 0ull, "transfer__insert_phi_massex_flags", 0u, t, transfer_buffer_p, transfer_buffer_m, phi, massex, flags.k());
 #endif // SURFACE
 #ifdef TEMPERATURE
 	kernel_transfer[enum_transfer_field::gi              ][0] = Kernel(device, 0ull, "transfer_extract_gi"              , 0u, t, transfer_buffer_p, transfer_buffer_m, gi);

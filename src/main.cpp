@@ -72,7 +72,7 @@ void main_label(const double frametime) {
 			const int ox=camera.width-37*(FONT_WIDTH)-1, oy=camera.height-11*(FONT_HEIGHT)-1;
 			int i = 0;
 			const float Re = info.lbm->get_Re_max();
-			const double pn=(double)info.lbm->get_N(), mt=(double)(bandwidth_bytes_per_cell_device()-(info.lbm->lbm_domain[0]->rho_rand_on ? (uint)sizeof(rhoxx) : 0u)); // ★ C2c: RHO_RAND streicht die rho-Bandbreite (Entscheidung Heiko 7)
+			const double pn=(double)info.lbm->get_N(), mt=(double)bpz_konv(*info.lbm); // ★ C2c: RHO_RAND streicht die rho-Bandbreite (Entscheidung Heiko 7); ★ 03.10.2026 ueber bpz_konv (einzige Quelle)
 			draw_label(ox, oy+i, "Resolution "     +alignr(26u, /********/ to_string(info.lbm->get_Nx())+"x"+to_string(info.lbm->get_Ny())+"x"+to_string(info.lbm->get_Nz())+" = "+to_string(info.lbm->get_N())), c); i+=FONT_HEIGHT;
 			//draw_label(ox, oy+i, "Volume Force "   +alignr(16u, /***************************************************/ info.lbm->get_fx())+","+alignr(15, info.lbm->get_fy())+", "+alignr(15, info.lbm->get_fz()), c); i+=FONT_HEIGHT;
 			draw_label(ox, oy+i, "Kin. Viscosity " +alignr(22u, /***********************************************************************************************************/ to_string(info.lbm->get_nu(), 8u)), c); i+=FONT_HEIGHT;

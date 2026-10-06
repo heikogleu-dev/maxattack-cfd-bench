@@ -26,9 +26,20 @@ Linux Android: LDLIBS_X11 =
 
 Linux-X11 Linux macOS Android: bin/FluidX3D
 
-bin/FluidX3D: temp/graphics.o temp/info.o temp/kernel.o temp/lbm.o temp/lodepng.o temp/main.o temp/setup.o temp/shapes.o make.sh
+bin/FluidX3D: temp/graphics.o temp/info.o temp/kernel.o temp/lbm.o temp/lodepng.o temp/main.o temp/setup.o temp/shapes.o temp/bau_id.o make.sh
 	@mkdir -p bin
 	$(CC) temp/*.o -o bin/FluidX3D $(CFLAGS) $(LDFLAGS_OPENCL) $(LDLIBS_OPENCL) $(LDFLAGS_X11) $(LDLIBS_X11)
+
+# ★ 05.10.2026 BAU-FINGERABDRUCK (Pruefbefund FLAGS4 M1): Commit + dirty-Flag + Diff-sha1 ins Binary, Ausgabe in Lauflog und
+# code/LAUF.txt (setup.cpp sichere_lauf). Das Skript laeuft bei JEDEM make, schreibt temp/bau_id.cpp aber nur bei geaendertem
+# Inhalt neu -- unveraenderter Stand linkt nicht neu.
+.PHONY: bau_id_pruefen
+temp/bau_id.cpp: bau_id_pruefen
+	@mkdir -p temp
+	@bash werkzeuge/bau_id.sh temp/bau_id.cpp
+
+temp/bau_id.o: temp/bau_id.cpp
+	$(CC) -c temp/bau_id.cpp -o temp/bau_id.o $(CFLAGS)
 
 temp/graphics.o: src/graphics.cpp src/defines.hpp src/graphics.hpp src/lodepng.hpp src/utilities.hpp make.sh
 	@mkdir -p temp

@@ -306,10 +306,28 @@ private:
 	;}
 public:
 	Device_Info info;
+	// ★ 03.10.2026 CFD_GPU_PROFIL (Leistungsanzeige je GPU, nur fahrzeug_dd). profil_anlegen ist ein PROZESSWEITES Flag
+	// (inline static, ein Exemplar ueber alle Uebersetzungseinheiten): das Setup setzt es VOR den LBM-Konstruktoren, dann
+	// legt jede danach gebaute Device ihre Queue mit CL_QUEUE_PROFILING_ENABLE an. Ohne Schalter bleibt es false und der
+	// Konstruktor ruft exakt den bisherigen Queue-Konstruktor. profil_queue = Ist-Zustand DIESER Queue (vom Treiber
+	// zurueckgelesen, nicht angenommen). profil_ziel: solange gesetzt, haengt Kernel::enqueue_run jedes Event dort an
+	// (nur ohne event_returned des Aufrufers); nullptr = es wird nichts gesammelt (Standard und ausserhalb do_time_step).
+	static inline bool profil_anlegen = false;
+	bool profil_queue = false;
+	vector<Event>* profil_ziel = nullptr;
 	inline Device(const Device_Info& info, const string& opencl_c_code=get_opencl_c_code()) {
 		print_device_info(info);
 		this->info = info;
-		this->cl_queue = cl::CommandQueue(info.cl_context, info.cl_device); // queue to push commands for the device
+		if(!profil_anlegen) {
+			this->cl_queue = cl::CommandQueue(info.cl_context, info.cl_device); // queue to push commands for the device
+		} else { // ★ 03.10.2026 CFD_GPU_PROFIL: nur mit Schalter; Ist=Soll ueber die zurueckgelesenen Queue-Eigenschaften
+			cl_int q_err = CL_SUCCESS;
+			this->cl_queue = cl::CommandQueue(info.cl_context, info.cl_device, (cl_command_queue_properties)CL_QUEUE_PROFILING_ENABLE, &q_err);
+			if(q_err!=CL_SUCCESS) print_error("CFD_GPU_PROFIL: Profiling-Queue auf \""+info.name+"\" nicht anlegbar (CL-Fehler "+to_string(q_err)+").");
+			const cl_command_queue_properties q_ist = this->cl_queue.getInfo<CL_QUEUE_PROPERTIES>();
+			profil_queue = (q_ist&(cl_command_queue_properties)CL_QUEUE_PROFILING_ENABLE)!=0u;
+			if(!profil_queue) print_error("CFD_GPU_PROFIL: die Queue auf \""+info.name+"\" meldet KEIN CL_QUEUE_PROFILING_ENABLE -- der Messarm waere ein stiller No-Op.");
+		}
 		cl::Program::Sources cl_source;
 		const string kernel_code = enable_device_capabilities()+"\n"+opencl_c_code;
 		cl_source.push_back({ kernel_code.c_str(), kernel_code.length() });
@@ -318,7 +336,14 @@ public:
 		// ★ 16.09.2026 A2 (TODO Durchsatz-Audit): zusaetzliche Build-Optionen aus der Umgebung, z. B. CFD_OCL_OPTIONS="-cl-intel-enable-auto-large-GRF-mode"
 		// (offline belegt: stream_collide dann SIMD32/256 GRF statt SIMD16/128 auf der B70, kein Spill). Reiner Messarm; Ansage-Doktrin: wird laut gemeldet.
 		const char* ocl_extra = getenv("CFD_OCL_OPTIONS");
-		const string build_options_eff = build_options+(ocl_extra&&ocl_extra[0] ? string(" ")+ocl_extra : string(""));
+		// ★ 02.10.2026 Messarm SC_SIMD16 (Spill R1Q=4): wo der Quelltext '#define SC_SIMD16' traegt (nur das per CFD_SC_SIMD16=<id> gewaehlte Geraet),
+		// kommt der AUTO-Large-GRF-Modus dazu: mit dem SIMD16-Attribut waehlt IGC dann fuer stream_collide 256 GRF (offline B70: spill 0), die
+		// uebrigen Laufzeit-Kernel bleiben bei 128 GRF; nur voxelize_mesh (Setup) und schale_blend (im Nahfeld No-op) gehen auf SIMD32/256 (Pruefbefund
+		// SC16b N2; der erzwungene Modus -ze-opt-large-register-file hob ALLE 39 Kernel auf 256 GRF). Nur fuer Intel-GPUs: die CPU-Laufzeit lehnt die Option ab (-43).
+		const bool sc16 = opencl_c_code.find("#define SC_SIMD16")!=string::npos;
+		if(sc16&&!(info.is_gpu&&info.intel_compute_capability>0u)) print_error("SC_SIMD16 ist fuer "+info.name+" gesetzt, das ist keine Intel-GPU -- CFD_SC_SIMD16 muss die OpenCL-ID der B70 tragen (1).");
+		const string build_options_eff = build_options+(ocl_extra&&ocl_extra[0] ? string(" ")+ocl_extra : string(""))+(sc16 ? string(" -cl-intel-enable-auto-large-GRF-mode") : string(""));
+		if(sc16) print_warning("SC_SIMD16 -- MESSARM auf "+info.name+": stream_collide mit SIMD16 erzwungen, Build-Option -cl-intel-enable-auto-large-GRF-mode. Wirkpfad = Laufzeit-Spill von stream_collide (Soll 0). Bitgleichheit ist zu PRUEFEN.");
 		if(ocl_extra&&ocl_extra[0]) print_warning("CFD_OCL_OPTIONS = \""+string(ocl_extra)+"\" -- MESSARM: zusaetzliche OpenCL-Build-Optionen fuer "+info.name+" (Registerallokation/SIMD-Breite koennen sich aendern; Bitgleichheit ist zu PRUEFEN, nicht anzunehmen).");
 #ifndef LOG
 		int error = cl_program.build({ info.cl_device }, (build_options_eff+" -w").c_str()); // compile OpenCL C code, disable warnings
@@ -757,6 +782,23 @@ public:
 		:Kernel(device, N, WORKGROUP_SIZE, name, parameters...) { // delegating constructor
 	}
 	inline Kernel() {} // default constructor
+	// ★ 02.10.2026 (Pruefbefund SC16-HOCH): tatsaechlicher Register-Spill des uebersetzten Kernels zur LAUFZEIT (Intel-Erweiterung
+	// CL_KERNEL_SPILL_MEM_SIZE_INTEL = 0x4109, cl_ext.h). Trifft die offline-zeinfo-Zahlen exakt (Pruefagent, iGPU). Rueckgabe ~0ull = nicht abfragbar.
+	inline ulong spill_bytes() const {
+		cl_ulong v = 0ull;
+		const cl_int e = clGetKernelWorkGroupInfo(cl_kernel(), device->info.cl_device(), (cl_kernel_work_group_info)CL_KERNEL_SPILL_MEM_SIZE_INTEL, sizeof(cl_ulong), &v, nullptr);
+		return e==CL_SUCCESS ? (ulong)v : ~0ull;
+	}
+	inline ulong private_bytes() const {
+		cl_ulong v = 0ull;
+		const cl_int e = clGetKernelWorkGroupInfo(cl_kernel(), device->info.cl_device(), CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(cl_ulong), &v, nullptr);
+		return e==CL_SUCCESS ? (ulong)v : ~0ull;
+	}
+	inline ulong max_workgroup() const {
+		size_t v = 0u;
+		const cl_int e = clGetKernelWorkGroupInfo(cl_kernel(), device->info.cl_device(), CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &v, nullptr);
+		return e==CL_SUCCESS ? (ulong)v : 0ull;
+	}
 	inline Kernel& set_ranges(const ulong N, const ulong workgroup_size=(ulong)WORKGROUP_SIZE) {
 		this->N = N;
 		cl_range_global = cl::NDRange(((N+workgroup_size-1ull)/workgroup_size)*workgroup_size); // make global range a multiple of local range
@@ -775,7 +817,27 @@ public:
 	}
 	inline Kernel& enqueue_run(const uint t=1u, const vector<Event>* event_waitlist=nullptr, Event* event_returned=nullptr) {
 		for(uint i=0u; i<t; i++) {
-			check_for_errors(cl_queue.enqueueNDRangeKernel(cl_kernel, cl::NullRange, cl_range_global, cl_range_local, event_waitlist, event_returned));
+			if(event_returned==nullptr&&device!=nullptr&&device->profil_ziel!=nullptr) { // ★ 03.10.2026 CFD_GPU_PROFIL: Event je Launch einsammeln (dieselbe Queue, derselbe Launch -- nur der Event-Ausgang ist neu)
+				Event ev;
+				check_for_errors(cl_queue.enqueueNDRangeKernel(cl_kernel, cl::NullRange, cl_range_global, cl_range_local, event_waitlist, &ev));
+				device->profil_ziel->push_back(ev);
+			} else {
+				check_for_errors(cl_queue.enqueueNDRangeKernel(cl_kernel, cl::NullRange, cl_range_global, cl_range_local, event_waitlist, event_returned));
+			}
+		}
+		return *this;
+	}
+	// ★ 04.10.2026 U_RAND U1c: Teilbereich [offset, offset+anzahl) ueber global_work_offset. offset MUSS ein Vielfaches der Arbeitsgruppe
+	// sein (dann sind die Arbeitsgruppen dieselben wie im Volllauf); anzahl wird auf die Arbeitsgruppe aufgerundet, der Kernel prueft n < N.
+	inline Kernel& enqueue_run_bereich(const ulong offset, const ulong anzahl) {
+		const ulong wg = (ulong)cl_range_local.get()[0];
+		if(wg==0ull||offset%wg!=0ull) print_error("enqueue_run_bereich: offset "+to_string(offset)+" ist kein Vielfaches der Arbeitsgruppe "+to_string(wg)+".");
+		if(device!=nullptr&&device->profil_ziel!=nullptr) { // ★ 05.10.2026 Korrektur A-N6/B-N1/C-N1: wie enqueue_run das Event einsammeln -- sonst fehlten die VOLL-Scheiben von stream_collide in [GPU-PROFIL]
+			Event ev;
+			check_for_errors(cl_queue.enqueueNDRangeKernel(cl_kernel, cl::NDRange(offset), cl::NDRange(((anzahl+wg-1ull)/wg)*wg), cl_range_local, nullptr, &ev));
+			device->profil_ziel->push_back(ev);
+		} else {
+			check_for_errors(cl_queue.enqueueNDRangeKernel(cl_kernel, cl::NDRange(offset), cl::NDRange(((anzahl+wg-1ull)/wg)*wg), cl_range_local));
 		}
 		return *this;
 	}

@@ -62,6 +62,23 @@ inline ulong rr_idx_host(const ulong n, const uint Nx, const uint Ny, const uint
 	if(x+2u>=Nx) return r0+4ull*(ulong)Nx+4ull*(ulong)(y-2u)+(ulong)(x+4u-Nx);
 	return r1_anzahl(Nx, Ny, Nz);
 }
+// ★ 04.10.2026 U_RAND (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.4): KOPFBELEGUNG des kompakten u-Puffers, EINZIGE Quelle. Die ersten
+// KOPF_W uint-Woerter des u-Puffers tragen diese Werte; lbm.cpp emittiert daraus die URK_*-Defines, der Geraetecode liest sie ueber
+// ur_k(). Danach die Maske von A (Modus 3) in uint-Woertern, ab DOFF (in velxx-Woertern) die Daten: je Komponente US Slots R1|A|V|Papierkorb.
+// (★ 05.10.2026 Korrektur C-N8: Segment C ist entfallen, die N2F-Bloecke liegen in A -- hier stand "Masken (A, C)" und "R1|A|C|V".)
+namespace ur_k {
+	enum : uint { MAGIC=0u, US=1u, DOFF=2u, R1N=3u, AN=4u, AX0=5u, AY0=6u, AZ0=7u, ANX=8u, ANY=9u, ANZ=10u, AMASK=11u, AMOFF=12u,
+		VOFF=13u, VN=14u, VBX0=15u, VBY0=16u, VBZ0=17u, VBNX=18u, VBNY=19u, VBNZ=20u, P=21u,
+		KOPF_W=64u }; // ★ U1c: kein Segment C mehr (die N2F-Bloecke liegen in A); V-Box (VBX0..VBNZ) setzt der Host je Leseplan-Schritt
+	constexpr uint GUELTIG = 0x55524E44u;     // "URND": Kopf gueltig
+	constexpr uint PLATZHALTER = 0x0BAD0BADu; // Platzhalter vor alloc_u_rand (ab U1b); Slot 485 zaehlt jeden Lesezugriff darauf
+	constexpr uint REGEL_VX = 64u;            // velxx-Index der Init-Regel im Kopf: Nicht-Solid x,y,z = 64..66, reines Solid 67..69 (uint-Woerter 32..34) -- NUR mit U_FP16 (2-Byte-velxx); Sperre in LBM_Domain::allocate und alloc_u_rand (Pruefbefund M2, 05.10.2026)
+}
+// ★ 05.10.2026 U_RAND Korrektur M1/N2 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.15): Groesse der Ausgabe V aus dem Gitter (EINZIGE Quelle fuer
+// ur_v_anlegen UND die VRAM-Vorpruefung im Konstruktor); scheiben != nullptr bekommt die VOLL-Scheibengrenzen.
+ulong ur_v_layout(const ulong Nx, const ulong Ny, const ulong Nz, std::vector<ulong>* scheiben);
+// Obergrenze des kompakten u-Puffers in Byte VOR dem Zensus (Konstruktor-Vorpruefung); alloc_u_rand vergleicht den echten Puffer dagegen.
+ulong ur_vorpruef_bytes(const uint Nx, const uint Ny, const uint Nz, const uint modus);
 inline float rho_unpack(const rhoxx w) { // Speicherwort -> rho
 #ifdef RHO_FP16
 	// ★★ 12.09.2026 (Audit-Schleife, Pruefer A, HOCH): half_to_float ist ausdruecklich "without
@@ -207,6 +224,67 @@ double dx_skal();                      // DX_SCHRITT_VORGABE_MM/CFD_DX in den dr
 void   dx_skal_setzen(const double s); // Ist=Soll aus dem Fall, wie ulat_skal_setzen
 double schritt_skal();                 // = ulat_skal()*dx_skal(): DER Faktor fuer env_schritte und zaehl_takt
 
+int sc_simd16_geraet(); // ★ 02.10.2026 Messarm CFD_SC_SIMD16=<OpenCL-Geraete-ID>, -1 = aus (lbm.cpp, streng gelesen)
+inline ulong domaenen_bau_zaehler = 0ull; // ★ 05.10.2026 A-N4/B-N4: zaehlt Domaenenbauten (nur Hauptthread; parallel gebaute Mehrdomaenen-Zerlegungen bekommen trotzdem verschiedene Werte, solange die Konstruktoren seriell laufen)
+uint zellbasen_modus(); // ★ 05.10.2026 CFD_ZELLBASEN (PLAN-ZELLBASEN-2026-10-05.md): 1 = Byte-Zellbasen in stream_collide (Vorgabe), 0 = alter Pfad (index_f); streng gelesen, global fuer alle Domaenen
+// ★ 04.10.2026 KRAFT-P1 (Heiko-Entscheid, Bauplan Planungsagent): Ergebnis des Kernels kraft_p1_gpu in Gittereinheiten,
+// double-Endsumme in fester Gruppenreihenfolge. P1 = Sum 2 w_i (rho_quelle - 1) c_i ueber dieselbe Linkmenge wie F
+// (Quelle j[ib] nicht Solid), Lage K = z-Index der Solidzelle, K = 0..7 einzeln. ok = false: nicht gebunden oder t = 0.
+struct KP1 {
+	double px = 0.0, py = 0.0, pz = 0.0;
+	double lx[8] = {}, lz[8] = {};
+	unsigned long long links = 0ull, typ_e = 0ull, klemme = 0ull, wandzellen = 0ull;
+	unsigned long long links_lage[8] = {};
+	bool ok = false;
+};
+// ★ 05.10.2026 FLAGS4 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md Teil C): flags in 4 Bit auf dem Geraet. Vorkommende Bits sind 0, 1, 6, 7
+// (TYPE_S, TYPE_E, TYPE_X, TYPE_Y); TYPE_T/F/I/G (Bits 2..5) gibt es nur unter TEMPERATURE/SURFACE, dort ist FLAGS4 gesperrt.
+// Bitumrechnung ohne Tabelle, bijektiv auf die 16 Kombinationen der Bits {0,1,6,7}:
+//   enc(f) = (f & 0x03) | ((f >> 4) & 0x0C)      dec(c) = (c & 0x03) | ((c & 0x0C) << 4)
+// Speicherform: Zelle n in Byte n>>1, Nibble n&1 (gerade Zelle unten). Little-Endian ist das gleichwertig zu uint-Wort n>>3, Verschiebung 4*(n&7).
+inline uchar flags4_enc(const uchar f) { return (uchar)((f&0x03u)|((f>>4u)&0x0Cu)); }
+inline uchar flags4_dec(const uchar c) { return (uchar)((c&0x03u)|((c&0x0Cu)<<4u)); }
+inline ulong flags4_bytes(const ulong N) { return 4ull*((N+7ull)/8ull); } // gepackte Laenge in Byte (ganze uint-Woerter: die Kernel-Schreiber arbeiten mit atomic_and/atomic_or auf dem Wort)
+ulong flags4_packen(const uchar* f, const ulong N, uchar* p); // packt N Zellen nach p (flags4_bytes(N) Byte, Rest 0); liefert die Zahl der Zellen mit fremden Bits (f & 0x3C), Soll 0
+void flags4_entpacken(const uchar* p, const ulong N, uchar* f); // Umkehrung
+uint flags4_selbsttest(); // F0: Rundreise aller 16 Codes und eines Pseudozufallsfelds (ungerades N); liefert die Zahl der Beanstandungen, Soll 0
+// ★ 05.10.2026 FLAGS4 F3 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md C.2): flags je Domaene. Der Host behaelt das VOLLE Bytefeld h (alle
+// Hostleser bleiben unveraendert); das Geraet bekommt k(). FLAGS4=0: k() = h, also derselbe Memory wie bisher (Host+Geraet, N Byte).
+// FLAGS4=1: h ist nur Host, k() = g ist der gepackte Puffer (4 Bit je Zelle, ganze uint-Woerter) mit einem Host-Schatten zum Packen.
+// Dass das hier KEIN Memory ist, ist Absicht: eine vergessene Kernelbindung "…, flags, …" bindet die Klasse als Konstante mit
+// sizeof(Flags_Puffer) Byte und scheitert beim Kernelbau mit CL_INVALID_ARG_SIZE (-51) -- laut, vor dem ersten Schritt, auf jedem Geraet.
+// Und read_from_device/write_to_device packen/entpacken selbst, so dass keine der rund 40 Synchronisationsstellen still ins Leere laeuft
+// (ein reiner Host-Memory machte aus jedem vergessenen Aufruf einen stillen No-Op).
+class Flags_Puffer {
+private:
+	Memory<uchar> h; // volles Bytefeld je Zelle (Host); FLAGS4=0 zugleich der Geraetepuffer
+	Memory<uchar> g; // FLAGS4=1: gepackter Geraetepuffer flags4_bytes(N) Byte, Host-Schatten fuer Packen/Entpacken
+	Device* dev = nullptr;
+	ulong N = 0ull;
+	bool vier = false;
+	uint haken = 0u; // CFD_FLAGS4_HAKEN=1: beim ERSTEN Hochladen ein Nibble im gepackten Puffer kippen (Soll: Geraeteprobe reisst)
+public:
+	ulong n_hoch = 0ull, n_runter = 0ull; // Wirkpfad: gepackte Hoch-/Runterladungen
+	ulong rundreise_abw = 0ull, fremd = 0ull; // Summen ueber alle Hochladungen, Soll 0
+	long haken_zelle = -1l; // gekippte Zelle (Testhaken), sonst -1
+	inline Flags_Puffer() {}
+	Flags_Puffer(const Flags_Puffer&) = delete;
+	Flags_Puffer& operator=(const Flags_Puffer&) = delete;
+	void anlegen(Device& device, const ulong N, const bool vier, const uint haken); // lbm.cpp
+	inline uchar& operator[](const ulong i) { return h[i]; }
+	inline const uchar& operator[](const ulong i) const { return h[i]; }
+	inline uchar* data() { return h.data(); }
+	inline const uchar* data() const { return h.data(); }
+	inline const ulong length() const { return h.length(); }
+	inline Memory<uchar>& k() { return vier ? g : h; } // Kernelbindung
+	inline Memory<uchar>& host() { return h; } // fuer den Memory_Container der Huelle (nur Hostzugriff)
+	inline bool ist_vier() const { return vier; }
+	inline ulong geraet_bytes() const { return vier ? g.capacity() : h.capacity(); }
+	void read_from_device(); // blockierend; FLAGS4: gepackt lesen (Zero-Copy: finish), dann entpacken
+	void write_to_device(const bool blocking=true); // FLAGS4: Queue leeren, packen (Fremdbit- und Rundreisepruefung), BLOCKIEREND schreiben
+	inline void enqueue_write_to_device() { write_to_device(false); }
+	void geraet_in(std::vector<uchar>& ziel); // Geraeteinhalt entpackt in ziel lesen, OHNE h anzufassen (Geraeteprobe nach initialize)
+};
 class LBM_Domain {
 private:
 	uint Nx=1u, Ny=1u, Nz=1u; // (local) lattice dimensions
@@ -301,6 +379,7 @@ private:
 
 	void allocate(Device& device); // allocate all memory for data fields on host and device and set up kernels
 	string device_defines(const Device_Info& device_info) const; // returns preprocessor constants for embedding in OpenCL C code
+	string u_rand_defines() const; // ★ 04.10.2026 U_RAND: URK_*-Defines aus ur_k (einzige Quelle), dazu U_RAND/UR_MAGIC/UR_REGEL_VX
 
 public:
 	// FORK -- Block-Tiling. Statisch, weil das Setup den Schalter setzen muss, BEVOR der LBM-Konstruktor
@@ -379,7 +458,7 @@ public:
 	// greift. Ein Lauf, in dem sie dauernd zuschlaegt, rechnet auf einem verfaelschten Feld und ist
 	// KEIN Ergebnis. Ich hatte diesen Waechter in defines.hpp beschrieben und nicht gebaut -- genau
 	// der lautlose No-op, den dieses Projekt jagt, in meiner eigenen Klemme.
-	static constexpr uint hits_n = 432u; // ★ 28.09.2026: 408 -> 432 (Rang-1-Querrest CFD_FAC_R1Q, Slots 408..431). ★ 24.09.2026: 384 -> 392 (Doppelterm-Korrektur) -> 400 (Normalanteil 388..392 und Stufe S2 393..397). IN DIESER ZEILE STEHT KEINE FREILISTE MEHR -- ★ Pruefbefund M4 (24.09. nachmittags, drittes Auftreten derselben Klasse): hier stand "Frei sind 398/399", waehrend 398/399 seit demselben Vormittag belegt sind (kernel.cpp, Leere Probe und Widerspruchs-Entscheider) und die Legende bereits 403 als naechsten Slot fuehrte. Wer dem Kommentar folgte, vergab 398/399 ein zweites Mal. ★ Pruefbefund M5: hier stand nach dem zweiten Schritt noch der Kommentar des ersten ("387..391 sind frei") -- eine widerspruechliche Zweitfassung IN DERSELBEN ZEILE wie der Wert, dieselbe Falle wie Pruefbefund 3-E. VERBINDLICH ist allein die Legende in lbm.cpp bei der Allokation. Alter Text: Mit 381..385 (Groessenhistogramm, vier Grenzen statt zwei -- Pruefbefund M4) und 386 (Begleitzaehler zu 378) war der Puffer voll; 387..391 sind frei. Der Kernel indiziert mit LITERALEN und kennt keine Schranke. // ★ 22.09.2026 S-1 (REKONSTRUKTION-PLAN.md §5): 320 -> 384. Der Kernel indiziert rho_clamp_hits[] mit LITERALEN und kennt KEINE Schranke -- ein Zaehler oberhalb der Pufferlaenge schreibt aus dem Puffer heraus, ohne dass irgendetwas meldet. Der Plan braucht 12-14 Slots, frei waren 3 (317..319). ★ 15.09.2026 Klemmen Stufe 1 P1a: Slotzahl an EINER Stelle (Allokation lbm.cpp, Leser setup.cpp)
+	static constexpr uint hits_n = 493u; // ★ 05.10.2026 Korrektur A-M3: 492 -> 493 (Slot 492 = ZELLBASEN-Konstantenspiegel; 488/491 bleiben fuer die ZK-Linien, 500..503 fuer M1 frei -- Merge-Hinweis in der Legende lbm.cpp). // ★ 04.10.2026 U_RAND: 484 -> 492 (Slots 484..491, Legende lbm.cpp). // ★ 04.10.2026: 473 -> 484 (Pruefbefunde REK-PI: 473 Nenner-Kollaps der Sekante, 474 nu_s an nu geklemmt, 475..481 Netto-Fluss-Histogramm T/(-rho u_tau^2), 482 Messbesuche, 483 ohne T_aus; Legende lbm.cpp). // ★ 03.10.2026: 440 -> 473 (Slots 440..471 = REK-PI nach PLAN-REK-PI.md §7, 472 = REK-PI w_WM in der Kollision angewandt -- Bauabweichung: Wirkpfad des tau_eff, im Plan ohne Slot; Legende lbm.cpp). // ★ 03.10.2026: 433 -> 440 (Slots 433..439 = R1Q Stufe 5 SPALTE1: kappa-Klassen 433..438, Schattentor 439; Legende lbm.cpp). // ★ 02.10.2026: 432 -> 433 (Slot 432 = Sub-Group-Breite von stream_collide unter SC_SIMD16). ★ 28.09.2026: 408 -> 432 (Rang-1-Querrest CFD_FAC_R1Q, Slots 408..431). ★ 24.09.2026: 384 -> 392 (Doppelterm-Korrektur) -> 400 (Normalanteil 388..392 und Stufe S2 393..397). IN DIESER ZEILE STEHT KEINE FREILISTE MEHR -- ★ Pruefbefund M4 (24.09. nachmittags, drittes Auftreten derselben Klasse): hier stand "Frei sind 398/399", waehrend 398/399 seit demselben Vormittag belegt sind (kernel.cpp, Leere Probe und Widerspruchs-Entscheider) und die Legende bereits 403 als naechsten Slot fuehrte. Wer dem Kommentar folgte, vergab 398/399 ein zweites Mal. ★ Pruefbefund M5: hier stand nach dem zweiten Schritt noch der Kommentar des ersten ("387..391 sind frei") -- eine widerspruechliche Zweitfassung IN DERSELBEN ZEILE wie der Wert, dieselbe Falle wie Pruefbefund 3-E. VERBINDLICH ist allein die Legende in lbm.cpp bei der Allokation. Alter Text: Mit 381..385 (Groessenhistogramm, vier Grenzen statt zwei -- Pruefbefund M4) und 386 (Begleitzaehler zu 378) war der Puffer voll; 387..391 sind frei. Der Kernel indiziert mit LITERALEN und kennt keine Schranke. // ★ 22.09.2026 S-1 (REKONSTRUKTION-PLAN.md §5): 320 -> 384. Der Kernel indiziert rho_clamp_hits[] mit LITERALEN und kennt KEINE Schranke -- ein Zaehler oberhalb der Pufferlaenge schreibt aus dem Puffer heraus, ohne dass irgendetwas meldet. Der Plan braucht 12-14 Slots, frei waren 3 (317..319). ★ 15.09.2026 Klemmen Stufe 1 P1a: Slotzahl an EINER Stelle (Allokation lbm.cpp, Leser setup.cpp)
 	Memory<uint> rho_clamp_hits; // Slotzahl steht in hits_n eine Zeile darueber und NUR dort; die Legende in lbm.cpp bei der Allokation ist die einzige Quelle der Vergabe. ★ Hier stand bis 24.09. eine Zweitfassung mit einer festen Zahl -- genau die Falle, die Pruefbefund 3-E und M5 beschreiben. (S-1), 320 seit 15.09.2026 abends (Klemmen Stufe 1 und 2: 271..305 -- Stand 16.09.2026, Pruefbefund N-4; die VERBINDLICHE Slotvergabe steht allein in lbm.cpp bei der Allokation; 288 mit Stufe 0, vorher 224 seit 08.09., davor 128) (Legende: lbm.cpp bei der Allokation) (70 Kraftpfad, 71 reserviert; 30.08.). Legende steht an EINER Stelle: lbm.cpp bei der Allokation (Pruefbefund 3-E: hier stand eine widerspruechliche Zweitfassung, aus der der naechste Slot vergeben worden waere).
 	// ★ uint je Domaene: ein pathologischer Lauf (Test B mass 415 Mio = ~10 % von 2^32) kann
 	// ueberlaufen. Fuer einen Waechter, der bei >0 ohnehin den Lauf disqualifiziert, vertretbar --
@@ -406,6 +485,9 @@ public:
 	static uint s_u_takt; // ★ TODO 2 Schritt 3 (CFD_U_SPARSAM): 0 = aus, sonst ratio (u voll am letzten Substep jedes Grobschritts)
 	static uint s_rho_takt; // ★ TODO 2 Schritt 1 (CFD_RHO_SPARSAM): Sample-Kadenz in FEINEN Schritten; 0 = aus (dann ist der Geraetecode zeichengleich zu vorher)
 	static uint s_rho_rand; // ★ 15.09.2026 RHO_RAND (CFD_RHO_RAND, RHO_RAND-PLAN.md): 0 = aus, 1 = rho nur in der Domaenen-Randschale R1. fahrzeug_dd NUR Nahfeld (Statik vor dem Fernfeld-Bau genullt) und Kugel-Pruefstand
+	static bool s_flags4_pruef; // ★ 05.10.2026 FLAGS4: CFD_FLAGS4 steht in der Zeile (auch =0) -> Geraeteprobe in BEIDEN Armen (MS-Zahl ist der Soll fuer den 4-Bit-Arm). Lesestelle/Nullung wie s_flags4
+	static uint s_flags4; // ★ 05.10.2026 FLAGS4 (CFD_FLAGS4, PLAN-VRAM-URAND-FLAGS-2026-10-04.md Teil C): 0 = Byte je Zelle (wie bisher), 1 = 4 Bit je Zelle auf dem Geraet. NUR fahrzeug_dd-Nahfeld; Lesestelle setup.cpp neben s_u_rand, Fernfeld genullt (Werkzeugfalle 21)
+	static uint s_u_rand; // ★ 04.10.2026 U_RAND (CFD_U_RAND, PLAN-VRAM-URAND-FLAGS-2026-10-04.md Teil B): 0 = aus, 1 = Pruefstand (A = ganzes Gitter), 2 = Grossbox, 3 = eng (Maske + N2F-Bloecke in A). NUR fahrzeug_dd-Nahfeld; Lesestelle setup.cpp neben s_u_takt, Fernfeld genullt
 	static uint s_fac_alpha;
 	static bool s_fac_elibb;
 	static uint s_sgs_fdwand;  // ★ 02.09. SGS-GEISTERMODEN-FIX (CFD_SGS_FDWAND=1): w an Facettenzellen aus |S|_FD des u-Felds (FD-Kernel, ein Schritt versetzt) statt aus dem Pi-Tensor, den das Wandmodell kontaminiert (B66/B69)
@@ -414,7 +496,8 @@ public:
 	static uint s_sgs_gdiag;   // ★ 31.08. g-DIAGNOSE (CFD_SGS_GDIAG=1): sparser Messkernel ueber die Facettenzellen -- |S|_FD, |S|_Pi, D_WALE, D_Sigma, |Omega| je Zelle akkumuliert; fasst Physik nicht an
 	static uint s_fac_messnur; // ★ 30.08. CFD_FAC_MESSNUR: Facetten bauen und MESSEN, im Kernel aber NICHTS anwenden -- BB-Physik mit Facetten-Instrument (Aepfel-mit-Aepfeln-Bezug fuer BB-Vergleiche)
 	static float s_fac_rek_leiter; // ★ 24.09.2026 DIAGNOSELEITER (CFD_FAC_REK_LEITER): skaliert die aus dem Wandmodellziel HERGELEITETE Amplitude. NUR unter CFD_FAC_REK=3, Vorgabe 1.0 (dann exakt bitgleich, Multiplikation mit 1.0f ist verlustfrei). ZWECK: trennt "der Speicherpfad quantisiert den Hub weg" von "die Zellquelle traegt die Physik nicht". GEMESSEN 24.09.: 100 % der Amplituden liegen unter dem Messhub 1e-4, 76,7 % im Fach 1e-5..1e-4. Skaliert die Wirkung auf cf mit der Leiter mit, ist die Quantisierung der Begrenzer; skaliert sie nicht, ist die Aktorfamilie unabhaengig davon tot. KEIN Messarm und KEIN Handwert im Ergebnis -- ein Instrument wie die eps-Amplitudenleiter vom August, das danach wieder herausfliegt.
-	static uint s_fac_r1q; // ★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q): 0 aus, 1 messen (rechnen+zaehlen, nichts anwenden), 2 V_Z (nur Modellanteil), 3 V_R (voller Rest (I-M)(Z-P)), 4 V_R ohne isotropen Druckanteil 2(rho-1)(S1.t). An Lage-1-Zellen mit Rang 1 (Marke -1 in fac_geo[8i+7]) wird der Teil des Wandmodellziels, den der PINV-Zweig nicht aufpraegen kann, als Zellquelle eingespeist.
+	static uint s_fac_r1q; // ★ 28.09.2026 RANG-1-QUERREST (CFD_FAC_R1Q): 0 aus, 1 messen (rechnen+zaehlen, nichts anwenden), 2 V_Z (nur Modellanteil), 3 V_R (voller Rest (I-M)(Z-P)), 4 V_R ohne isotropen Druckanteil 2(rho-1)(S1.t), 5 wie 4, aber NUR SPALTE 1 (R2' := 0: ersetzt wird nur die Laengsspalte P1-A1 -> Z1, der Quer-BB-Austausch P2 bleibt wie die PINV ihn behandelt; K2 aus UNTERBODEN-R1Q-ANALYSE.md, 03.10.2026). An Lage-1-Zellen mit Rang 1 (Marke -1 in fac_geo[8i+7]) wird der Teil des Wandmodellziels, den der PINV-Zweig nicht aufpraegen kann, als Zellquelle eingespeist.
+	static uint s_fac_rekpi; // ★ 03.10.2026 REK-PI (CFD_FAC_REKPI, PLAN-REK-PI.md): 0 aus, 1 messen (rechnen+zaehlen, bitgleich zu 0), 3 (★ 04.10.) Ausweichstufe: nur u setzen, kein Pi-Tausch/tau_eff, 2 anwenden (u_t-Setzung + Pi_tn-Tausch + tau_eff an ALLEN Facettenzellen mit Referenzpunkt; zieht FAC_REK und FAC_REK_R3 nach). In setup.cpp neben s_fac_r1q gesetzt und genullt (Werkzeugfalle 21), NIE im Konstruktor
 	static uint s_fac_rek; // ★ 22.09.2026 S0/S1 WANDZELL-REKONSTRUKTION (CFD_FAC_REK): 0 = aus, 1 = Umfang Rang 0 (REKONSTRUKTION-PLAN.md §12). Marke in fac_geo[8i+7], Amplitude in [8i+6] -- beide Laufzeitladungen, KEIN JIT-Define fuer die Amplitude (sonst optimiert IGC die Identitaet weg).
 	static uint s_fac_pinv; // ★ 04.09. CFD_FAC_PINV: Moore-Penrose-Pseudoinverse statt achsenparalleler Skalarleiter im gekoppelten Zweig
 	static uint s_fac_idx_voll; // ★ 03.09. CFD_FAC_IDX_VOLL: fac_idx wieder als volles uint-Feld (Rueckschalter fuer das A/B gegen die Bitmaske)
@@ -454,6 +537,56 @@ public:
 	bool rho_rand_on = false;  // ★ 15.09. Konstruktionszeit-Kopie von s_rho_rand (read-once-Doktrin); das Setup liest DIESEN Wert, nicht die Umgebungsvariable
 	ulong rr_N = 0ull;         // ★ 15.09. RHO_RAND C2c: Zellen der Randschale R1 (rho-Puffer = rr_N+1, letzter Slot Papierkorb); 0 ohne RHO_RAND
 	uint u_takt = 0u;          // Konstruktionszeit-Kopie von s_u_takt
+	ulong u_fenster_n = 0ull, u_fenster_frei = 0ull; // ★ 05.10.2026 (SWEEP-SPZ-ZB4 Slot-206-Waechter): Schritte im Zaehlfenster [zaehl_takt+2, +6) von stream_collide bzw. davon ohne erzwungenes Vollschreiben (felder_voll Bit 1 = 0)
+	// ★ 04.10.2026 U_RAND (PLAN-VRAM-URAND-FLAGS-2026-10-04.md Teil B): u kompakt (Kopf + R1|A|V|Papierkorb; ★ C-N8: kein Segment C mehr), voller Hostspiegel separat.
+	bool u_rand_on = false;    // Konstruktionszeit-Kopie von s_u_rand
+	uint ur_modus_soll = 0u;   // Konstruktionszeit-Kopie des Modus (= s_u_rand); alloc_u_rand baut danach
+	uint ur_modus = 0u;        // = CFD_U_RAND: 1 = A ist das ganze Gitter (Pruefstand), 2 = Grossbox (U1d), 3 = eng mit Masken und N2F-Bloecken (U2); 0 = aus
+	ulong ur_US = 0ull, ur_R1N = 0ull, ur_AN = 0ull, ur_VOFF = 0ull, ur_VN = 0ull, ur_P = 0ull, ur_DOFF = 0ull, ur_len = 0ull; // Layout (Slots bzw. velxx-Woerter)
+	std::vector<uint> ur_kopf;  // Host-Zwilling von Kopf + Masken (uint-Woerter, Laenge ur_DOFF/2)
+	Memory<velxx> u_spiegel;    // voller Hostspiegel N x 3 (nur Host); LBM::u bindet ihn unter U_RAND
+	ulong ur_idx_host(const ulong n) const; // Zwilling von ur_idx (kernel.cpp)
+	void ur_layout(const uint modus); // Modus 1/2/3 (Gitter/Grossbox/eng); fuellt ur_kopf (+Maske) und das Layout
+	void ur_kopf_in_puffer();   // ur_kopf -> Kopfwoerter im Hostpuffer von u
+	void ur_packen();           // Hostspiegel -> kompakter Hostpuffer (alle gespeicherten Zellen)
+	void ur_spiegel_init_nachziehen(); // ★ 05.10.2026 A-N2: Spiegel an gespeicherten TYPE_ONLY_S-Zellen auf 0, wie initialize im Kernel
+	void ur_streuen();          // kompakter Hostpuffer -> Hostspiegel (alle gespeicherten Zellen)
+	uint ur_selbsttest();       // Bijektion der Slots, Kopf-Gegenlese; liefert Beanstandungen
+	ulong ur_init_waechter();   // ★ U1d: ungespeicherte Zellen des Spiegels == Init-Regel (Wortvergleich); liefert die Verletzungen
+	inline const velxx* u_host_voll() const { return u_rand_on ? u_spiegel.data() : u.data(); } // Setup-Stand von u (Zensus)
+	// ★ U1b: spaete Allokation. Der Konstruktor legt nur einen PLATZHALTER an (Kopf mit Magic ur_k::PLATZHALTER, keine Slots); die
+	// echte Groesse steht erst nach Facetten-, Band- und N2F-Listenbau fest. alloc_u_rand legt an und bindet ALLE u-Kernel neu
+	// (Muster alloc_f_liste: erst anlegen, dann binden). Freigegeben wird dabei nur der kleine Platzhalter (NEO-Defekt, lbm.cpp).
+	bool ur_alloziert = false;
+	void ur_platzhalter();
+	void alloc_u_rand(const uint modus, const float u_lat);
+	uint ur_neu_binden(); // liefert die Zahl der neu gebundenen Kernel
+	// ★ U1b: GUELTIGKEITSSTEMPEL des Hostspiegels (Plan B.5). Ein Hostzugriff ausserhalb ist ein harter Fehler (Zugriffssperre,
+	// U_Feld::pruefe_zugriff). ur_setup: vor initialize ist der Spiegel die Wahrheit. Danach gilt eine Zelle bei t, wenn
+	// VOLL(t) ODER (KOMPAKT(t) und die Zelle hat einen Slot) ODER sie in der gestempelten Ebene/Saeule liegt.
+	bool ur_setup = true;
+	ulong ur_t_kompakt = ~0ull, ur_t_voll = ~0ull, ur_t_ebene = ~0ull, ur_t_saeule = ~0ull;
+	uint ur_ebene_y = 0u, ur_saeule_x = 0u, ur_saeule_y = 0u, ur_saeule_zn = 0u;
+	// ★ U1c: AUSGABE V + LESEPLAN (Plan B.5). Der Host sagt VOR dem Grobschritt an, was er danach liest; stream_collide schreibt am
+	// LETZTEN Substep die eigenen Werte zusaetzlich nach V. Bits: 4 Ebene y = VY0, 8 VOLL (Scheiben), 16 Saeule.
+	uint ur_plan = 0u;          // fuer den naechsten letzten Substep (wird beim Ausfuehren verbraucht)
+	bool ur_vbox_aktiv = false; // V-Box im Kopf gesetzt (muss vor dem naechsten stream_collide ohne Plan geleert werden)
+	uint ur_v_y = 0u;           // Ebene der Slice-Ausgabe (y = Ny/2, wie lese_yslice_in_host(fNy/2) im Setup)
+	uint ur_plan_lauf = 0u;     // im letzten Grobschritt ausgefuehrt, verbraucht von LBM::u_rand_ausgabe
+	ulong ur_plan_t = ~0ull;    // t NACH dem ausfuehrenden Schritt
+	std::vector<ulong> ur_scheiben; // Scheibengrenzen fuer VOLL (Vielfache der Arbeitsgruppe, je Grenze mitten in der Zeile y = Ny/2)
+	uint ur_pruef = 0u, ur_haken = 0u; // CFD_U_RAND_PRUEF (Modus 1: V gegen kompakt), CFD_U_RAND_TESTHAKEN
+	ulong ur_soll_489 = 0ull, ur_soll_490 = 0ull; // Host-Soll der Ausgabezaehler
+	ulong ur_pruef_n = 0ull, ur_pruef_abw = 0ull, ur_n_voll = 0ull, ur_n_ebene = 0ull, ur_n_saeule = 0ull;
+	// ★ 05.10.2026 Korrektur M3/H1 (Plan B.15): V GEGEN KOMPAKT in JEDEM Modus -- an jeder Lesung die gespeicherten Nicht-R1-Zellen des
+	// Lesebereichs (Spiegel nach allen Streuungen) gegen den kompakten Puffer; Soll 0. Dazu Kosten und die Kombinationen der Leseplan-Bits.
+	ulong ur_vgl_n = 0ull, ur_vgl_abw = 0ull, ur_vgl_bytes = 0ull, ur_vgl_bereiche = 0ull;
+	double ur_vgl_s = 0.0;
+	ulong ur_n_bits[8] = {0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull}; // Index bits>>2: 1 Ebene, 2 VOLL, 3 VOLL+Ebene, 4 Saeule, 5 Ebene+Saeule, 6 VOLL+Saeule, 7 alle drei
+	void ur_v_anlegen();        // V-Groesse und Scheiben aus dem Gitter; setzt ur_VOFF/ur_VN (hinter A)
+	void ur_saeule_setzen(const uint x, const uint y, const uint zn); // Wandprofil-Saeule (Host; die V-Box setzt enqueue_stream_collide)
+	void ur_vbox(const uint x0, const uint y0, const uint z0, const uint nx, const uint ny, const uint nz); // V-Box in den Kopf (finish + Schreiben)
+	void ur_voll_scheiben(const uint fv); // VOLL: stream_collide scheibenweise, V je Scheibe lesen und streuen
 	uint felder_voll_h = 3u;   // je Schritt gesetzter Kernelparameter, BITFELD: Bit 0 = rho ueberall, Bit 1 = u ueberall (3 = heutiges Verhalten)
 	bool rho_voll_zwang = false; // Host erzwingt Vollschreiben (Abschlusspfad, unregelmaessige Feldlesung)
 	long fac_diagz_wert = -1l; // Konstruktionszeit-Kopie von s_fac_diagz (Gross-Audit: Spaet-Lese-Pfad geschlossen)
@@ -467,11 +600,27 @@ public:
 	// und nur der Vorkernel ist isoliert messbar. Instanzkopie, weil fahrzeug_dd die Statik vor dem
 	// Bau des Fernfelds nullt -- dieselbe Falle wie bei apg_on (Pruefbefund HOCH-1 vom 16.09.).
 	uint timer_apg = 0u; double apg_t_summe = 0.0, apg_t_min = 1.0e30, apg_t_max = 0.0; ulong apg_t_n = 0ull;
+	// ★ 03.10.2026 CFD_GPU_PROFIL (Leistungsanzeige je GPU). profil_an = Konstruktionszeit-Kopie von device.profil_queue
+	// (die Queue traegt CL_QUEUE_PROFILING_ENABLE nur, wenn das Setup Device::profil_anlegen VOR dem Konstruktor setzte,
+	// heute ausschliesslich fahrzeug_dd). do_time_step markiert die Schrittgrenzen und sammelt NUR die Launches des
+	// Schritts; ausgewertet wird nur an ohnehin synchronisierten Stellen (LBM::run nach info.update, LBM::finish), kein
+	// eigenes wait/finish. Je Schritt: Spanne = groesstes END - kleinstes START, Kernelsumme = Summe (END - START).
+	bool profil_an = false;
+	vector<Event> profil_events; // Events der noch nicht ausgewerteten Schritte
+	vector<ulong> profil_grenzen; // Startindex jedes noch nicht ausgewerteten Schritts in profil_events
+	ulong profil_schritte = 0ull; // ausgewertete Schritte, kumulativ
+	ulong profil_kern_ns = 0ull, profil_spanne_ns = 0ull; // kumulativ, Geraeteuhr in ns
+	ulong profil_verletzt = 0ull; // Selbsttest 0 < Kernelsumme <= Spanne verletzt (Schritte)
+	ulong profil_fehler = 0ull; // Event mit Fehlerstatus oder Profilwert nicht lesbar (Schritte)
+	void profil_schritt_beginnen(); // do_time_step, VOR dem ersten Launch: Grenze markieren, Ziel setzen
+	void profil_schritt_beenden(); // do_time_step, NACH dem letzten Launch: Ziel loesen
+	void profil_auswerten(); // nur nach einer Barriere rufen; wertet nur Schritte aus, deren Events ALLE CL_COMPLETE sind
 	// ★ 23.09.2026 EINZIGE QUELLE der fac_nb-Stride-Erweiterung unter CFD_FAC_REK. Die Formel stand bis heute
 	// AUSGESCHRIEBEN an drei Stellen (lbm.cpp Host-Spiegel, lbm.cpp Stride-Waechter, setup.cpp berichte_apg) plus
 	// der JIT-Emission -- die vierte fand erst der Pruefagent (H-1), sie haette den ersten APG+REK-Lauf mit rc=1
 	// beendet. Wer die Zahl aendert, aendert sie HIER; die Nutzer rechnen damit. Stufe A: 3 (Richtung t_nb),
 	// Stufe A2 ab 23.09.: 4 (zusaetzlich der Impuls-Akkumulator Summe rho*du_x je Facette).
+	static constexpr ulong nb_rekpi_floats = 4ull; // ★ 04.10.2026: 3 -> 4, roff+8 = Ausfluss-Halbmoment T_aus des Netto-Fluss-Zaehlers (nur an Zaehlschritten geschrieben/gelesen; 4 mm +12,5-13,1 MB, fac_nb 36 B je Facette = 113-118 MB). // ★ 03.10.2026 REK-PI: u_tau, u_WM(y_w), nu_eff je Facette in roff+5..7, HINTER den REK-Floats (fac_nachbar_ab rechnet das Wandgesetz, Spill-Begrenzung in stream_collide). Kosten bei 4 mm: 3,13-3,28 Mio Facetten x 12 B = 37,6-39,4 MB. Die Stride-Formel steht an FUENF Stellen (lbm.cpp Konstruktor, device_defines, alloc-Waechter, VRAM-Schaetzung; setup.cpp APG-Bericht) -- alle tragen diesen Summanden.
 	static constexpr ulong nb_rek_floats = 5ull; // ★ 24.09.2026 S2: 4 -> 5. Der fuenfte float haelt die aus dem Wandmodellziel bestimmte Amplitude des naechsten Schritts (roff+4). Kosten bei 4 mm: 3,13 Mio Facetten x 4 B = 12,5 MB.
 	Memory<float> fac_nb; Kernel kernel_fac_nachbar; Kernel kernel_fac_apg; bool nachbar_on = false; bool apg_on = false; float apg_kappa = 0.0f; uint apg_haken = 0u; uint apg_moz = 0u; float apg_moz_c = 0.0f, apg_moz_ap0 = 0.0f; ulong nb_stride = 2ull; ulong nb_roff = 2ull; // ★ 23.09. nb_roff: Offset der REK-Felder in fac_nb, EINZIGE Hostquelle (Pruefbefund N7 -- die Formel war an zwei Stellen in setup.cpp dupliziert) // ★ 16.09. HOCH-1 (Pruefagent): APG-Zustand je INSTANZ eingefroren (allocate), weil fahrzeug_dd die Statik vor dem Bau des Fernfelds nullt; // ★ 16.09. kernel_fac_apg: APG-Vorkernel (grad rho in fac_nb[2..4]), nur unter s_fac_apg != 0 gebunden // ★ 03.09. deterministische Nachbarabtastung: (u_t_abt, y_abt) je Facette (2 float) aus eigenem Kernel nach stream_collide, ein Schritt Versatz (fac_wfd-Muster); Konstruktionszustand eingefroren
 	Memory<float> fac_wfd; Kernel kernel_sgs_fdwand; bool fdwand_on = false; // ★ Geistermoden-Fix: w je Facettenzelle (1 float), Konstruktionszustand eingefroren (Emission + Platzhalter im ctor); alloc rebindet ueber den env-Parameter
@@ -495,11 +644,12 @@ public:
 	Memory<uint>  fac_tau_n; // Akkumulator: Anzahl Beitraege
 	Memory<uchar> fac_q; // ★ B1: q je Link (18 uchar je aktive Facette; 0 = kein Schnitt -> HWBB, sonst q = qb/254, 127 = exakt 0,5)
 	// ★ kraft_facetten-GPU-Reduktion: Druckanteil des Cd-Pfads auf dem Geraet statt per Voll-F-Transfer.
-	Memory<uint> kf_liste; // ★ 08.09. uint statt ulong -- der groesste Einzelposten dieser Massnahme (237 MB bei 4 mm)  // Markerzellen-Indexliste (Host-Scan-Reihenfolge der F-BBox)
+	Memory<uint> kf_liste; // ★ 08.09. uint statt ulong; ★ 04.10. KF-FILTER: nur Wandsolidzellen (4 mm 3,74 M statt 62,1 M, ~14 MiB statt 237)  // Markerzellen-Indexliste (Host-Scan-Reihenfolge der F-BBox)
 	Memory<float> kf_psum;   // 3 float je Arbeitsgruppe: px,py,pz-Teilsummen (atomikfrei)
 	Memory<uint>  kf_pcnt;   // 3 uint je Arbeitsgruppe: voll,proj,unklar
 	Kernel kernel_kraft_facetten;
 	ulong kf_N=0ull; uchar kf_marker=0u; bool kf_zper=false, kf_bound=false; // Bindungsschluessel (marker,z_per) + Waechter
+	ulong kf_verworfen=0ull; // ★ 04.10.2026 KF-FILTER (Pruefbefund M2): Markerzellen ohne Wandkontakt (F = 0), die der Listenbau verwirft -- fuer die Zensus-Ausgaben
 	// ★ FORK Kraft-Zerlegung (CFD_KRAFT_ZBAND): zweiter Bindungs-Slot fuer die z-Band-Teilliste (z<zband).
 	// Eigener Puffersatz + eigener Kernel -- der Hauptslot bleibt wortgleich unangetastet.
 	Memory<uint> kfb_liste; // ★ 08.09. uint statt ulong (derselbe Membersatz wie kf_liste)  // Band-Teilliste (dieselbe Scan-Reihenfolge, Filter z<zband)
@@ -509,6 +659,14 @@ public:
 	ulong kfb_N=0ull; uint kfb_zband=0u; uchar kfb_marker=0u; bool kfb_zper=false, kfb_bound=false; // EIGENE Bindungsschluessel (Pruefagent: der Hauptslot aktualisiert kf_marker/kf_zper VOR dem Bandslot-Vergleich -- geteilte Schluessel waeren ein stiller Stolperdraht)
 	void bind_kraft_facetten(const std::vector<ulong>& liste, const uchar marker, const bool z_per, const bool band_slot=false); // Liste hochladen, Kernel binden; band_slot=true -> kfb_*-Satz
 	void kraft_facetten_gpu(double& px, double& py, double& pz, ulong& n_voll, ulong& n_proj, ulong& n_unklar, const bool band_slot=false); // Kernel + double-Endsumme
+	// ★ 04.10.2026 KRAFT-P1: eigener Kernel ueber den Hauptslot kf_liste (gebunden in bind_kraft_facetten, nur band_slot=false).
+	// Feste Gruppenzahl kp1_groups (Grid-Stride, Determinismus wie object_force); je Gruppe 19 float + 12 uint (0,12 MB).
+	Memory<float> kp1_f;     // 19 float je Arbeitsgruppe: [0..2] P x/y/z, [3..10] px Lage 0..7, [11..18] pz Lage 0..7
+	Memory<uint>  kp1_u;     // 12 uint je Arbeitsgruppe: [0] Links, [1..8] Links je Lage, [9] TYPE_E-Quelle, [10] rho an RHO_CLAMP, [11] Wandzellen mit Link
+	Kernel kernel_kraft_p1;
+	uint kp1_groups = 1024u;
+	bool kp1_bound = false;  // true erst, wenn kernel_kraft_p1 wirklich erzeugt ist (leere Liste: false, kraft_p1_gpu liefert dann Nullen mit ok)
+	void kraft_p1_gpu(KP1& k, const uint haken); // haken 1: tt = t statt t-1, 2: Quelle j[i] statt j[ib] (Negativtests des Selbsttests)
 	static bool s_sgs_wandfrei;
 	static bool s_sgs_guo; // ★ 2026-08-25 Guo-Korrektur des Nichtgleichgewichtsmoments im Smagorinsky // Test B: kein nu_t in Wandzellen (CFD_SGS_WANDFREI)
 	static bool s_sgs_diag;
@@ -524,7 +682,13 @@ public:
 
 	Memory<rhoxx> rho; // density of every cell -- Speicherwort, NICHT die Dichte: rho_unpack/rho_pack (TODO 2 Schritt 4)
 	Memory<velxx> u; // velocity of every cell -- Speicherwort, NICHT die Geschwindigkeit: u_unpack/u_pack (TODO 2 Schritt 4)
-	Memory<uchar> flags; // flags of every cell
+	Flags_Puffer flags; // flags of every cell -- ★ 05.10.2026 FLAGS4: Fassade (Hostfeld je Byte, Geraetepuffer ueber flags.k(), siehe Flags_Puffer)
+	bool flags4_on = false;    // ★ 05.10.2026 FLAGS4: Konstruktionszeit-Kopie von s_flags4 (Geraetepuffer 4 Bit je Zelle, JIT-Define FLAGS4)
+	const ulong bau_nr = ++domaenen_bau_zaehler; // ★ 05.10.2026 Korrektur A-N4/B-N4: Instanzkennung je Domaenenbau (Cache-Schluessel von fac_z_karte statt des Zeigers -- ABA-sicher)
+	bool zellbasen_on = false;  // ★ 05.10.2026 ZELLBASEN: Entscheid je Domaene im Konstruktor VOR dem JIT (zellbasen_modus()==1, D3Q19, kein Block-Tiling, sizeof(fpxx)*N < 2^32), JIT-Define ZELLBASEN
+	bool zellbasen_jit = false; // ★ 05.10.2026 ZELLBASEN: aus dem JIT-Text eingefroren (Wirkpfad, Zeile ZELLBASEN im Log)
+	bool flags4_pruef = false; // ★ 05.10.2026 FLAGS4: Konstruktionszeit-Kopie von s_flags4_pruef (CFD_FLAGS4 in der Zeile gesetzt, 0 oder 1): Geraeteprobe nach dem Hochladen und nach initialize
+	uint flags4_geraeteprobe(const string& wann, const bool gegen_host); // lbm.cpp: Kernel flags_pruefsumme gegen die Hostrechnung; liefert die Zahl abweichender 256er-Gruppen
 #ifdef FORCE_FIELD
 	Memory<float> F; // individual force for every cell
 	// ★ 03.09.2026 F-MARKERLISTE (CFD_F_LISTE, Default aus). Layout wie fac_idx: je 32 F-BBox-Zellen
@@ -534,7 +698,8 @@ public:
 	Memory<uint> f_maske;
 	bool fac_rek_r3_jit = false; bool fac_rek_s2_jit = false; // ★ 23.09. R3-Arm im uebersetzten Kernel (aus dem JIT-Text, nicht aus der Statik)
 	ulong fac_rek_marken = 0ull; float fac_rek_eps = 0.0f; // ★ 22.09. S0: Zahl der gesetzten Marken und die Amplitude -- Vergleichsgroessen fuer die Abnahme
-	bool fac_r1q_on = false; uint fac_r1q_stufe = 0u; bool fac_r1q_jit = false; bool fac_r1q_an_jit = false; bool fac_r1q_vr_jit = false; bool fac_r1q_od_jit = false; ulong fac_r1q_marken = 0ull; // ★ 28.09. R1Q: Hostzustand, Kernelzustand aus dem JIT-Text (Mess-/Anwendungsdefine getrennt), Zahl der gesetzten Marken
+	bool fac_r1q_on = false; uint fac_r1q_stufe = 0u; bool fac_r1q_jit = false; bool fac_r1q_an_jit = false; bool fac_r1q_vr_jit = false; bool fac_r1q_od_jit = false; bool fac_r1q_k2_jit = false; bool sc_simd16_jit = false; ulong sc_spill = ~0ull; ulong sc_private = ~0ull; ulong fac_r1q_marken = 0ull; // ★ 28.09. R1Q: Hostzustand, Kernelzustand aus dem JIT-Text (Mess-/Anwendungsdefine getrennt), Zahl der gesetzten Marken
+	bool fac_rekpi_on = false; uint fac_rekpi_stufe = 0u; bool fac_rekpi_jit = false; bool fac_rekpi_an_jit = false; bool fac_rekpi_nur_u_jit = false; // ★ 04.10. Stufe 3 = FAC_REKPI_NUR_U // ★ 03.10. REK-PI: Host eingefroren (Konstruktor) gegen JIT-Text (Kohaerenz in alloc_facetten_domain)
 	bool fac_rek_on = false; bool fac_rek_jit = false; // ★ 22.09. S0: Hostzustand und der aus dem JIT-Text gelesene Kernelzustand -- alloc vergleicht sie (Pruefbefund M2 vom selben Tag)
 	bool fac_pinv_on = false; // Konstruktionszustand eingefroren
 	bool fac_idx_voll_on = false; // Konstruktionszustand eingefroren; true = alte Vollfeld-Bauform von fac_idx
@@ -561,7 +726,28 @@ public:
 	Kernel kernel_sgs_band;
 	void alloc_sgs_band(const uchar* flags_host, const uint Nx, const uint Ny, const uint Nz, const uint lagen);
 	uint pruefe_rho_rand_c0(const uchar* flags_host, const uint Nx, const uint Ny, const uint Nz, const bool testhaken); // ★ 15.09. RHO_RAND C0: Host-Waechter (R1-Abdeckung aller rho-Leser) + APG-Zensus; liefert die Zahl der Beanstandungen
+	// ★ 04.10.2026 U_RAND U0 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.8/B.10): Mengenbau und Host-Zensus. Reine Hostpruefung, kein Geraetecode.
+	// E = statische u-Lesemenge im Nahfeldinneren (Facetten L1, ihre sgs_fdwand-Achsnachbarn, fac_nachbar_ab-Linkziele, Wandsolid fuer
+	// update_force_field, Solidnachbarn kuenftiger TYPE_MS-Zellen); R1 = Randschale Dicke 2; C = N2F-4^3-Bloecke. Liefert die Beanstandungen.
+	struct URandMengen {
+		std::vector<ulong> e_bits;                 // N Bits, gesetzt = Zelle in E (auch wenn sie zugleich in R1 liegt)
+		ulong n_e_aus = 0ull, n_e_r1 = 0ull;       // |E ohne R1|, |E in R1|
+		uint ex0=0u, ey0=0u, ez0=0u, enx=0u, eny=0u, enz=0u; // Huelle von E ohne R1 (Ursprung, Masse; leer = 0)
+		uint cbx0=0u, cby0=0u, cbz0=0u, cbnx=0u, cbny=0u, cbnz=0u; // Huelle der N2F-Bloecke in BLOCKkoordinaten (Block = (x+2)/4)
+		std::vector<ulong> c_bits;                 // Blockmenge ueber die Blockhuelle (1 Bit je Block)
+		ulong n_bloecke = 0ull;
+		uint gx0=0u, gy0=0u, gz0=0u, gnx=0u, gny=0u, gnz=0u; // Grossbox (Stufe 1a) = Huelle von (E ohne R1) und den Blockzellen
+		uint cr = 4u, ch = 2u; // ★ 05.10.2026 Korrektur A-H1: Blockkante = ratio, Fensterversatz = ratio/2 (schale_extract: Fenster [c-ch, c-ch+cr)), Block(x) = (x+ch)/cr
+		std::vector<ulong> zentren; // ★ A-H1: Kopie der N2F-Deckungspunkte fuer die Fensterprobe NACH dem Layout (alloc_u_rand), danach geleert
+		std::vector<ulong> haken_aus; // ★ 05.10.2026 Laufzeit-Testhaken 6/7/8 (CFD_U_RAND_TESTHAKEN): Zellen, die ur_layout (Modus 3) NICHT speichert -- leer im Normalbetrieb
+	};
+	URandMengen ur_mengen; // gefuellt von pruefe_u_rand_c0, gelesen vom Speicherbau (ab U1d)
+	uint pruefe_u_rand_c0(const uchar* flags_host, const velxx* u_host, const uint Nx, const uint Ny, const uint Nz, const std::vector<ulong>& n2f_zentren, const uint ratio, const float u_lat, const uint testhaken); // ★ 05.10.2026 A-H1: ratio (Blockkante der N2F-Fenster)
 	void alloc_f_liste(const uchar* flags_host, const uint Nx, const uint Ny, const uint Nz); // baut Maske+Praefix, legt F neu an, rebindet
+	// ★ 04.10.2026 KF-FILTER (Pruefbefund M1): DAS Wandsolid-Praedikat von alloc_f_liste, herausgezogen -- Solid (nicht TYPE_E) mit mindestens einem
+	// Nicht-Solid-Nachbarn unter den 18 (D3Q27: 26) Richtungen, z ausserhalb des Gitters zaehlt als Wand. Der kf_liste-Filter nutzt es in BEIDEN
+	// Armen (CFD_F_LISTE 0/1), damit die Liste armgleich bleibt; alloc_f_liste ruft dieselbe Funktion (wortgleich per Konstruktion).
+	static bool wand_solid_host(const uchar* flags_host, const uint x, const uint y, const uint z, const uint Nx, const uint Ny, const uint Nz);
 	// Zelle (als F-BBox-Index) -> F-Slot. AUSDRUCKSGLEICH zu f_slot() in kernel.cpp -- beide Pfade
 	// werden von CFD_FAC_GPU_PRUEF zahlenscharf gegeneinander gestellt.
 	inline bool f_slot_host(const ulong fbi, ulong& slot) const {
@@ -985,6 +1171,7 @@ public:
 	class U_Feld {
 	private:
 		Memory_Container<velxx> c;
+		LBM* lbm_ = nullptr; bool rand = false; // ★ 04.10.2026 U_RAND: im RAND-Betrieb ist c der volle HOSTSPIEGEL, der Geraetepuffer ist kompakt
 	public:
 		// Der Stellvertreter setzt auf den KOMPONENTENZEIGERN auf, die Memory_Container ohnehin
 		// oeffentlich fuehrt (Pointer x/y/z). reference() selbst ist dort privat, und das bleibt es --
@@ -992,19 +1179,20 @@ public:
 		class Komp {
 		private:
 			Memory_Container<velxx>::Pointer* p = nullptr;
+			const U_Feld* f = nullptr; // ★ 04.10.2026 U_RAND U1b: fuer die Zugriffssperre
 		public:
 			inline Komp() {}
-			inline Komp(Memory_Container<velxx>::Pointer* p) : p(p) {}
+			inline Komp(Memory_Container<velxx>::Pointer* p, const U_Feld* f) : p(p), f(f) {}
 			class Ref { // was aus u.x[n] wird: liest ueber u_unpack, schreibt ueber u_pack
 			private:
-				Memory_Container<velxx>::Pointer* p; ulong i;
+				Memory_Container<velxx>::Pointer* p; ulong i; const U_Feld* f;
 			public:
-				inline Ref(Memory_Container<velxx>::Pointer* p, const ulong i) : p(p), i(i) {}
-				inline operator float() const { return u_unpack((*p)[i]); } // Zusage 1: GENAU EINE Wandlung
-				inline Ref& operator=(const float v) { (*p)[i] = u_pack(v); return *this; }
+				inline Ref(Memory_Container<velxx>::Pointer* p, const ulong i, const U_Feld* f) : p(p), i(i), f(f) {}
+				inline operator float() const { if(f->rand) f->pruefe_zugriff(i); return u_unpack((*p)[i]); } // Zusage 1: GENAU EINE Wandlung. ★ U_RAND: Stempelpruefung
+				inline Ref& operator=(const float v) { if(f->rand) f->pruefe_schreiben(i); (*p)[i] = u_pack(v); return *this; } // ★ 05.10.2026 A-N3: Schreibsperre ohne Slot nach initialize
 				inline Ref& operator=(const Ref&) = delete; // Zusage 3: keine stille Neubindung
 			};
-			inline Ref operator[](const ulong i) const { return Ref(p, i); }
+			inline Ref operator[](const ulong i) const { return Ref(p, i, f); }
 		};
 		Komp x, y, z;
 		inline U_Feld() {}
@@ -1015,18 +1203,43 @@ public:
 		U_Feld& operator=(const U_Feld&) = delete;
 		inline U_Feld(LBM* lbm, Memory<velxx>** buffers, const string& name) : c(lbm, buffers, name) { zeiger_setzen(); }
 		inline U_Feld& operator=(Memory_Container<velxx>&& m) noexcept { c = std::move(m); zeiger_setzen(); return *this; }
-		inline void read_from_device() { c.read_from_device(); }
-		inline void write_to_device() { c.write_to_device(); }
+		inline void read_from_device() { if(rand) read_rand(); else c.read_from_device(); }
+		inline void write_to_device() { if(rand) write_rand(); else c.write_to_device(); }
 		inline const ulong length() const { return c.length(); }
+		void binde_rand(LBM* l); // lbm.cpp -- ★ 04.10.2026 U_RAND
+		inline bool ist_rand() const { return rand; }
 	private:
-		inline void zeiger_setzen() { x = Komp(&c.x); y = Komp(&c.y); z = Komp(&c.z); }
+		void read_rand();  // lbm.cpp: kompakten Puffer lesen, in den Spiegel streuen
+		void write_rand(); // lbm.cpp: Spiegel packen, kompakten Puffer schreiben
+		inline void zeiger_setzen() { x = Komp(&c.x, this); y = Komp(&c.y, this); z = Komp(&c.z, this); }
+	public:
+		void pruefe_zugriff(const ulong n) const; // lbm.cpp -- ★ 04.10.2026 U_RAND U1b: Zugriffssperre (harter Fehler ausserhalb der Stempel)
+		void pruefe_schreiben(const ulong n) const; // lbm.cpp -- ★ 05.10.2026 A-N3: Schreibsperre (Zelle ohne Slot nach initialize -> harter Fehler)
 	};
 
 	LBM_Domain** lbm_domain; // one LBM domain per GPU
 
 	Rho_Feld rho; // density of every cell -- Zugriff ueber get/set, siehe Rho_Feld
 	U_Feld u; // velocity of every cell -- Zugriff ueber u.x/u.y/u.z, siehe U_Feld
-	Memory_Container<uchar> flags; // flags of every cell
+	// ★ 05.10.2026 FLAGS4 F3 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md C.2): flags der Huelle. Hostzugriff unveraendert ueber den Container
+	// (er zeigt auf das volle Bytefeld je Domaene), die Synchronisation laeuft ueber Flags_Puffer der Domaenen. Der Container selbst
+	// darf NICHT mehr lesen/schreiben: unter FLAGS4 hat sein Puffer keinen Geraeteteil, ein Aufruf liefe still ins Leere.
+	class Flags_Feld {
+	private:
+		Memory_Container<uchar> c;
+		LBM* lbm_ = nullptr;
+	public:
+		inline Flags_Feld() {}
+		Flags_Feld(const Flags_Feld&) = delete;
+		Flags_Feld& operator=(const Flags_Feld&) = delete;
+		inline Flags_Feld& operator=(Memory_Container<uchar>&& m) noexcept { c = std::move(m); return *this; }
+		inline void binde(LBM* l) { lbm_ = l; }
+		inline uchar& operator[](const ulong n) { return c[n]; }
+		inline const ulong length() const { return c.length(); }
+		void read_from_device();  // lbm.cpp: wie Memory_Container::read_from_device, aber ueber Flags_Puffer je Domaene
+		void write_to_device();   // lbm.cpp: dito
+	};
+	Flags_Feld flags; // flags of every cell -- ★ 05.10.2026 FLAGS4: Hostzugriff wie bisher, Synchronisation ueber die Domaenen-Fassade
 #ifdef FORCE_FIELD
 	Memory_Container<float> F; // individual force for every cell
 #endif // FORCE_FIELD
@@ -1080,12 +1293,13 @@ public:
 	// auf der feinen Domaene. Beide erfordern einen vorherigen run() (Kernel brauchen initialisierte Puffer).
 	bool plane_fits(const PlaneSpec& plane, const char* who) const; // prueft, dass die Ebene ganz in der Domaene liegt
 	void alloc_coupling_planes(const ulong max_plane_cells);
-	void extract_plane_macros(const PlaneSpec& plane, std::vector<float>& host_buf); // liest (rho,u) einer Ebene in host_buf (4 floats/Zelle)
+	void extract_plane_macros(const PlaneSpec& plane, std::vector<float>& host_buf, const bool u_verwerfen=false); // liest (rho,u) einer Ebene in host_buf (4 floats/Zelle); ★ 05.10.2026 C-N2: unter U_RAND nur mit u_verwerfen = true
 	void rho_rek_ebene(const PlaneSpec& plane, const ulong t_rek, const uint modus, std::vector<float>& out4, std::vector<rhoxx>& worte); // ★ 15.09. RHO_RAND C1/C2a: rho einer Ebene aus den DDFs bei t_rek; modus 0 = Identitaet (t), 1 = Nachkollision (t-1, ohne MS)
 	void rho_ausgabe_ebene(const PlaneSpec& plane, const ulong t_aus, const bool zaehlen, std::vector<float>& out); // ★ 15.09. RHO_RAND C2a: Ausgabe-rho (Nachkollisionssumme), t_aus = get_t()-1
 	void rho_schicht_in_host(const uint z, const bool zaehlen); // ★ 15.09. RHO_RAND C2c: z-Schicht der Ausgabe in den rho-Cache (VTK)
 	ulong rho_aus_gezaehlt_zellen = 0ull, rho_aus_gezaehlt_e = 0ull, rho_aus_ist_219 = 0ull, rho_aus_ist_220 = 0ull; // ★ C2c: Ist=Soll der gezaehlten Ausgabeaufrufe (Slots 219/220)
 	ulong rho_aus_rr_verglichen = 0ull, rho_aus_rr_abw = 0ull; // ★ C2c: Geraete-rr_idx gegen Host-rr_idx_host an TYPE_E der gezaehlten Ebene (Soll: verglichen > 0, Abweichungen 0)
+	void u_rand_ausgabe(); // ★ 04.10.2026 U_RAND U1c: nach einem Grobschritt mit Leseplan V/R1 lesen, in den Spiegel streuen, Stempel setzen
 	void lese_yslice_in_host(const uint y); // ★ Slice-Ebenen-Read 2026-08-26: (rho,u,flags) EINER y-Ebene per Device-Gather in die Host-Arrays streuen (Transportweg-Optimierung, wertgleich)
 	void drive_boundary_from_coarse(const PlaneSpec& fine_plane, const std::vector<float>& coarse_face, const uint coarse_a, const uint coarse_b, const uint ratio); // kubischer Lift in die TYPE_E-Randzellen
 	// ★ P9c N2F-SCHALE (Heiko): near->far-Schalen-Rueckkopplung. Reihenfolge: alloc_schale() auf
@@ -1270,3 +1484,8 @@ public:
 	Graphics graphics;
 #endif // GRAPHICS
 }; // LBM
+
+// ★ 03.10.2026 EINZIGE QUELLE der Bytes je Zelle und Schritt fuer die Bandbreitenanzeige (Laufzeile info.cpp, Grafiklabel
+// main.cpp, [GPU]-Zeilen setup.cpp). Upstream-KONVENTION (bandwidth_bytes_per_cell_device), keine Messung; unter RHO_RAND
+// faellt der rho-Anteil weg (Entscheidung Heiko 7, 15.09.). Wertgleich zum bisherigen Ausdruck in info.cpp/main.cpp.
+double bpz_konv(const LBM& lbm); // ★ 05.10.2026 double: FLAGS4 zaehlt flags mit 0,5 B (Pruefbefund FLAGS4 N1). ★ 05.10.2026 C-N11: U_RAND/U_SPARSAM (u-Schreibbytes je Zelle) gehen NICHT ein -- gbps_konv ist eine KONVENTION (Upstream-Bytezahl je Zelle), keine Messgroesse; nur Anzeige

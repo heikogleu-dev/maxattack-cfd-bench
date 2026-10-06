@@ -3,6 +3,12 @@
 # dx_ref: 4
 # Spalten: NAME WERT EINHEIT
 # --- BEGRUENDUNGEN (bleiben bei Neuerzeugung erhalten) ---
+# NACHGEZOGEN (von Hand, 2026-10-05 spaet, Heiko 05.10.: "N=10 Standard" -- Sweep SWEEP-SPZ-ZB4-2026-10-05.md: Gittermode setzt erst zwischen 10 und 9 ein, N = 10 Cp'-rms/y-Mode wie 12, Dachfeld <= 0,7 SE am Bezug, -15,5 % Wanduhr): CFD_SCHRITTE_PRO_ZELLE 12 -> 10 (u_lat 0,0833 -> 0,1, Ma_lat 0,144 -> 0,173). basis_aus_lauf.py --nachziehen aendert keine Werte (bricht bei vorhandenem Schalter ab) -- deshalb von Hand. Die schritte_fein-Schalter (ZAEHL_TAKT, SISM_AB/T, SLICE_NEAR_STEPS) bleiben auf u_lat 0,075/dx_ref definiert und werden im Lauf umgerechnet (env_schritte). Voraussetzung erfuellt: Slot-206-Waechter zaehlt seit 5c92642 im 4-Schritt-Fenster (bei N = 10 traf der Einzelschritt einen Vollschreibschritt, rc 1). Bezuege mit 12 (Anker 15378211796086792561) deklarieren ab jetzt CFD_SCHRITTE_PRO_ZELLE=12. Offen: Einsatzpunkt der Gittermode bei 4 mm nicht gemessen (nur 8 mm).
+# NACHGEZOGEN (basis_aus_lauf.py --nachziehen, 2026-10-05, Grund: Pruefbefund C-N6 (AUDIT-LOOP-2026-10-05-C): Laufzeit-Schalter mit Vorgabe 1 ohne Basiszeile -- ein Wechsel der Code-Vorgabe waere fuer den Waechter unsichtbar (Klasse Nebenbefund 12); Werte = heutige Vorgaben, Feld unveraendert): Einheiten unveraendert; ergaenzt CFD_ZELLBASEN 1, CFD_RHO_RAND 1.
+# NACHGEZOGEN (basis_aus_lauf.py --nachziehen, 2026-10-05, Grund: Heiko 05.10.: geprueft + Wirkung belegt => Standard. FLAGS4 (flags 4 Bit), Pruefung bc35a5f ohne HOCH, B70 8 mm Anker bitgleich in 5 Armen (Binary 0784be9, auch mit U_RAND 3), 4 mm -312,3 MiB VRAM, Wanduhr gleich): Einheiten unveraendert; ergaenzt CFD_FLAGS4 1.
+# NACHGEZOGEN (basis_aus_lauf.py --nachziehen, 2026-10-05, Grund: Heiko 05.10.: geprueft + Wirkung belegt => Standard. U_RAND Modus 3, Pruefungen 960bbcb+205de58 ohne HOCH, B70 8 mm Anker bitgleich (Binary 0784be9), 4 mm ~2,7 GB VRAM frei, Wanduhr -0,4 %): Einheiten unveraendert; ergaenzt CFD_U_RAND 3.
+# NACHGEZOGEN (basis_aus_lauf.py --nachziehen, 2026-10-04, Grund: Heiko 04.10.2026: Kontaktband lagenfest N = 4 bei jedem dx (KRAFT-P1-Bau, cd_rest/cz_rest ueber dx vergleichbar)): Einheiten CFD_KRAFT_ZBAND band_oberkante_mm->lagen (Wert 16 mm Sollhoehe -> 4 Lagen, Heiko 04.10.2026 Kontaktband lagenfest).
+# NACHGEZOGEN (von Hand, 2026-10-03 abends, Heiko: "12 Zellbesuche wird wieder ab sofort Standard"): CFD_SCHRITTE_PRO_ZELLE 8 -> 12 (u_lat 0,125 -> 0,0833, Ma_lat 0,217 -> 0,144). Grund: Leiter logs/serie_spz_leiter_f8.txt -- Gittermode (y-Periode ~3 Zellen) ueber dem Dach bei 8: Cp-rms 0,355 / y-Mode 90 %, bei 12: 0,017 / 1,4 %; Wanduhr +46 %. Laeufe vor diesem Datum mit 8 tragen die Mode.
 # NACHGEZOGEN (von Hand, 2026-09-21, Heiko-Entscheid: KASTEN-REGELWERK). Die Boxmasse sind ab jetzt KEINE Schalter mehr,
 #   sondern werden in setup.cpp aus Fahrzeugmassen und Randfaktoren abgeleitet (BOX-REGELWERK.md, Ist=Soll-Abnahme im Lauf).
 #   ENTFERNT: CFD_FAR_LX 12.2720 (Regel: X- 0,625 L / X+ 1,250 L -> 12,784 m), CFD_NEAR_LY 2.6400 (0,25 B -> 2,768 m),
@@ -152,6 +158,14 @@
 #     drift-frei: 5000 feine Schritte = 50,0 ms bei 4 mm (dt_f = 1e-5 s), skaliert wie zellen_fein mit
 #     dx_ref/dx -> 2500 bei 8 mm (dt_f = 2e-5 s). Einheit zellen_fein bewusst, weil dt_f proportional dx.
 #     Der Diff-Schnitt ist im Kadenz-Modus per Default AUS (Heiko 26.08.), CFD_DIFF_SCHNITT=1 reaktiviert ihn.
+# STANDARD GEAENDERT (Heiko 04.10.2026 abends, "alles maximal VRAM-sparsam und performant", U_RAND baut darauf auf): U_SPARSAM 0 -> 1.
+#   Im Pi-Modus greift der Waechter U_SPARSAM x BAND nicht; 8 mm bitgleich (vs_us0_a/vs_us1_a, Hash 15378211796086792561), -1,5 % Wanduhr.
+# ERGAENZT (04.10.2026 abends, Heiko: "Wenn wir einen Fehler in der Buchung/Aufteilung der Reibung haben, dann bitte direkt im Anschluss korrigieren"):
+#   CFD_REIB_TANGENTIAL 1 -- cd_reib/cz_reib enthalten nur noch den TANGENTIALEN Teil von fac_tau; der Normalanteil (ELIBB-Blendenimpuls,
+#   Wanddruck) steht in den neuen Spalten cd_reib_n/cz_reib_n. Reine Host-Buchung, Feld bitgleich (PLAN-REIBBUCHUNG-2026-10-04.md).
+#   0 = alte Buchung (A/B im selben Binary). cd_rest/cz_rest und P1 sind davon unberuehrt.
+#   ★ 05.10.2026 (Pruefbefund C-N8): "unberuehrt" gilt fuer den SCHALTER. Seit 05.10. ist das BERICHTETE cd_rest aber cd_rest_p MIT dem
+#   Rest-Normalanteil (REIB-N-REST, setup.cpp [REIB-N-REST]; haengt NICHT am Schalter) -- cd_rest_p ist nicht dasselbe wie das alte cd_druck_rest.
 CFD_BODEN_EQ 2 lagen
 CFD_BODEN_EQ_ABSTAND 2 zellen_fein
 CFD_BODEN_EQ_DOWN 1 lagen
@@ -173,9 +187,10 @@ CFD_FAC_UTKORR 1.5 modus
 CFD_FERN_BODEN_EQ 2 lagen
 CFD_FERN_BODEN_EQ_DOWN 1 lagen
 CFD_FERN_EINLASS_EQ 2 lagen
+CFD_FLAGS4 1 modus
 CFD_F_LISTE 1 modus
 CFD_KOPPLUNG_GLATT 1 modus
-CFD_KRAFT_ZBAND 16 band_oberkante_mm
+CFD_KRAFT_ZBAND 4 lagen
 CFD_N2F_BAND 1 modus
 CFD_N2F_BAND_N 8 zellen_grob_laenge
 CFD_N2F_BAND_PLATEAU 2 zellen_grob_laenge
@@ -188,8 +203,10 @@ CFD_N2F_SCHALE 0.5 modus
 CFD_PERF_AB 0.1 phys
 CFD_POSITIV 2 modus
 CFD_PTRT 1.90 modus
+CFD_REIB_TANGENTIAL 1 modus
+CFD_RHO_RAND 1 modus
 CFD_RHO_SPARSAM 1 modus
-CFD_SCHRITTE_PRO_ZELLE 8 modus
+CFD_SCHRITTE_PRO_ZELLE 10 modus
 CFD_SGS_BAND 2 modus
 CFD_SGS_BAND_PI 1 modus
 CFD_SGS_FDWAND 1 modus
@@ -201,8 +218,10 @@ CFD_SPONGE_N 64 zellen_grob_laenge
 CFD_T_END 0.741 phys
 CFD_T_WARMUP 0.201 phys
 CFD_U_KLEMME 1 modus
-CFD_U_SPARSAM 0 modus
+CFD_U_RAND 3 modus
+CFD_U_SPARSAM 1 modus
 CFD_VTK_DT 0.15 ausgabe
 CFD_VTK_ENDE 1 ausgabe
 CFD_Y_VERSATZ 1 modus
 CFD_ZAEHL_TAKT 1000 schritte_fein
+CFD_ZELLBASEN 1 modus
