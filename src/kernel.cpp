@@ -1090,9 +1090,52 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 	return (ulong)slot*((ulong)def_TILE*def_TILE*def_TILE*def_velocity_set) + (ulong)loc;
 }
 )+"#else"+R(
+)+"#ifdef ZK"+R(
+// ★ 06.10.2026 ZKS Z4 -- KALTER Index fuer alle fi-Leser/-Schreiber ausser dem heissen Pfad von stream_collide (Makro index_f -> zk_index_f,
+// tile_slot = Zeilentabelle ueber TS_P, Muster SPARSE_TILES). Zeile r = n/Nx, Satz der eigenen Zeile (k = 0): [16+16r] = r*Nx - P[r],
+// [16+16r+8] = E | L<<16 (Loch [E-L, E)). Lochzelle -> Papierkorb PK = Kopf [2]; Stride S = Kopf [1]. Lochzellen erreichen nur initialize
+// (schreibt alle Zellen) und Nachbarschreibzugriffe aus initialize -- gelesen wird der Papierkorb nie (Halo-2-Invariante, Zensus).
+ulong zk_index_f(const uxx n, const uint i, const global uint* zt) {
+	const uint r = (uint)((ulong)n/(ulong)def_Nx);
+	const uint x = (uint)((ulong)n-(ulong)r*(ulong)def_Nx);
+	const uint b0 = zt[16u+16u*r];
+	const uint el = zt[16u+16u*r+8u];
+	const uint e = el&0xFFFFu;
+	const uint l = el>>16;
+	const uint c = (x+l>=e&&x<e) ? zt[2] : x+b0-(x>=e ? l : 0u);
+	return (ulong)i*(ulong)zt[1]+(ulong)c;
+}
+// ★ 06.10.2026 ZKS Z4b: kalter Pfad von load_f/store_f. VTune Z4 (B70, 8 mm): boden_eq +19,9 % (+0,66 Pkt. der Nahfeldzeit), weil jeder der 38
+// Zugriffe ueber zk_index_f eine Division n/Nx und zwei Tabellen-Gathers kostete. Jetzt EIN vload16 des Zeilensatzes der eigenen Zeile; die 7
+// Nachbarzeilen stehen darin (Zuordnung wie zk_basen, D3Q19), der Lochterm wird je Lane und Spalte gerechnet (kein Untergruppen-Argument:
+// kalte Kernel laufen im dichten Dispatch). Lochzelle -> Papierkorb PK. Liefert Kompaktindizes in Zellen (ohne Richtungsversatz).
+ulong zk_kalt_c(const uint xx, const uint b0, const uint el, const uint pk) {
+	const uint e = el&0xFFFFu;
+	const uint l = el>>16;
+	return (ulong)((xx+l>=e&&xx<e) ? pk : xx+b0-(xx>=e ? l : 0u));
+}
+void zk_kalt_basen(const uxx n, const global uint* zt, ulong* zc) { // zc[0] = eigene Zelle, zc[(i+1)/2] = Nachbar j[i] (i ungerade), wie zk_basen
+	const uint r = (uint)((ulong)n/(ulong)def_Nx);
+	const uint x = (uint)((ulong)n-(ulong)r*(ulong)def_Nx);
+	const uint16 s = vload16(0u, zt+16u+16u*r);
+	const uint pk = zt[2];
+	const uint xp = x+1u==def_Nx ? 0u : x+1u;
+	zc[0] = zk_kalt_c(x , s.s0, s.s8, pk);
+	zc[1] = zk_kalt_c(xp, s.s0, s.s8, pk);
+	zc[2] = zk_kalt_c(x , s.s1, s.s9, pk);
+	zc[3] = zk_kalt_c(x , s.s2, s.sa, pk);
+	zc[4] = zk_kalt_c(xp, s.s1, s.s9, pk);
+	zc[5] = zk_kalt_c(xp, s.s2, s.sa, pk);
+	zc[6] = zk_kalt_c(x , s.s3, s.sb, pk);
+	zc[7] = zk_kalt_c(xp, s.s4, s.sc, pk);
+	zc[8] = zk_kalt_c(xp, s.s5, s.sd, pk);
+	zc[9] = zk_kalt_c(x , s.s6, s.se, pk);
+}
+)+"#else"+R( // ZK
 )+R(ulong index_f(const uxx n, const uint i) { // 64-bit indexing for DDFs
 	return (ulong)i*def_N+(ulong)n; // SoA (>2x faster on GPUs)
 }
+)+"#endif"+R( // ZK
 )+"#endif"+R( // SPARSE_TILES
 )+R(float c(const uint i) { // avoid constant keyword by encapsulating data in function which gets inlined by compiler
 	const float c[3u*def_velocity_set] = {
@@ -1612,11 +1655,22 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 		fhn[i+1u] = load(fi, cbj[i] + (ulong)(t%2ul ? i+1u : i   )*T3);
 	}
 )+"#else"+R(
+)+"#ifdef ZK"+R( // ★ 06.10.2026 ZKS Z4b: Zellbasen aus dem Zeilensatz (j[] bleibt fuer die Aufrufer, hier ungenutzt)
+	ulong zc[10];
+	zk_kalt_basen(n, tile_slot, zc);
+	const ulong zs = (ulong)tile_slot[1];
+	fhn[0] = load(fi, zc[0]); // Esoteric-Pull
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		fhn[i   ] = load(fi, zc[0]         +(ulong)(t%2ul ? i    : i+1u)*zs);
+		fhn[i+1u] = load(fi, zc[(i+1u)/2u]+(ulong)(t%2ul ? i+1u : i   )*zs);
+	}
+)+"#else"+R( // ZK
 	fhn[0] = load(fi, index_f(n, 0u)); // Esoteric-Pull
 	for(uint i=1u; i<def_velocity_set; i+=2u) {
 		fhn[i   ] = load(fi, index_f(n   , t%2ul ? i    : i+1u));
 		fhn[i+1u] = load(fi, index_f(j[i], t%2ul ? i+1u : i   ));
 	}
+)+"#endif"+R( // ZK
 )+"#endif"+R( // SPARSE_TILES
 }
 )+R(void store_f(const uxx n, const float* fhn, global fpxx* fi, const uxx* j, const ulong t TS_P) {
@@ -1631,14 +1685,25 @@ ulong cell_base(const uxx n, const global uint* tile_slot) {
 		store(fi, cbn    + (ulong)(t%2ul ? i    : i+1u)*T3, fhn[i+1u]);
 	}
 )+"#else"+R(
+)+"#ifdef ZK"+R( // ★ 06.10.2026 ZKS Z4b: wie load_f
+	ulong zc[10];
+	zk_kalt_basen(n, tile_slot, zc);
+	const ulong zs = (ulong)tile_slot[1];
+	store(fi, zc[0], fhn[0]); // Esoteric-Pull
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		store(fi, zc[(i+1u)/2u]+(ulong)(t%2ul ? i+1u : i   )*zs, fhn[i   ]);
+		store(fi, zc[0]         +(ulong)(t%2ul ? i    : i+1u)*zs, fhn[i+1u]);
+	}
+)+"#else"+R( // ZK
 	store(fi, index_f(n, 0u), fhn[0]); // Esoteric-Pull
 	for(uint i=1u; i<def_velocity_set; i+=2u) {
 		store(fi, index_f(j[i], t%2ul ? i+1u : i   ), fhn[i   ]);
 		store(fi, index_f(n   , t%2ul ? i    : i+1u), fhn[i+1u]);
 	}
+)+"#endif"+R( // ZK
 )+"#endif"+R( // SPARSE_TILES
 }
-)+"#ifdef ZELLBASEN"+R(
+)+"#if defined(ZELLBASEN)||defined(ZK)"+R( // ★ 06.10.2026 ZKS: die Byte-Zellbasen-Helfer traegt auch ZK (PLAN-ZKS-VOLLBAU K3)
 // ★ 05.10.2026 BYTE-ZELLBASEN (CFD_ZELLBASEN, Vorgabe 1; PLAN-ZELLBASEN-2026-10-05.md, Messarm 6 aus TILING-AUFHOLEN-2026-10-05.md):
 // nur stream_collide. Je Zelle EINMAL cb = sizeof(fpxx)*j (uint), je fi-Zugriff nur noch Richtungsversatz (JIT-Konstante) + cb, also
 // eine 64-Bit-Addition statt mov/add.q/shl.q/add.q in index_f. Dieselben Byteadressen wie index_f -> bitgleich, solange
@@ -1668,7 +1733,160 @@ void store_f_zb(const float* fhn, global fpxx* fi, const ulong t, const uint* cb
 		zb_st(fi, (ulong)sizeof(fpxx)*(ulong)(t%2ul ? i    : i+1u)*(ulong)def_N, cb[0], fhn[i+1u]);
 	}
 }
-)+"#endif"+R( // ZELLBASEN
+)+"#endif"+R( // ZELLBASEN || ZK
+)+"#ifdef ZK"+R(
+// ★ 06.10.2026 ZKS -- ZEILENKOMPAKTIERUNG, Geraeteseite (CFD_ZK, PLAN-ZKS-VOLLBAU-2026-10-06.md; Messarme TILING-AUFHOLEN 5/10/11, M-Z 06.10.).
+// stream_collide laeuft im Pad-Dispatch (jede Arbeitsgruppe ganz in einer Zeile r = y+Ny*z) und laedt je Untergruppe EINEN Zeilensatz
+// (16 uint = 64 B, zk_tab[16+16r ...]): [k] = r'_k*Nx - P[r'_k] fuer die 7 Nachbarzeilen k = (dy,dz) (0,0) (+1,0) (0,+1) (+1,+1) (-1,0)
+// (0,-1) (+1,-1), periodisch vom Host eingerechnet; [8+k] = E_k | L_k<<16 (Lochende, Lochlaenge; Loch [E-L, E) auf W = 16 ausgerichtet).
+// Der Lochterm haengt nur am ersten x der Untergruppe (x_sg >= E ? L : 0): eine Lane, deren Nachbarspalte in einem Loch laege, hat
+// Chebyshev-Abstand <= 1 zu einer Lochzelle und ist darum selbst Solid (Loch-Invariante Halo 2) -- sie steigt vor jedem fi-Zugriff aus.
+// Einziger Sonderfall ist der x-Umlauf (x = Nx-1, dx = +1, Ziel x' = 0 mit Lochterm 0): select je Lane. In Z2 ist die Tabelle LEER
+// (P = 0, L = 0): die Adressen sind bytegleich zu ZELLBASEN, der Kernel also bitgleich zu CFD_ZK=0.
+void zk_basen(const uint x, const uint8 zr, const uint8 zt, uint* cb) { // 10 Byte-Zellbasen, Reihenfolge n, j1, j3, ..., j17 (wie zb_basen)
+	const uint xp = x+1u;
+	const uint w = (uint)(xp==def_Nx);
+	cb[0] = (uint)sizeof(fpxx)*(x+zr.s0);
+	cb[1] = (uint)sizeof(fpxx)*(select(xp, zt.s0, w)+zr.s0);
+	cb[2] = (uint)sizeof(fpxx)*(x+zr.s1);
+	cb[3] = (uint)sizeof(fpxx)*(x+zr.s2);
+	cb[4] = (uint)sizeof(fpxx)*(select(xp, zt.s1, w)+zr.s1);
+	cb[5] = (uint)sizeof(fpxx)*(select(xp, zt.s2, w)+zr.s2);
+	cb[6] = (uint)sizeof(fpxx)*(x+zr.s3);
+	cb[7] = (uint)sizeof(fpxx)*(select(xp, zt.s4, w)+zr.s4);
+	cb[8] = (uint)sizeof(fpxx)*(select(xp, zt.s5, w)+zr.s5);
+	cb[9] = (uint)sizeof(fpxx)*(x+zr.s6);
+}
+// ★ 06.10.2026 ZKS Z4: Stride S = N'+Papierkorb (auf 64 gerundet) steht erst nach der Voxelierung fest -> Kernelargument zs2 = sizeof(fpxx)*S
+// (Byte, uniform), Richtungsversaetze per additiver Leiter (M-Z Arm 12: kostet gegen den JIT-Stride nichts, +1,84 % gegen +2,20 %).
+void load_f_zk(float* fhn, const global fpxx* fi, const ulong t, const uint* cb, const ulong zs2) {
+	fhn[0] = zb_ld(fi, 0ul, cb[0]);
+	ulong da = zs2;
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		const ulong db = da+zs2;
+		fhn[i   ] = zb_ld(fi, t%2ul ? da : db, cb[0]);
+		fhn[i+1u] = zb_ld(fi, t%2ul ? db : da, cb[(i+1u)/2u]);
+		da = db+zs2;
+	}
+}
+void store_f_zk(const float* fhn, global fpxx* fi, const ulong t, const uint* cb, const ulong zs2) {
+	zb_st(fi, 0ul, cb[0], fhn[0]);
+	ulong da = zs2;
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		const ulong db = da+zs2;
+		zb_st(fi, t%2ul ? db : da, cb[(i+1u)/2u], fhn[i   ]);
+		zb_st(fi, t%2ul ? da : db, cb[0], fhn[i+1u]);
+		da = db+zs2;
+	}
+}
+// ★ 06.10.2026 ZKS Pruefbefund M-2: EINMALIGER Pruefkernel nach initialize (dichter Dispatch, Geraete-Flags, Geraete-Tabelle), ausserhalb von
+// stream_collide (keine Spill-Reserve dort). Slots ungegatet, Soll 0, Abbruch vor der Zeitschleife (zk_pruefen):
+// [496] Leser (Nicht-Solid, oder Solid mit Nicht-Solid-Nachbar) erreicht ueber den kalten Pfad den Papierkorb
+// [497] heisse Basis (zk_basen mit Untergruppen-Lochterm) != kalte Basis (zk_kalt_basen), oder Tabelle widerspruechlich (Nachbarsaetze !=
+//       Eigensatz der Nachbarzeile, Praefixkette b0(r+1) != b0(r)+Nx-L(r))
+// [498] Kopf: Magic != "ZKS1", zk_s2 != sizeof(fpxx)*S, PK >= S
+// [499] Lochzelle mit Nicht-TYPE_S in der 5x5x5-Umgebung (Halo-Waechter gegen die Geraete-Flags nach initialize)
+kernel void zk_pruef(const global uchar* flags, const global uint* zt, const ulong zs2, global uint* hits) {
+	const uxx n = get_global_id(0);
+	if(n>=(uxx)def_N) return;
+	const uint r = (uint)((ulong)n/(ulong)def_Nx);
+	const uint x = (uint)((ulong)n-(ulong)r*(ulong)def_Nx);
+	const uint y = r%def_Ny;
+	const uint z = r/def_Ny;
+	if(n==0u) {
+		if(zt[0]!=0x5A4B5331u||zs2!=(ulong)sizeof(fpxx)*(ulong)zt[1]||zt[2]>=zt[1]) atomic_inc(&hits[498]);
+	}
+	const uint b0 = zt[16u+16u*r];
+	const uint el = zt[16u+16u*r+8u];
+	if(x==0u) {
+		const int zdy[7] = { 0, 1, 0, 1, -1,  0,  1 };
+		const int zdz[7] = { 0, 0, 1, 1,  0, -1, -1 };
+		uint bad = 0u;
+		for(uint q=1u; q<7u; q++) {
+			const uint yy = (uint)(((int)y+(int)def_Ny+zdy[q])%(int)def_Ny);
+			const uint zz = (uint)(((int)z+(int)def_Nz+zdz[q])%(int)def_Nz);
+			const uint rr = yy+def_Ny*zz;
+			if(zt[16u+16u*r+q]!=zt[16u+16u*rr]||zt[16u+16u*r+8u+q]!=zt[16u+16u*rr+8u]) bad++;
+		}
+		if(r+1u<def_Ny*def_Nz&&zt[16u+16u*(r+1u)]!=b0+def_Nx-(el>>16)) bad++;
+		// ★ Pruefbefund N-c: Anker -- erste Zeile beginnt bei 0, letzte endet am Papierkorb (Bijektion auf [0, N') im Geraet geschlossen); Loch ausgerichtet
+		if(r==0u&&b0!=0u) bad++;
+		if(r+1u==def_Ny*def_Nz&&b0+def_Nx-(el>>16)!=zt[2]) bad++;
+		if((el&0xFFFFu)%16u!=0u||(el&0xFFFFu)>def_Nx||(el>>16)>(el&0xFFFFu)) bad++;
+		if(bad>0u) atomic_inc(&hits[497]);
+	}
+	const uint e = el&0xFFFFu;
+	const uint l = el>>16;
+	const uchar f = fl(flags, n)&TYPE_BO;
+	if(x+l>=e&&x<e) {
+		uint nichts = 0u;
+		for(int dz=-2; dz<=2; dz++) for(int dy=-2; dy<=2; dy++) for(int dx=-2; dx<=2; dx++) {
+			const uint xx = (uint)(((int)x+(int)def_Nx+dx)%(int)def_Nx);
+			const uint yy = (uint)(((int)y+(int)def_Ny+dy)%(int)def_Ny);
+			const uint zz = (uint)(((int)z+(int)def_Nz+dz)%(int)def_Nz);
+			if((fl(flags, (uxx)xx+((uxx)yy+(uxx)zz*(uxx)def_Ny)*(uxx)def_Nx)&TYPE_BO)!=TYPE_S) nichts++;
+		}
+		if(nichts>0u) atomic_inc(&hits[499]);
+	}
+	uxx j[def_velocity_set];
+	neighbors(n, j);
+	bool leser = f!=TYPE_S;
+	for(uint i=1u; i<def_velocity_set; i++) leser = leser||((fl(flags, j[i])&TYPE_BO)!=TYPE_S);
+	if(!leser) return;
+	ulong zc[10];
+	zk_kalt_basen(n, zt, zc);
+	const ulong pk = (ulong)zt[2];
+	uint pkt = 0u;
+	for(uint q=0u; q<10u; q++) pkt += (uint)(zc[q]==pk);
+	if(pkt>0u) atomic_inc(&hits[496]);
+	if(f!=TYPE_S) {
+		const uint xsg = x&~15u;
+		const uint16 s = vload16(0u, zt+16u+16u*r);
+		const uint8 zel = s.s89abcdef;
+		const uint8 zt8 = select((uint8)0u, zel>>16, (zel&(uint8)0xFFFFu)<=(uint8)xsg);
+		const uint8 zr8 = s.s01234567-zt8;
+		uint cb[10];
+		zk_basen(x, zr8, zt8, cb);
+		uint ung = 0u;
+		for(uint q=0u; q<10u; q++) ung += (uint)((ulong)cb[q]!=(ulong)sizeof(fpxx)*zc[q]);
+		if(ung>0u) atomic_inc(&hits[497]);
+	}
+}
+)+"#endif"+R( // ZK
+)+"#ifdef ZK_NBPAD"+R(
+// ★ 06.10.2026 ZKS (M-Z Arm 11): Nachbarindizes aus dem Pad-Dispatch -- x je Lane, y und z uniform (Zeile r), ohne Division je Lane.
+// Dieselben Werte wie neighbors(n) (Pruefagent 05.10. am Prototyp); j[] dient auch Facetten, MS und U_RAND.
+void neighbors_pad(const uint x, const uint y, const uint z, uxx* j) {
+	const uxx x0 = (uxx)x;
+	const uxx xp = (uxx)(x+1u==def_Nx ? 0u : x+1u);
+	const uxx xm = (uxx)(x==0u ? def_Nx-1u : x-1u);
+	const uxx y0 = (uxx)(y*def_Nx);
+	const uxx yp = (uxx)(((y+1u)%def_Ny)*def_Nx);
+	const uxx ym = (uxx)(((y+def_Ny-1u)%def_Ny)*def_Nx);
+	const uxx z0 = (uxx)z*(uxx)(def_Ny*def_Nx);
+	const uxx zp = (uxx)((z+1u)%def_Nz)*(uxx)(def_Ny*def_Nx);
+	const uxx zm = (uxx)((z+def_Nz-1u)%def_Nz)*(uxx)(def_Ny*def_Nx);
+	j[0] = x0+y0+z0;
+	j[ 1] = xp+y0+z0;
+	j[ 2] = xm+y0+z0;
+	j[ 3] = x0+yp+z0;
+	j[ 4] = x0+ym+z0;
+	j[ 5] = x0+y0+zp;
+	j[ 6] = x0+y0+zm;
+	j[ 7] = xp+yp+z0;
+	j[ 8] = xm+ym+z0;
+	j[ 9] = xp+y0+zp;
+	j[10] = xm+y0+zm;
+	j[11] = x0+yp+zp;
+	j[12] = x0+ym+zm;
+	j[13] = xp+ym+z0;
+	j[14] = xm+yp+z0;
+	j[15] = xp+y0+zm;
+	j[16] = xm+y0+zp;
+	j[17] = x0+yp+zm;
+	j[18] = x0+ym+zp;
+}
+)+"#endif"+R( // ZK_NBPAD
 
 )+"#ifdef SURFACE"+R(
 )+R(void load_f_outgoing(const uxx n, float* fon, const global fpxx* fi, const uxx* j, const ulong t) { // load outgoing DDFs, even: 1:1 like stream-out odd, odd: 1:1 like stream-out even
@@ -4343,8 +4561,39 @@ __attribute__((intel_reqd_sub_group_size(16)))
 )+"#endif"+R( // SGS_BAND
 )+"#endif"+R( // FACETTEN
 )+R( TS_P
+)+"#ifdef ZK"+R(
+	, const global uint* zk_tab // ★ 06.10.2026 ZKS: Zeilentabelle (Kopf 16 uint + 16 uint je Zeile) -- Host: add_parameters(tile_slot) hinter dem TS_P-Block unter zk_on
+	, const ulong zk_s2 // ★ 06.10.2026 ZKS Z4: fi-Stride in Byte (sizeof(fpxx)*S), LETZTER Parameter, gesetzt in zk_finalisieren (Position zk_s2_pos)
+)+"#endif"+R( // ZK
 )+") {"+R( // stream_collide()
+)+"#ifdef ZK"+R(
+	// ★ 06.10.2026 ZKS Kopf (M-Z H1, PLAN-ZKS-VOLLBAU §4.1): Pad-Dispatch, get_group_id kennt den Bereichsoffset der U_RAND-VOLL-Scheiben NICHT
+	// (enqueue_run_bereich), get_global_id enthaelt ihn. Pad-Ausstieg ist reine Arithmetik; Flags- und Zeilensatz-Ladung stehen im SELBEN
+	// Basisblock (gleichzeitig unterwegs), der Wirkpfadzaehler [493] dahinter, der Lochterm erst hinter dem Solid-Ausstieg.
+	const uint zk_grp = (uint)get_group_id(0)+(uint)(get_global_offset(0)/(ulong)cl_workgroup_size);
+	const uint zk_r = zk_grp/def_ZK_G;
+	const uint zk_x = (uint)((ulong)get_global_id(0)-(ulong)zk_r*(ulong)def_ZK_NXP);
+	// Lochterm je Untergruppe (W = 16): x_sg = x der Lane 0 der Untergruppe, per sub_group_broadcast VOR jedem divergenten Ausstieg (alle Lanes
+	// aktiv) -- uniform fuer IGC, also ein Skalar statt Lane-Vektoren. Die Form get_sub_group_size()*get_sub_group_id() kostete offline +31
+	// Instruktionen und B70 gemessen +4,4 % statt +2,3 % (Z2a 06.10.).
+	const uint zk_xsg = sub_group_broadcast(zk_x, 0u)
+)+"#ifdef ZK_HAKEN_SG"+R(
+		+16u
+)+"#endif"+R( // ZK_HAKEN_SG: Testhaken CFD_ZK_HAKEN=5 (nur CPU/iGPU), Untergruppen-x um W verschoben -> [495] muss > 0 zaehlen
+	;
+	if(zk_x>=def_Nx) return;
+	const uxx n = (uxx)zk_r*(uxx)def_Nx+(uxx)zk_x; // n = x+(y+z*Ny)*Nx, dicht wie bisher (u, rho, flags, U_RAND, Facetten)
+	const uchar flagsn = fl(flags, n);
+	const uint16 zk_satz = vload16(0u, zk_tab+16u+16u*zk_r);
+	// [493] Gruppen-Wirkpfad (Lane 0 ist nie Pad) und [495] Untergruppen-Geraetetest in EINEM uniformen Zweig am Zaehlschritt: Lane liegt nicht in
+	// [x_sg, x_sg+16) -- Untergruppe nicht zusammenhaengend oder breiter als W, dann waere der Lochterm falsch (Soll 0; alle Nicht-Pad-Lanes).
+	if(t==(ulong)def_zaehl_takt+2ul) {
+		if(get_local_id(0)==0u) atomic_inc(&rho_clamp_hits[493]);
+		if((zk_x>>4)!=(zk_xsg>>4)) atomic_inc(&rho_clamp_hits[495]); // ★ 06.10. Pruefbefund M1: wahre Invariante (selbe 16er-Spalte), prueft Breite UND Ausrichtung
+	}
+)+"#else"+R( // ZK
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
+)+"#endif"+R( // ZK
 )+"#ifdef SC_SIMD16"+R(
 	if(n==0u) rho_clamp_hits[432] = get_sub_group_size();
 )+"#endif"+R( // SC_SIMD16
@@ -4355,14 +4604,37 @@ __attribute__((intel_reqd_sub_group_size(16)))
 	// die Daten einer echten aktiven Tile. Genau daran ist der erste T=8-Lauf divergiert (Cd 18.4).
 	if(is_dead_tile(n, tile_slot)) return;
 )+"#endif"+R(
+)+"#ifndef ZK"+R(
 	const uchar flagsn = fl(flags, n); // cache flags[n] for multiple readings
+)+"#endif"+R( // ZK
 	const uchar flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
 	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // if cell is solid boundary or gas, just return
+)+"#ifdef ZK"+R(
+	// [494] Wirkpfad: Zellen hinter dem Solid-Ausstieg mit n%1024 == 0 an t == zaehl_takt+2, Ist = Soll aus den Host-Flags (deckt gid -> n).
+	// ★ 06.10.2026 Z2c: Bedingung BEWUSST ueber t%def_zaehl_takt geschrieben (gleichwertig zu t == zaehl_takt+2) und als ERSTES Glied auf dem
+	// Hauptpfad hinter dem Solid-Ausstieg. Der 64-Bit-Rest t%def_zaehl_takt (wirksam CFD_ZAEHL_TAKT mal Schrittskala, bei 8 mm 450) kostet emuliert ~55 skalare Befehle; im dichten Kern rechnet ihn die
+	// ZELLBASEN-Zeile (Slot 492) an dieser Stelle einmal, und IGC uebernimmt ihn fuer alle spaeteren t%def_zaehl_takt (POSITIV, Slot 76, ...).
+	// Fehlte diese dominierende Rechnung (Z2a/Z2b), rechnete stream_collide den Rest an vier Stellen neu: +225 Instruktionen, B70 +2,5 Pkt.
+	if(t%def_zaehl_takt==2ul&&t>=(ulong)def_zaehl_takt&&t<2ul*(ulong)def_zaehl_takt&&n%1024u==0u) atomic_inc(&rho_clamp_hits[494]);
+	// Lochterm aus dem gehaltenen Zeilensatz (x_sg siehe Kopf)
+	const uint8 zk_el = zk_satz.s89abcdef;
+	const uint8 zk_t = select((uint8)0u, zk_el>>16, (zk_el&(uint8)0xFFFFu)<=(uint8)zk_xsg);
+	const uint8 zk_zr = zk_satz.s01234567-zk_t;
+)+"#endif"+R( // ZK
 
 	uxx j[def_velocity_set]; // neighbor indices
+)+"#ifdef ZK_NBPAD"+R(
+	neighbors_pad(zk_x, zk_r%def_Ny, zk_r/def_Ny, j); // ★ 06.10. ZKS: y, z uniform aus der Zeile, dieselben Werte wie neighbors(n)
+)+"#else"+R( // ZK_NBPAD
 	neighbors(n, j); // calculate neighbor indices
+)+"#endif"+R( // ZK_NBPAD
 
 	float fhn[def_velocity_set]; // local DDFs
+)+"#ifdef ZK"+R(
+	uint zk_cb[(def_velocity_set+1u)/2u];
+	zk_basen(zk_x, zk_zr, zk_t, zk_cb);
+	load_f_zk(fhn, fi, t, zk_cb, zk_s2); // perform streaming (part 2), Byte-Zellbasen aus dem Zeilensatz, Stride aus dem Argument
+)+"#else"+R( // ZK
 )+"#ifdef ZELLBASEN"+R( // ★ 05.10.2026 Byte-Zellbasen (PLAN-ZELLBASEN-2026-10-05.md): dieselben Adressen wie load_f, je Zugriff eine 64-Bit-Addition
 	uint zb_cb[(def_velocity_set+1u)/2u];
 	zb_basen(j, zb_cb);
@@ -4376,6 +4648,7 @@ __attribute__((intel_reqd_sub_group_size(16)))
 )+"#else"+R( // ZELLBASEN
 	load_f(n, fhn, fi, j, t TS_A); // perform streaming (part 2)
 )+"#endif"+R( // ZELLBASEN
+)+"#endif"+R( // ZK
 )+"#ifdef POSITIV"+R(
 	// ★ 15.09.2026 Klemmen Stufe 1 P1b: Slot 285 = Zelle mit negativer GELADENER Population (Nicht-E, vor MB/Facette), gezaehlt an den
 	// Zaehlschritten t%def_zaehl_takt == 2 an Stichprobenzellen n%def_pos_sub == 0; Slot 289 = dieselbe Probe genau bei t == def_zaehl_takt+3 (Nachladeprobe fuer Haken 1).
@@ -5649,6 +5922,19 @@ __attribute__((intel_reqd_sub_group_size(16)))
 	// hier neu, statt sie ueber den Facettenblock zu spillen (Spill 448/832 -> 0/0, offline bewiesen,
 	// FP-Instruktions-Multiset identisch; Belegkette: AUDIT-BEFUNDE Rang-1-Absatz + Abnahme g24).
 	const uxx nn = n+(uxx)(t>>62);
+)+"#ifdef ZK"+R(
+	{ // ★ 06.10.2026 ZKS: Zeilensatz ueber die Kollision GEHALTEN (zwei uniforme uint8), x aus nn -- kein Neuladen vor den Stores
+		const uint zk_x2 = (uint)(nn-(uxx)zk_r*(uxx)def_Nx);
+		uint zk_cb2[(def_velocity_set+1u)/2u];
+		zk_basen(zk_x2, zk_zr, zk_t, zk_cb2);
+
+)+"#ifdef ZK_S2_KOPF"+R( // nur Geraete mit uses_ram (iGPU/CPU): Stride hier NEU aus dem Tabellenkopf -- zk_s2 ueber die Kollision gehalten spillte die iGPU 512 B (offline 0x7d67); auf der B70 kostet das Neuladen +104 Instruktionen, dort bleibt zk_s2 gehalten (Spill 0). Gleiche Adressen in beiden Formen.
+		store_f_zk(fhn, fi, t, zk_cb2, (ulong)sizeof(fpxx)*(ulong)zk_tab[1]); // perform streaming (part 1)
+)+"#else"+R( // ZK_S2_KOPF
+		store_f_zk(fhn, fi, t, zk_cb2, zk_s2); // perform streaming (part 1)
+)+"#endif"+R( // ZK_S2_KOPF
+	}
+)+"#else"+R( // ZK
 	uxx j2[def_velocity_set]; // rematerialisierte Nachbarindizes, identische Werte wie j
 	neighbors(nn, j2);
 )+"#ifdef ZELLBASEN"+R( // ★ 05.10.2026 Byte-Zellbasen aus j2 (Rang-1-Remat bleibt undurchsichtig: Basen aus nn, nicht aus dem Lade-cb)
@@ -5660,6 +5946,7 @@ __attribute__((intel_reqd_sub_group_size(16)))
 )+"#else"+R( // ZELLBASEN
 	store_f(nn, fhn, fi, j2, t TS_A); // perform streaming (part 1)
 )+"#endif"+R( // ZELLBASEN
+)+"#endif"+R( // ZK
 } // stream_collide()
 
 )+"#ifdef SURFACE"+R(
@@ -8064,7 +8351,7 @@ kernel void fac_apg_ab(const global uchar* flags, const global uint* gd_zellen, 
 				const float3 un = load3_u(u, n); // load previous velocity
 )+"#endif"+R( // U_RAND
 				if(un.x==u_set.x&&un.y==u_set.y&&un.z==u_set.z) { // velocity matched: cell belonged to the currently voxelized geometry
-)+"#ifndef SPARSE_TILES"+R(
+)+"#if !defined(SPARSE_TILES)&&!defined(ZK)"+R( // ★ 06.10.2026 ZKS Z4: unter ZK ebenso Platzhalter (Sperre set_u am Host)
 					// FORK: bei SPARSE_TILES ist fi zur Voxelisierungszeit noch der 1-Zell-Platzhalter --
 					// finalize_sparse_tiles() legt die echte sparse fi erst DANACH an, weil vorher gar nicht
 					// feststeht, welche Tiles tot sind. Ein store_f hierher schriebe ausserhalb des Puffers.

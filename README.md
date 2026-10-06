@@ -14,6 +14,7 @@ on one workstation — and states how every number it reports was measured.**
 ![VRAM](https://img.shields.io/badge/4%20mm%20near%20field-25%20687%20MiB%20VRAM-0A7BBB?style=for-the-badge)
 ![Forces](https://img.shields.io/badge/pressure%20Cd%20%C2%B7%20Cz%20vs%20OpenFOAM%2013-96%25%20%C2%B7%2080%25%20%E2%80%94%20gap%20open-D97706?style=for-the-badge)
 ![Bandwidth](https://img.shields.io/badge/main%20kernel%20DRAM-400%20GB%2Fs%20%C2%B7%2066%25%20of%20peak-6E7781?style=for-the-badge)
+![3.5 mm](https://img.shields.io/badge/3.5%20mm%20near%20field-816.5%20M%20cells%20on%2032%20GB-0A7BBB?style=for-the-badge)
 
 ![Hardware](https://img.shields.io/badge/Intel%20Arc%20Pro%20B70-32%20GB-0068B5?style=flat-square&logo=intel&logoColor=white)
 ![iGPU](https://img.shields.io/badge/Arrow%20Lake%20iGPU-far%20field-0068B5?style=flat-square&logo=intel&logoColor=white)
@@ -235,10 +236,11 @@ effect was measured separately at 12/8 mm (RMS against OF13 −9.9 %, share abov
   rear is too thick: the total-pressure loss integral over windscreen and roof is already two to
   five times OF13's.
 
-**Resolution alone does not close the gap.** The same B70 has run the vehicle at 3.75 mm and 3.5 mm
-with smaller near boxes. P1 without band: 3.75 mm 0.479 / −1.018, 3.5 mm 0.507 / −0.966 (the 3.5 mm
-run used a shorter far box, later found to make the far field 1–2 m/s too fast). Neither moves
-toward OF13.
+**Resolution alone does not close the gap.** The same B70 has now run the vehicle at 3.5 mm with
+816.5 M near-field cells (`p35_m375_zk`, 2026-10-06, see below). Time-averaged P1 without band over
+0.201–0.741 s: **0.521 / −1.027** at 3.5 mm against 0.525 / −1.041 at 4 mm — 95 % / 79 % of OF13 at
+both resolutions. Finer cells do not move the forces toward OF13. (Earlier 3.75 mm and 3.5 mm runs
+used smaller near boxes; the 3.5 mm one also a shorter far box that made the far field 1–2 m/s too fast.)
 
 ### The 4 mm production runs, measured
 
@@ -264,6 +266,39 @@ of the force sums).
 4 mm, so the default went back to 12 steps per cell; a 4 mm wall-clock figure with 12 steps and all levers
 has not been measured yet. Byte cell bases alone raise the near-field throughput by 2.7 %.
 The 75 min this page used to quote was `p4_bandpi2_4`: 501 ms at 8 steps per cell, not comparable.
+
+### 3.5 mm: 816.5 M near-field cells on one 32 GB card
+
+`p35_m375_zk` (2026-10-06): near field at 3.5 mm on the B70, far field at 14 mm on the iGPU, 12 steps
+per cell, 740 ms of physical time. Every figure below is taken from the run's own log.
+
+| | 3.5 mm |
+|---|---|
+| Near field (B70) | 2 033 × 765 × 525 = **816.5 M cells** |
+| Far field (iGPU) | 437 M cells at 14 mm, 19.6 GB system RAM |
+| Distributions, dense → row-compacted | 29 590 → **27 048 MiB** (−2 542); 70.1 M solid cells are not stored |
+| Velocity field, full → stored only where read (U_RAND) | 4 672 → **1 397 MiB** |
+| Free VRAM before the time loop | **1 630 MiB** (32 GB card, desktop included) |
+| Time loop | **14 045 s (3 h 54 min)**, no driver or device error |
+| Check kernel for the compact layout | 0 / 0 / 0 / 0 (pass) |
+
+**What made it fit.** The levers act together, and each one was accepted at 8 mm with the anchor's
+field hash unchanged:
+- two-byte distributions, density and velocity;
+- velocity stored only where it is read (U_RAND);
+- density only on the boundary shell;
+- four-bit flags (FLAGS4);
+- the force list restricted to wall cells (KF-FILTER).
+
+The step to 3.5 mm came from **row compaction (ZKS)**. Rows of the
+lattice skip their solid run, a per-row table maps cells to storage, and the distributions are made
+resident and checked against the table before the time loop starts.
+
+**What it costs.** At 8 mm, row compaction adds 2.8 % to the near-field kernel time. The wall
+clock does not see it. At 3.5 mm the far field on the iGPU sets the pace: the B70 waits about
+149 ms per coarse step (21 %), measured from the run's coupled-step timing. A near-field cost below
+that margin does not reach the run time. The next performance work therefore targets the far field
+(its damping layer is 40 % of its cells).
 
 ### What sets the run time
 
@@ -291,9 +326,8 @@ the order of the coupled step first.
 
 **Memory.** At 4 mm the distributions are 92 % of the near-field VRAM (breakdown under *What a cell
 costs*), so further layout savings are small; 56.1 M solid cells (2 033 MiB) are dead space that only
-an indirection — row compaction — can recover. By the project's memory model (calculated, not run),
-the 4 mm box cannot be run at 3.5 mm with any bit-identical lever, and a smaller near box fits at
-3.5 mm only with row compaction.
+an indirection — row compaction — can recover. Row compaction is now built: it is the lever that put a
+816.5 M-cell near box at 3.5 mm on the 32 GB card (see *3.5 mm: 816.5 M near-field cells*).
 
 Earlier versions of this page carried a run-time projection to larger NVIDIA cards. It rested on the
 94 % figure and on the assumption that the B70's bandwidth sets the run time; both are withdrawn, so
@@ -342,6 +376,7 @@ for this case. Every figure was measured on this rig.
 | **Two-device domain decomposition** — fine near field on the B70, coarse far field on the iGPU, with a smoothed coupling | The far field costs system RAM instead of VRAM |
 | **Compact fields** — two-byte distributions, density and velocity; velocity stored only where it is read, density only on the boundary shell, flags in four bits | **41.2 B per cell** measured at 4 mm, all buffers; 4 mm near field **28 698 → 25 687 MiB** on 2026-10-05 |
 | **Sparse field writes**, register-level scheduling, byte cell bases | Measured lever by lever at 8 mm, each bit-identical: sparse velocity writes −1.5 %, byte cell bases −3.3 % wall clock |
+| **Row compaction (ZKS)** — each lattice row skips its solid run; a row table maps cells to storage, checked by its own kernel before the time loop | Distributions at 3.5 mm 29 590 → 27 048 MiB; with it the 816.5 M-cell near field at 3.5 mm fits with 1.6 GB to spare; +2.8 % near-field kernel time at 8 mm, wall clock unchanged |
 | **12 steps per cell** — the lattice velocity below the measured lattice-mode limit | 10 steps would save 18.8 % wall clock at 4 mm, but there the lattice mode appears above the roof (spanwise mode share 0.83 against 0.009 at 12), so the default stays at 12 (2026-10-06) |
 | **Real VRAM accounting from `/proc/*/fdinfo`** | `intel_gpu_top` cannot see the B70 — the `xe` driver has no i915 PMU. Root-free per-device utilisation instead of a reconstruction |
 
@@ -542,8 +577,9 @@ form that belongs here.
 2. **Performance, far field first** — the iGPU sets the pace, so the far-field kernel, the boundary
    kernels and the order of the coupled step come before any B70 kernel work. Each lever is measured
    before it is built.
-3. **Toward 3.5 mm** — row compaction (ZKS) to fit a near box at 3.5 mm into 32 GB, and a far field
-   that no longer holds the B70 back.
+3. **3.5 mm is reached** (816.5 M near-field cells, row compaction). What remains is a far field that
+   no longer holds the B70 back: a thinner damping layer and box-size ladders that check where the far
+   field's imprint on the near field stops changing.
 4. **The roof, the main problem** — the boundary layer separating too early from windscreen over roof
    to rear: a wall treatment that works under an adverse pressure gradient on the staircase, for any
    vehicle shape. A diagnosis channel with the flow driven *across* the steps (the existing tilted

@@ -25,6 +25,31 @@ uint zellbasen_modus() {
 	print_error("CFD_ZELLBASEN = \""+string(e)+"\" -- erlaubt sind nur 0 (alter Pfad, index_f) und 1 (Byte-Zellbasen, Vorgabe).");
 	return 1u;
 }
+// ★ 06.10.2026 CFD_RAND_DISPATCH (F1 Rand-Dispatch, PLAN-KERNEL-ARCHITEKTUR-DURCHSATZ Rang 1 / PLAN-FERNFELD-ENTSCHLACKEN R1): streng gelesen wie
+// CFD_ZELLBASEN -- ungesetzt/leer = 0 (Vorgabe: boden_eq laeuft wie bisher ueber alle N Zellen), 1 = boden_eq per Bereichsstart nur ueber seine
+// z-Lagen (Kernel zeichengleich, kein Define, reiner Host-Pfad). Alles andere ist ein harter Fehler statt still 0 (atoi).
+// ★ GEMESSEN 06.10.2026 (VTune iGPU, rd_vt_ig_1 gegen hw06n_igpu_ov, 8 mm): boden_eq per Bereichsstart 1,99 -> 0,28 ms je Grobschritt. Ein
+// kompakter Kopf fuer einlass_eq (nx*Ny*Nz Work-Items, n = 1 + gid%nx + (gid/nx)*Nx) war dagegen LANGSAMER: 2,68 -> 3,80 ms, XVE 92 % Stall --
+// die Zellen x = 1..2 liegen 400 Zellen auseinander, der kompakte Start buendelt diese verstreuten Zugriffe in wenige Threads. Er war bitgleich
+// (Anker CPU/iGPU/B70), wurde aber auf Pruefbefund M1 wieder entfernt (Commits dca0151..1280c90 tragen ihn als Modus 2); einlass_eq laeuft voll.
+// Global fuer alle Domaenen und Faelle (reiner Startpfad ohne Physikwirkung, darum keine Statik mit Lese-/Nullstellen in setup.cpp).
+uint rand_dispatch_modus() {
+	const char* e = getenv("CFD_RAND_DISPATCH");
+	if(e==nullptr||e[0]=='\0') return 0u;
+	if(string(e)=="0") return 0u;
+	if(string(e)=="1") return 1u;
+	print_error("CFD_RAND_DISPATCH = \""+string(e)+"\" -- erlaubt sind nur 0 (Volllauf ueber N, Vorgabe) und 1 (boden_eq per Bereichsstart).");
+	return 0u;
+}
+// ★ 06.10.2026 Pruefbefund M2, TESTHAKEN der Ist=Soll-Abnahme: CFD_RAND_DISPATCH_HAKEN=1 kuerzt den boden_eq-Bereich um eine z-Ebene (nur mit
+// CFD_RAND_DISPATCH=1). Dann MUSS die Abnahme in boden_eq_abnahme() reissen. Physik aendert sich (oberste Bandlage ohne Reset) -- nur Testarm.
+static uint rand_dispatch_haken() {
+	const char* e = getenv("CFD_RAND_DISPATCH_HAKEN");
+	if(e==nullptr||e[0]=='\0'||string(e)=="0") return 0u;
+	if(string(e)=="1") return 1u;
+	print_error("CFD_RAND_DISPATCH_HAKEN = \""+string(e)+"\" -- erlaubt sind nur 0 und 1.");
+	return 0u;
+}
 static bool f_nur_solid_an() { const char* e = getenv("CFD_F_NUR_SOLID"); return e==nullptr||e[0]=='\0'||atoi(e)>0; } // leer gesetzt = Default AN (Pruefagent NIEDRIG-2)
 
 Units units; // for unit conversion
@@ -306,6 +331,30 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 		print_error("FLAGS4 mit SURFACE/GRAPHICS/PARTICLES/TEMPERATURE: deren flags-Leser und -Schreiber sind nicht umgestellt, TYPE_T/F/I/G passen nicht in 4 Bit.");
 #endif
 	}
+	// ★ 06.10.2026 ZKS (CFD_ZK, PLAN-ZKS-VOLLBAU-2026-10-06.md Z1): Konstruktionszeit-Kopie VOR dem JIT (device_defines liest zk_on) und VOR dem
+	// read-once von s_sparse_tiles_on weiter unten (die Tiling-Sperre muss die Statik noch sehen). Die Lesestelle (setup.cpp fahrzeug_dd) setzt
+	// s_zk, der Fernfeld-Block nullt sie vor dem Bau von lbm_c (Muster FLAGS4). Sperren hier UND an der Lesestelle (Werkzeugfalle 12).
+	zk_on = s_zk>0u;
+	if(zk_on) {
+		if(Dx*Dy*Dz>1u) print_error("ZK: die Domaene ist Teil einer Mehrdomaenen-Zerlegung -- Halo-Transfer und Pad-Dispatch sind nicht abgenommen.");
+		if(s_sparse_tiles_on) print_error("ZK mit Block-Tiling (CFD_SPARSE_TILES): ausgeschlossen, beide bilden fi um.");
+		if(velocity_set!=19u) print_error("ZK: nur D3Q19 (Zeilensatz mit 7 Nachbarzeilen und 10 Byte-Zellbasen; D3Q27 nicht abgenommen).");
+		if(Nx>=65536u) print_error("ZK: Nx >= 65536 -- Lochende und Lochlaenge liegen im Zeilensatz in je 16 Bit.");
+		if(Nx<(uint)WORKGROUP_SIZE) print_error("ZK: Nx kleiner als eine Arbeitsgruppe -- der Pad-Dispatch braucht mindestens eine volle Gruppe je Zeile.");
+		if((ulong)sizeof(fpxx)*(ulong)Nx*(ulong)Ny*(ulong)Nz>=4294967296ull) print_error("ZK: sizeof(fpxx)*N >= 2^32 -- die Byte-Zellbasen sind uint.");
+		if((ulong)Nx*(ulong)Ny*(ulong)Nz>=4294967295ull) print_error("ZK: N >= 2^32 -- Kompaktindex und Papierkorb sind uint.");
+#if defined(SURFACE) || defined(GRAPHICS) || defined(PARTICLES) || defined(TEMPERATURE)
+		print_error("ZK mit SURFACE/GRAPHICS/PARTICLES/TEMPERATURE: deren fi-Pfade sind nicht umgestellt.");
+#endif
+		zk_haken = env_u("CFD_ZK_HAKEN", 0u);
+		if(zk_haken>=5u&&!device_info.uses_ram) print_error("CFD_ZK_HAKEN="+to_string(zk_haken)+" (Geraetehaken) nur auf CPU/iGPU, nie auf der B70 (Testleiter).");
+		{ // ★ 06.10. Pruefbefund N8: sub_group_broadcast braucht Untergruppen -- Klartext statt JIT -11
+			const string ext_ = device_info.cl_device.getInfo<CL_DEVICE_EXTENSIONS>();
+			if(!contains(ext_, "cl_khr_subgroups")&&!contains(ext_, "cl_intel_subgroups")) print_error("ZK: Geraet "+device_info.name+" meldet weder cl_khr_subgroups noch cl_intel_subgroups -- der ZK-Kopf braucht sub_group_broadcast.");
+		}
+		if(zaehl_takt()<3ull) print_error("ZK braucht einen Zaehltakt >= 3: der Wirkpfad [494] zaehlt ueber t%takt == 2 im Fenster [takt, 2*takt) (= t == takt+2), hier "+to_string(zaehl_takt())+".");
+		zk_nxp = ((Nx+(uint)WORKGROUP_SIZE-1u)/(uint)WORKGROUP_SIZE)*(uint)WORKGROUP_SIZE;
+	}
 	// FORK -- F-Bounding-Box HIER aufloesen, nicht erst in allocate(). Der Konstruktor baut den
 	// OpenCL-Code (und damit def_FBNX/def_FBN) weiter unten; allocate() laeuft erst DANACH. Stand die
 	// Aufloesung in allocate(), wurde def_FBNX = 0 emittiert, f_bbox lieferte ueberall false und
@@ -574,12 +623,17 @@ LBM_Domain::LBM_Domain(const Device_Info& device_info, const uint Nx, const uint
 	  // Sperre faellt die Domaene still auf den alten Pfad zurueck und sagt es in der ZELLBASEN-Zeile (Grund), kein Abbruch: der alte Pfad ist physikalisch identisch.
 		const ulong zb_bytes = (ulong)sizeof(fpxx)*(ulong)Nx*(ulong)Ny*(ulong)Nz;
 		const uint zb_modus = zellbasen_modus();
-		if(zb_modus==0u) zb_grund = "CFD_ZELLBASEN=0";
+		if(zk_on) zb_grund = "ZK (eigene Byte-Zellbasen aus dem Zeilensatz, PLAN-ZKS-VOLLBAU)"; // ★ 06.10.2026 ZKS: Konflikt K3 -- ZELLBASEN und Slot 492 bleiben aus, ZK traegt eigene Zellbasen
+		else if(zb_modus==0u) zb_grund = "CFD_ZELLBASEN=0";
 		else if(velocity_set!=19u) zb_grund = "nicht D3Q19 (cb-Feld und Abnahme nur fuer D3Q19)";
 		else if(sparse_on) zb_grund = "Block-Tiling (SPARSE_TILES hat eigene Zellbasen)";
 		else if(zb_bytes>=4294967296ull) zb_grund = "sizeof(fpxx)*N >= 2^32 (uint-Byteversatz liefe ueber)";
 		zellbasen_on = zb_grund=="an";
 	}
+	rand_dispatch_on = rand_dispatch_modus()==1u; // ★ 06.10.2026 F1: boden_eq per Bereichsstart (reiner Host-Pfad, kein JIT-Define)
+	rand_dispatch_haken_on = rand_dispatch_haken()==1u; // ★ 06.10.2026 M2-Testhaken (Bereich um eine z-Ebene kuerzer)
+	if(rand_dispatch_haken_on&&!rand_dispatch_on) print_error("CFD_RAND_DISPATCH_HAKEN=1 braucht CFD_RAND_DISPATCH=1 (der Haken kuerzt den Bereichsstart).");
+	if(rand_dispatch_haken_on) print_warning("CFD_RAND_DISPATCH_HAKEN=1: TESTARM -- der boden_eq-Bereich ist um eine z-Ebene gekuerzt, die BODEN_EQ-Abnahme MUSS reissen.");
 	string opencl_c_code;
 #ifdef GRAPHICS
 	graphics = Graphics(this);
@@ -778,6 +832,7 @@ uint LBM_Domain::s_u_takt = 0u;     // ★ TODO 2 Schritt 3 (CFD_U_SPARSAM): 0 =
 uint LBM_Domain::s_rho_takt = 0u;   // ★ TODO 2 Schritt 1 (CFD_RHO_SPARSAM): 0 = aus, sonst Sample-Kadenz in FEINEN Schritten
 uint LBM_Domain::s_rho_rand = 0u;   // ★ 15.09.2026 RHO_RAND (CFD_RHO_RAND): 0 = aus; nur Nahfeld
 uint LBM_Domain::s_u_rand = 0u;    // ★ 04.10.2026 U_RAND (CFD_U_RAND): 0 = aus; nur fahrzeug_dd-Nahfeld
+uint LBM_Domain::s_zk = 0u;        // ★ 06.10.2026 ZKS (CFD_ZK): 0 = aus; nur fahrzeug_dd-Nahfeld
 uint LBM_Domain::s_flags4 = 0u;    // ★ 05.10.2026 FLAGS4 (CFD_FLAGS4): 0 = Byte, 1 = 4 Bit; nur fahrzeug_dd-Nahfeld
 bool LBM_Domain::s_flags4_pruef = false; // ★ 05.10.2026 FLAGS4: Geraeteprobe in beiden Armen (CFD_FLAGS4 in der Zeile gesetzt)
 float LBM_Domain::s_einlass_eq_u = -1.0f; // Setup reicht sein u_lat durch (Konvention wie s_boden_eq_u); Sentinel wie dort, Pruefbefund B7
@@ -994,7 +1049,7 @@ void LBM_Domain::allocate(Device& device) {
 	// sparse fi an. Grund ist kein Geschmack, sondern ein Treiberdefekt -- das Freigeben eines bereits
 	// allozierten 19-GB-fi-Buffers bringt den Intel-NEO mit CL_OUT_OF_RESOURCES zu Fall. Das Move-Assign
 	// in finalize gibt so nur den Platzhalter frei, was trivial ist.
-	fi = Memory<fpxx>(device, sparse_on ? 1ull : N, velocity_set, false);
+	fi = Memory<fpxx>(device, (sparse_on||zk_on) ? 1ull : N, velocity_set, false); // ★ 06.10.2026 ZKS Z4: unter ZK ebenfalls Platzhalter, zk_finalisieren legt fi kompakt an
 	// ★ 15.09.2026 RHO_RAND C2c: rho_rand_on MUSS vor der rho-Allokation stehen (stand hinter ihr, C2-Plan Falle 3).
 	rho_rand_on = s_rho_rand>0u;
 	rr_N = rho_rand_on ? r1_anzahl((uint)get_Nx(), (uint)get_Ny(), (uint)get_Nz()) : 0ull;
@@ -1032,6 +1087,8 @@ void LBM_Domain::allocate(Device& device) {
 		sparse_tiles_y = ((uint)get_Ny()+sparse_T-1u)/sparse_T;
 		sparse_tiles_z = ((uint)get_Nz()+sparse_T-1u)/sparse_T;
 		tile_slot = Memory<uint>(device, (ulong)sparse_tiles_x*sparse_tiles_y*sparse_tiles_z);
+	} else if(zk_on) { // ★ 06.10.2026 ZKS Z4: tile_slot IST die Zeilentabelle (TS_P/TS_A fuer die kalten fi-Leser, zk_tab fuer stream_collide)
+		tile_slot = Memory<uint>(device, 16ull+16ull*(ulong)get_Ny()*(ulong)get_Nz());
 	} else {
 		tile_slot = Memory<uint>(device, 1ull); // Platzhalter, wird nie gelesen (TS_A ist leer)
 	}
@@ -1068,10 +1125,18 @@ void LBM_Domain::allocate(Device& device) {
 	// | [296] u-Betragshuelle |u|^2 >= c_s^2 | [297] 296 ohne 295 (Diagonalluecke) | [298]/[299] (nur CFD_RHO_HUELLE) rho unter/ueber der Konsistenzhuelle 0,5/1,5 | [300] Lift-rho ausserhalb der GESCHLOSSENEN Bildhuelle [0,21875; 1,78125], Soll 0 (Haken 5: > 0). Audit 16.09.2026 (B1): [301]/[302] KONSTANTENSPIEGEL der uebersetzten Torgrenzen def_tor_gate_lo/hi als Festkomma (S = def_klemm_s), Ist=Soll gegen die Host-Rechnung -- der Wirkpfadbeleg fuer CFD_TOR_HUELLE, das sonst nur eine Null vorzuweisen hatte. [303] (nur CFD_POSITIV_FACETTE) K0-Facettenzelle WIRKLICH begrenzt, Stichprobe wie [273] -- Wirkpfadbeleg des Schalters (Befund B3; [273] allein zaehlt in beiden Stellungen gleich). [304]/[305] KONSTANTENSPIEGEL der uebersetzten Waechterhuelle def_w210_lo/hi (Befund M3, zweite Haelfte von CFD_TOR_HUELLE), ein Schritt je Zaehltakt. APG 16.09.2026 (PLAN-APG-2026-09-16.md §A5, alle nur an Zaehlschritten, saettigend): [306] Vorkernel-Besuche (Soll = [7]) | [307] entartet (eine Achse ohne Fluidnachbar) | [308] APG-Zweig besucht (Soll = [7]-[9]) | [309]/[310] Klemme unten 0 / oben 2*tw (Summe = [19]) | [311]/[312] dp/ds > 0 (APG) / < 0 (FPG) | [313..316] Autoritaet |kappa*y_ab*dp/ds|/tw in <0,1 / 0,1-0,5 / 0,5-1 / >=1. MOZAFFARI 22.09.2026 (nur unter FACETTEN_APG_MOZ, alle an Zaehlschritten, saettigend): [317] Entartung (u_tau <= 0 oder alpha_p nicht endlich -> f := 1 erzwungen, Soll 0) | [318..325] f-HISTOGRAMM, Grenzen f >= 0,99 / 0,95 / 0,90 / 0,80 / 0,70 / 0,65 / 0,62 / darunter -- in alpha_p umgerechnet (C = 0,4, a0 = 0,005): 1,282e-4 / 7,143e-4 / 1,667e-3 / 5,000e-3 (= a0, natuerliche Mitte) / 1,500e-2 / 3,500e-2 / 9,500e-2. [318] enthaelt auch den gesamten FPG-Ast (f konstruktiv 1) UND die Besuche mit dp/ds exakt 0. Bezug ist das GEKLEMMTE Spalding-tw (Klemme tw_max im Spalding-Block), tw_neu = tw*f^2. ABNAHME: Summe [317..325] == [308] (jeder Besuch genau ein Fach; NICHT [311]+[312], die zaehlen dp/ds == 0 nicht mit -- Pruefbefund A-5/B-M1); [318] < [308], sonst ist der Tausch ein No-Op; [317] == 0 | [326]/[327] SCHATTEN der entfallenen Klemme: korr > tw bzw. -korr > tw (geklemmtes Spalding-tw), also genau die Bedingung, die unter der linearen Form [309]/[310] gezaehlt hat. ABNAHME unter MOZ: [19] = [309] = [310] = 0 UND |[326]+[327] - [316]| <= 1e-3*[316]+16 (symmetrisch: Strikt-/Nichtstrikt-Kante |korr| == tw und GPU-Divisionsrundung 2,5 ulp in [316]; Pruefbefund A-10/B-N1/2A-M1). Slot 8 (Endklemme tw*faca > tw_max) feuert unter MOZ NUR bei faca > 1 (tw <= tw_Spalding <= tw_max), also seltener als linear (dort tw bis 2*tw_Spalding) -- kein Widerspruch zu "keine Klemme mehr", die Endklemme ist die alte Stabilitaetsklemme (2A-N1). REKONSTRUKTION S0 (22.09.2026, CFD_FAC_REK): [328] Wirkpfad (Block erreicht, gegattert) | [329] WIRKUNG |du|/|u| > 1e-6 (Soll in S0 EXAKT 0) | [330] relativer Rundungszaehler (Soll 0 in der Delta-Form; Ausschlag = falsche Formelform gebaut) | [331] RESERVIERT fuer die R3-Kreuztabelle (ab S2). Inkrement am 23.09. ENTFERNT: es stand im selben Gate wie [328], war konstruktiv identisch, kostete ein Atomic je Besuch und taeuschte eine Pruefung vor, die nie feuern konnte (Audit-Schleife, drei Auditoren unabhaengig). [332] S1b MASSENNEUTRALITAET: |rho(f+Df) - rho(f)| > 1e-6*rho. Die Delta-Form erhaelt die Masse ANALYTISCH exakt (Sum w_i = 1, Sum w_i c_i c_i = c_s^2 I heben den -1,5(s.du)-Term genau auf), ★ 23.09. BERICHTIGT: die Probe rechnet INLINE mit derselben Summenreihenfolge wie klemm_rho_roh(), also rho VOR der Dichteklemme -- ein AUFRUF laege hier oberhalb der Definition und ist unter OpenCL C99 der sofortige Lauftod (BERICHTIGT 23.09. abends: der alte Text nannte den Aufruf, wer ihn nachzieht baut error -11 ein). Vorher standen zwei Aufrufe von calculate_rho_u gegeneinander, und DIE KLEMMT auf [0,5;1,5] (kernel.cpp:1257) -- bei einer Zelle dauerhaft ausserhalb war die Differenz EXAKT 0, egal was die Rekonstruktion mit der Masse tat (1,2-1,8 Mrd Klemmtreffer je Lauf, nicht hypothetisch). Schranke 1e-6 -> 5e-7. Numerisch bleibt der Boden beim ulp der Schlussaddition rho += 1.0f, also 5,96e-8 bis 1,19e-7 -- NICHT 1e-9, wie hier zuerst stand (Pruefbefund 23.09.). Die Schranke 1e-6*rho traegt damit rund 8- bis 17-fache Luft; wer sie schaerft, erzeugt Fehlalarme. ★ BERICHTIGT 23.09. abends: die Schranke im Kernel ist 5e-7, nicht 1e-6, und traegt damit 4,2- bis 8,4-fache Luft ueber dem ulp-Boden, nicht die hier zuerst genannten 8 bis 17. Soll 0 in JEDER Stufe. | [333] S1b ZWEITES MOMENT (xy): Summe c_x c_y Df_i gegen rho*(u_x du_y + du_x u_y + du_x du_y). NOETIG, weil [330] und [332] gemeinsam BLIND fuer einen Fehler im s-Vektor sind: Summe_i c_i w_i (c_i.du)(c_i.s) = 0 und Summe_i w_i [4,5(c.du)(c.s) - 1,5(du.s)] = 0 gelten fuer JEDES s, der s-Term wird erst im zweiten Moment sichtbar. Ohne [333] wuerden s = 2u, s = u+du oder das voellige Weglassen der quadratischen Terme unentdeckt durchlaufen. | [334] BEGLEITZAEHLER zu [333]: wie oft war |mxy_soll| <= 1e-7, die Probe an dieser Facette also LEER? [333] hat einen absoluten Boden; wo das Sollmoment darunter liegt, behauptet sie nichts. Ohne [334] liest man 333 = 0 als Beleg, wo gar nichts geprueft wurde. | [335] KONSTANTENSPIEGEL der Rekonstruktion: der UEBERSETZTE Kernel schreibt 0x5245464B ('REFK'), sobald der FAC_REK-Block im Geraetecode steht. Noetig, weil der alte Kohaerenzwaechter (fac_rek_jit gegen fac_rek_on) TAUTOLOGISCH war -- beide Seiten lasen dasselbe eingefrorene Feld, er konnte nie ausloesen (Audit-Schleife 23.09., Auditor B). Dieser Slot belegt den uebersetzten Kernel, nicht den JIT-Text. | [336..343] HISTOGRAMM der Hubrichtung t1.x ueber die Marken, Grenzen -0,5/-0,1/0/0,1/0,5/0,9/0,99. Beantwortet, ob die 10620 Huebe in x gleichsinnig zeigen. Haeufung nahe +1 heisst: die Betragssumme IST die Vektorsumme, und die gemessene Ausbeute von rund 3 % hat eine ANDERE Ursache. Streuung um 0 heisst: die wirksame Amplitude ist eps*<t1.x>, und jede auf eps normierte Amplitudenleiter ist falsch skaliert. | [344..351] HISTOGRAMM von rhon ueber die Marken, Grenzen 0,55/0,7/0,85/0,95/1,05/1,2/1,45. Der Block injiziert rhon*du mit dem GEKLEMMTEN rhon (Untergrenze 0,5); an **85 %** der Facettenbesuche steht es auf der Klemme und daempft dort den Hub um 43 % (GEMESSEN 23.09., Commit b4158aa, 53 195 580 Besuche -- die hier zuerst notierten 6,5 % waren eine Schaetzung aus den globalen Klemmzaehlern und galten fuer ALLE Facettenzellen, nicht fuer die markierten). Ohne diese Zahl ist die Amplitude des Arms unbekannt. Beide sind BITNEUTRAL: kein Zugriff auf fhn, nur atomic_inc an Zaehlschritten. | [352..359] HISTOGRAMM der NACHBARRICHTUNG t_nb.x, gleiche Eimergrenzen wie [336..343]. Die Nachbarabtastung liest das fertige u-Feld einer zweiten Fluidzelle entlang der Normale -- eine Zelle, die die ELIBB-Blende NICHT angefasst hat. Gegen [336..343] (lokale Richtung, aus der zu 85 % geklemmten Zelle) ist das der direkte Vergleich. | [360..367] HISTOGRAMM von cos zwischen lokaler und Nachbarrichtung, Grenzen -0,5/0/0,3/0,6/0,8/0,95/0,999. PFLICHT, nicht Beiwerk: zeigt der Hub kuenftig entlang t_nb, sieht das Wandmodell (Basis t1 bleibt LOKAL, kernel.cpp) davon nur cos*eps, und sin*eps landet im t2-Kanal -- also im Querrest, den das Modell zu null setzen will. | [368] kein Fluidnachbar (Rueckfall auf die lokale Richtung), Gegenprobe zu Slot 73. | [369] BAUPROBE der geschriebenen Richtung: ||t_nb|-1| > 1e-5 ODER |t_nb.n| > 1e-3 (die Tangentialschranke ist 1e-3, BERICHTIGT 23.09. abends -- hier stand 1e-5, Faktor 100 gegen den Kernel). Soll 0. Ohne sie ist ein Stride-Versatz nicht von "die Richtung streut halt" zu unterscheiden. Alle vier sind BITNEUTRAL (nur atomic_inc an Zaehlschritten). R3 23.09.2026 (nur unter CFD_FAC_REK=2, alle an Zaehlschritten, saettigend): [370] markierte Besuche AM GATE (Nenner) | [331] davon ZUSAETZLICH in den Rueckfall gezwungen -- die eigentliche Wirkung von R3; frueher "reserviert", jetzt belegt | [380] davon ohnehin schon Rueckfall (Gate war dort ein No-Op). ABNAHME [331]+[380] == [370], jeder Besuch genau ein Fach. | [371] BAUREIHENFOLGE-PROBE (NICHT der Nullbeweis des Tors -- berichtigt 23.09. spaet; unter der erlaubten Schalterschnittmenge konstruktiv 0, den Nullbeweis liefert der Hashvergleich Arm 1/Arm 2): Marke UND der Additivterm u_s != 0 nach dem Solve, Soll EXAKT 0 -- 370/331/380 zaehlen die Absicht, 371 das Ergebnis. Der Zaehler sass zuerst an pass2_an und war dort TAUTOLOGISCH (Nachpruefung H4). | [372] Normalprobe der Buchung: |du.n| > 1e-3*|du| (RELATIV -- die absolute Schranke prueft bei kleinem eps nichts, Nachpruefung M2), Soll 0 (du steht konstruktiv tangential; ein Normalanteil ginge in den Druckpfad und waere dort doppelt). Die Buchung selbst ist KEIN Zaehler, sondern fwx/y/z -= rho*du vor fac_tau_acc[1..3] -- ihr Beleg ist die Bilanzserie a2_bilanz (23.09.) und K2. [373..377] HISTOGRAMM von |G11roh| an den Marken (Grenzen 1e-6/1e-4/1e-2/1), belegt 23.09. abends. ENTSCHEIDET den Doppelterm: P1 wird aus fhn gebildet, und fhn traegt an den Marken schon das Df -- unter R3 ist phi1 = P1, die Wandkraft enthaelt den Wandlink-Anteil also ein ZWEITES Mal, zusaetzlich zur Buchung fw -= rho*du. Zur fuehrenden Ordnung ist der Zusatzterm rho*eps*G11roh. Liegt das Histogramm nicht im untersten Fach, traegt die Wandkraft den Term doppelt. ★ 24.09.2026 ERLEDIGT: er WIRD korrigiert (exakt, siehe 381..385); dieser Absatz ist keine Handlungsanweisung mehr, sondern die Messung der Groesse. GEMESSEN am kipp26 24.09.: nur 0,38 % der Marken haben |G11roh| < 1e-6 -- der Kanal traegt den Term also SEHR WOHL, die frueher hier und in kernel.cpp stehende Entwarnung war unbelegt. DOPPELTERM-KORREKTUR 24.09.2026 (nur unter CFD_FAC_REK=2, an Zaehlschritten, saettigend): [378] ANWENDUNGSPROBE -- fw wird VOR und NACH den drei Korrekturzeilen auf t1 projiziert und die Differenz gegen rek_dp1 gehalten; Soll EXAKT 0. Faengt drei Fehler, die kein Zaehler auf rek_gate fangen kann: Korrektur hinter fac_tau_acc (toter Code), Korrektur ausserhalb der FAC_REK_R3-Insel, Vorzeichen verkehrt. Sie faengt NICHT ein falsches Vorzeichen in der HERLEITUNG von DP1 -- aus den Ausgabedateien ist das NICHT pruefbar (kein Dateipaar isoliert Summe rho*du, ★ 02.10. Pruefbefund F-N3), siehe die R3-ANSAGE in setup.cpp. | [379] t2-KANAL: |DP2| > 0,1*|DP1| an der Marke. Beantwortet empirisch, ob die fuehrende Ordnung rho*eps*G11roh (nur t1) gereicht haette; sie haette rho*eps*G12roh unterschlagen, an ebener Wand exakt 0, an schiefen Linkmengen bis sqrt(G11roh*G22roh). Deshalb ist die EXAKTE Form gebaut: Df wird je Wandlink in der Momentenschleife nachgebildet und auf t1/t2 projiziert, ohne Ordnungsargument. | [381..385] HISTOGRAMM der Korrekturgroesse |DP|/(rho*|du|), Grenzen 0,01/0,1/0,5/1,0 (★ 24.09. Pruefbefund M4: es waren zwei Grenzen, das oberste Fach damit OFFEN bei 0,1 -- die Groesse erreicht aber 2,0, das Fach konnte "ein Zehntel der Quelle" nicht von "doppelt so gross, Reibungspfad gedreht" unterscheiden). ABNAHME: Summe [381..385] == [370]. | [386] BEGLEITZAEHLER zu [378] (Klasse von [334]): wie oft dominiert der Ausloeschungsboden 4,8e-7*|fw|_1 den relativen Teil der Toleranz? Wo er das tut, prueft [378] nichts und seine Null ist kein Beleg -- |fw.t1| ist um Dekaden groesser als |DP1|. Liegt alles im untersten Fach, war der Doppelterm an dieser Geometrie vernachlaessigbar und die Korrektur ein GEMESSENER No-Op. WAS [378] NICHT FAENGT (ausdruecklich, damit seine Null nicht ueberlesen wird): er vergleicht die ANWENDUNG gegen rek_dp1, nicht rek_dp1 gegen die Injektion. Eine Aenderung des Linkgates in der Momentenschleife, die rek_dp1 ueber eine andere Menge als P1 akkumuliert, bleibt unsichtbar; ebenso ein Vorzeichenfehler in der HERLEITUNG von DP1. Und wenn jemand die Korrekturzeilen UND den 378-Block GEMEINSAM hinter fac_tau_acc schiebt, bleibt er gruen -- er misst eine lokale Invariante, nicht die Lage zum Verbraucher (Pruefbefund M3, 24.09.). | [387] BLINDHEITSSCHRANKE von [378]: |DP2| > 1000*|DP1| an der Marke. Die Toleranz von 378 faengt ein verkehrtes Vorzeichen bis Verhaeltnis rund 1e4 und toten Code bis rund 1e3 (eigener float-Versuch 24.09., 200 000 Saetze je Stufe); darueber ist sie blind. [379] zaehlt ab 0,1 und sagt darueber nichts. Steht [387] auf 0, ist die Null von [378] ueber den gefahrenen Wertebereich belastbar. (Historie: am 23.09. stand hier einmal 373, widerspruechlich zur Zeile darueber, die 373..377 belegt -- wer der Legende folgte, haette 373 ein zweites Mal vergeben. Die Zeile, auf die sich diese Berichtigung bezog, ist am 24.09. ersetzt worden; der Hinweis bleibt als Warnung stehen, weil dieselbe Falle bei jeder Neuvergabe droht.) ★ 24.09.2026 BERICHTIGT (Pruefbefund M-7): hier stand bis eben ein zweites Mal "Puffer hits_n = 384 seit 22.09.2026" -- eine widerspruechliche Zweitfassung IN DERSELBEN ZEILE, aus der der naechste Slot falsch vergeben worden waere. Das ist wortwoertlich Pruefbefund 3-E, eine Ebene hoeher. | [388..392] HISTOGRAMM |DP_n|/(rho*|du|), Grenzen 0,01/0,05/0,15/0,3 -- der NORMALANTEIL des Wandlink-Flusses der Rekonstruktion. NICHT dasselbe wie [372]: der prueft |du.n| und ist konstruktiv 0, weil du tangential steht. DP_n verschwindet nur an der EBENEN Wand; an einer Einzellink-Zelle ist c.n von null verschieden, und 92 % der Rang-0-Facetten haben genau einen Link. Gebaut aus dem S2-Planungsschritt (Befund H1, 24.09.). ABNAHME: Summe [388..392] == [370]. WAS ER MISST UND WAS NICHT: allein die GROESSE von DP_n. Ob dieser Anteil im Druckpfad ankommt und ob er dort ungebucht ist, ist damit NICHT beantwortet -- das braucht eine eigene Messung. STUFE S2 24.09.2026 (nur unter CFD_FAC_REK=3, JIT-Define FAC_REK_S2, an Zaehlschritten): [397] WIRKPFAD und Nenner der vier folgenden -- Besuche des Bestimmungsblocks. Soll > 0; steht er auf 0, bleibt die Amplitude auf ihrem Anfangswert 0 und der Arm ist ein stiller No-Op. | [393] SCHRITTFLUKTUATION der Amplitude ★ BERICHTIGT 24.09. nachmittags (Pruefagent H3): hier stand "KONVERGENZ des Lag-1-Kreises". Das galt fuer das ALTE Ziel mit P1 (e_{n+1} = e* - G11roh*e_n). Seit S1 haengt die Amplitude nur noch an twe und rhon DESSELBEN Schritts, es gibt keine Rueckkopplung mehr und also auch nichts zu kontrahieren. Der Zaehler misst jetzt die Schrittschwankung von twe/rhon und damit DIREKT den Lag-1-Fehler (gemessen 63,8 %: an zwei Dritteln der Marken weicht die angewandte Amplitude um mehr als 5 % ab). KEIN Konvergenzbefund. Alter Text: |d1_neu - d1_alt| > 5 % von |d1_neu|. Die Amplitude stammt aus dem VORSCHRITT, weil P1 erst nach der Momentenschleife feststeht. Faellt dieser Zaehler nicht, schwingt sie (Periode-2-Mode, im Plan als real gefuehrt) -- dann muss die Injektion hinter die Momentenschleife. | [394] rhon auf der unteren Klemme. VORZEICHENUMKEHR gegen die frueheren Stufen: rho steht in S2 im NENNER, die Klemme VERSTAERKT die Amplitude statt sie zu daempfen. | [395] ★ NUR ZUSAMMEN MIT SLOT 8 DEUTBAR (24.09. nachmittags, Pruefagent H1/H2): unter S1 ist die Schranke STRUKTURELL redundant, weil |s2_r1| = def_fac_tau*twe <= def_fac_tau*tw_max per fmin gilt. Die Null ist ein STOLPERDRAHT, keine bestandene Messung -- sie feuert nur, wenn jemand die tw_max-Klemme entfernt (wie beim MOZ-Tausch schon einmal geschehen). Slot 8 sagt, ob der Klemmpfad ueberhaupt lief; ohne ihn ist [395] = 0 ein Zufallsbefund. Bis 24.09. nachmittags wurde ausserdem NACH der Division verglichen (fabs(s2_d1)<=0.5f*ut), was an der twe-Klemme um 1-2 ulp ueberschoss und die Zelle STILL auf Bounce-Back warf -- der damals gemessene [400] = 9 ist genau diese Kante. Alter Text: Schranke 0,5*u_t gegriffen -> Rueckfall auf Bounce-Back (SATGATE-Logik, nicht klemmen: Befund G8, die geklemmte Anwendung hat einen vorzeichen-definiten Bias). Hohe Quote heisst, die Amplitude kommt von der SCHRANKE statt vom Wandmodell -- der Knopf waere nur umbenannt. | [396] RICHTUNG der Schrittaenderung (s2_neu > s2_alt). ★ ERSETZT 24.09. nachmittags (Pruefagent H1): hier stand "R1 > 0, die Wand beschleunigt, erwartet rund 40 %". Unter S1 ist s2_r1 = -def_fac_tau*twe mit twe >= 0 lueckenlos und def_fac_tau in {0;1} (drei Zuweisungen, alle Literale, ein CFD_FAC_TAU gibt es nicht) -- der Zaehler KONNTE nicht feuern, die 40 % waren nicht verfehlt sondern unmoeglich, und der Gegenphasentest verglich 0 % gegen 0 %. Dieselbe Klasse wie Slot 124/125 und Slot 331. JETZT: bei einer Periode-2-Mode geht [396]/[397] gegen 100 % und [401]/[402] gegen 0 % (oder umgekehrt), bei reiner Fluktuation liegen BEIDE bei rund 50 %. | [397] WIRKPFAD des Bestimmungsblocks und NENNER der vier S2-Prozentzahlen (★ Pruefbefund MITTEL-3: er fehlte hier, obwohl die M1-Abnahme auf ihm steht). ABNAHME: [397] == [370], strikt -- gleiches Gate, kein return dazwischen. | [398] LEERE PROBE: markierter Besuch mit rho*|du| == 0. Unter S2 ist die Amplitude je Facette UND Schritt 0 -- beim ersten Schritt immer, und nach jedem Schranken-Rueckfall. Die Histogramme 381..385 und 388..392 legen solche Besuche stumm ins unterste Fach; ohne diesen Zaehler liest sich das als "vernachlaessigbar" (Klasse [334]/[386]). | [399] WIDERSPRUCHS-ENTSCHEIDER: |rek_dp1 - rho*du*G11roh| > 20 %. Beide sind nur in fuehrender Ordnung (u, du -> 0) dieselbe Groesse; je Wandlink kann der (du*s)-Term das Vorzeichen umkehren -- 399 misst den Abstand zur Linearisierung, nicht das Vorzeichen (★ 02.10. Pruefbefund G-M1). Gebaut, weil sich [373..377] und [381..385] im S2-Probelauf widersprachen (G11roh >= 1e-2 an 92 %, |DP|/(rho|du|) >= 1e-2 an 21 %) -- die fruehere Deutung, die H1-Korrektur (P1 - rek_dp1) stehe genau auf dieser Gleichheit, ist seit 24.09. als falsch markiert (setup.cpp R3-Bericht; ★ 02.10. F-N3). | [400..402] GEGENPHASE zu [395]/[396], abgetastet bei t%def_zaehl_takt==1 statt ==0, mit [402] als eigenem Nenner. GRUND (Pruefbefund HOCH-2, 24.09.): def_zaehl_takt ist gerade, alle Zaehlschritte sind gerade, und die dort gelesene Amplitude stammt vom Schritt DAVOR, also von einem ungeraden. Eine Periode-2-Mode -- vom Plan ausdruecklich als real gefuehrt -- ist damit konstruktiv unsichtbar und liest sich als einseitiges Vorzeichen (gemessen 99,7 %), als Schranke die nie greift und als dauerhafte Schrittaenderung. Weichen die Paritaeten um mehr als 20 Prozentpunkte ab, schwingt die Amplitude und KEINE Kraftzahl des Arms ist deutbar. [403..407] AMPLITUDENGROESSE, ★ NEU 24.09. nachmittags (Pruefagent H4). Faecher von |s2_neu| an den projekteigenen Schwellen: [403] < 1e-6, [404] 1e-6..1e-5, [405] 1e-5..1e-4, [406] 1e-4..1e-3, [407] >= 1e-3. Nenner ist [397] (gleiches Gate). GRUND: unter S2 ist CFD_FAC_REK_EPS zwingend 0, deshalb schweigen BEIDE Groessenwaechter in setup.cpp (harte Sperre 1e-6 "der Hub ueberlebt store_f nicht", Warnung 1e-4 "darunter messen die Zaehler registerseitig") -- sie haengen an rek_eps_b>0. Fuer die LAUFZEITamplitude gab es keinen einzigen Waechter, und die Herleitung gibt |du| = twe/rhon ~ 4,5e-6..1,35e-5, also 7- bis 22-fach UNTER dem Messhub. Liegt die Masse in [403]/[404], arbeitet der Arm im stillen Band und KEINE seiner gruenen Zahlen belegt etwas ausserhalb der Register. DER KERNEL INDIZIERT DIESE FUENF BERECHNET (s2_f) -- ein Literal-Grep nach hits[404] findet sie NICHT, dieselbe Falle wie die SGS_DIAG-Faecher 30..48. (Stand 24.09.: Puffer 408, mit 403..407 voll -- ★ 28.09. ueberholt, siehe die R1Q-Zeile darunter: hits_n = 432.) DIESE LEGENDE IST DIE EINZIGE QUELLE DER SLOTVERGABE.
 	// RANG-1-QUERREST 28.09.2026 (nur unter CFD_FAC_R1Q, JIT-Defines FAC_R1Q / FAC_R1Q_AN / FAC_R1Q_VR / FAC_R1Q_OHNE_DRUCK / FAC_R1Q_SPALTE1, alle an Zaehlschritten, saettigend): [408] markierte Besuche am Anwendungspunkt (Nenner; Marke -1 in fac_geo[8i+7] = Lage 1 und statischer Rang 1) | [409] Quelle berechnet (PINV-Zweig angewandt, pass2_an) | [410] PINV mit Rueckfall | [411] Zweig 3 (entkoppelter Skalarzweig) | [412] Zweig 1/2 (Vollrang) | [413] sonst -- ABNAHME Summe [409..413] == [408] STRIKT | [414] UNmarkiert im PINV-Zweig (nicht bedient) | [415..420] q = 1-a^2-b^2, Grenzen 0,1/0,3/0,5/0,7/0,9, Summe == [409] | [421..425] |p_perp|/|Z1| mit p_perp = (I-Gt/tr)P, Grenzen 0,1/1/10/100, [426] Ziel Z1 == 0, Summe [421..426] == [409] | R1Q=4 (FAC_R1Q_OHNE_DRUCK): V_R mit R' = R + 2(rho-1)(S1.t) -- nur der Reibungsanteil des BB wird ersetzt. [427] |du| > 0,5*ut: unter V_Z (R1Q=2) Stolperdraht, Soll 0; unter V_R (R1Q=3 bis 5) das TOR (Quelle nicht angewandt, BB bleibt -- wie SATGATE, Schranke wie tw_max) | [428] Impulsprobe Sum c Df != rho*du (aus den Inkrementen, Toleranz 1e-3 relativ) | [429] Massenprobe Sum Df != 0 (aus den Inkrementen, 1e-3 von rho*|du|) | [430] Buchungsprobe dfw != -m | [431] Normalanteil |du.n| > 1e-3|du|. 428..430 nur unter FAC_R1Q_AN. | [432] (★ 02.10.2026, nur unter SC_SIMD16) tatsaechliche Sub-Group-Breite von stream_collide, geschrieben von Zelle 0 (kein Zaehler; Soll 16). | R1Q=5 (★ 03.10.2026, nur unter FAC_R1Q_SPALTE1, an Zaehlschritten): kappa = (m.m4)/|m4|^2 = Anteil des Stufe-4-Schubs m4, den K2 (R2':=0) uebrig laesst, [433] <0 | [434] [0;0,1) | [435] [0,1;0,5) | [436] [0,5;0,9) | [437] [0,9;1,1) | [438] >=1,1 -- Summe 433..438 == [409] | [439] Schattentor |m4|/rho > 0,5*ut (dort haette Stufe 4 abgeschnitten; gegen [427] lesen). Puffer hits_n = 440 seit 03.10.2026, VOLL.
 	// U_RAND 04.10.2026 (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.8, nur unter #ifdef U_RAND emittiert): [484] Papierkorb GELESEN, UNGEGATET, saettigend, Soll 0 (stream_collide TYPE_E und deriv_reg-Nachbarn, update_force_field Wandsolid, sgs_fdwand, drive_boundary als Schreibversuch; ★ 05.10.2026 Korrektur A-M1/C-M1 ERGAENZT: sgs_fdwand auch OHNE SGS_SISM, schale_extract (Punkt- und Blockmittel), fac_nachbar_ab (Linkziel), apply_pressure_outlet (Lesen ODER Schreiben am Papierkorb; geschrieben wird dort seither nur mit Slot). Laufzeit-Negativtests: CFD_U_RAND_TESTHAKEN 6/7/8 nehmen Zellen eines Lesers aus dem Layout, Soll dann 484 > 0. Nicht als Laufzeitzaehler erfasst: apply_moving_boundaries (in stream_collide; der Zaehler kostete auf der iGPU 1600 B Spill -- dafuer STATISCHE Probe der MS-Solidnachbarn gegen die Geraete-Flags in berichte_u_rand, die Lesemenge ist nach initialize fest), rho_rek_ebene (Diagnose), update_fields (tot unter UPDATE_FIELDS), sgs_gdiag/REK-PI (gesperrt), extract_plane_macros (Nahfeld nur ueber lese_yslice_in_host, das u verwirft; die oeffentliche API sperrt U_RAND) | [485] Kopf traegt nicht die gueltige Magic (Platzhalter/vergessene Neubindung), ungegatet, Soll 0 | [486] stream_collide geschrieben (Slot in R1/A) an t == zaehl_takt+2, Ist=Soll gegen Host | [487] dort ohne Slot (Nicht-Solid), Ist=Soll | [488] FREI (war C-Segment; entfallen, die N2F-Bloecke liegen in A) | [489] Ausgabe V Ebenen-/Saeulenzellen (Nicht-Solid), Ist=Soll gegen ur_soll_489 | [490] V-Scheibenzellen bei VOLL, NUR n%1024 == 0 (sonst ein Atomic je Zelle), Ist=Soll | [491] FREI in master (★ 05.10.2026: in den Worktrees tiling-aufholen und agent-a59b... als ZK-Attrappe belegt, ebenso [488] -- in master NICHT anders vergeben, beim Merge die Legenden vereinigen). | [492] ★ 05.10.2026 Korrektur A-M3/C-N7: ZELLBASEN-KONSTANTENSPIEGEL, atomic_or in stream_collide IM #ifdef-ZELLBASEN-Zweig neben load_f_zb (Bit 0; ein zweites Bit an store_f_zb kostete auf der iGPU 32 B Spill), Stichprobe t%zaehl_takt == 0 an n%1024 == 0; Soll 1 mit ZELLBASEN, 0 ohne (Abnahme berichte_dichteklemme, je Domaene). Puffer hits_n = 493 seit 05.10.2026. MERGE-HINWEIS: der Worktree agent-a3de... (M1 SPARSE-DIAG) fuehrt hits_n = 504 mit [500] belegt, [501..503] vorgehalten und 492..499 ausdruecklich frei fuer FLAGS4/U_RAND -- beim Merge hits_n = 504 nehmen, [492] bleibt ZELLBASEN.
+	// ZKS 06.10.2026 (PLAN-ZKS-VOLLBAU-2026-10-06.md Z2, nur unter #ifdef ZK emittiert; Nummern frisch hinter 492 vergeben -- 488/491 bleiben frei, 500..503 sind im Worktree agent-a3de... fuer M1 vorgehalten): [493] Arbeitsgruppen durch den ZK-Kopf von stream_collide an t == zaehl_takt+2 (Lane 0 jeder Gruppe, hinter dem Pad-Ausstieg; Lane 0 ist nie Pad), Ist=Soll (Nx_pad/64)*Ny*Nz | [494] Zellen hinter dem Solid-Ausstieg mit n%1024 == 0 am selben Schritt, Ist=Soll aus den Host-Flags (TYPE_MS = S|E zaehlt mit) | [495] Untergruppen-Geraetetest am selben Schritt (alle Nicht-Pad-Lanes, x_sg = sub_group_broadcast(x, 0)): Lane-x liegt nicht in [x_sg, x_sg+16) (Untergruppe nicht zusammenhaengend oder breiter als die Lochausrichtung W = 16), Soll 0. Ohne ZK alle drei 0. Puffer hits_n = 496 seit 06.10.2026.
+	// ZKS 06.10.2026 Pruefbefund M-2 (nur unter #ifdef ZK, Kernel zk_pruef, EINMAL nach initialize, ungegatet, Soll 0, Abbruch vor der Zeitschleife): [496] Leser erreicht den Papierkorb (kalter Pfad) | [497] heisse != kalte Basis oder Tabelle widerspruechlich (Nachbarsaetze, Praefixkette) | [498] Kopf: Magic, zk_s2 != sizeof(fpxx)*S, PK >= S | [499] Lochzelle mit Nicht-TYPE_S in 5x5x5 (Geraete-Flags). Testhaken CFD_ZK_HAKEN=6 (Tabellenwort +1 -> [497]), 7 (Zelle neben einem Loch auf Fluid -> [499]) und 8 (alle Basen +1 -> Anker in [497]), nur CPU/iGPU. Puffer hits_n = 500 seit 06.10.2026 (500..503 im Worktree agent-a3de... fuer M1 vorgehalten).
 	// REK-PI 03.10.2026 (nur unter CFD_FAC_REKPI, JIT-Defines FAC_REKPI / FAC_REKPI_AN, PLAN-REK-PI.md §7; alle an Zaehlschritten t%zaehl_takt == 0 und saettigend, AUSSER [470] (Schritt danach)): [440] Besuche hinter dem ut-Tor (Soll [7]-[9]) | [441] Referenzpunkt gueltig, REK-PI gerechnet (unter _AN angewandt) | [442] kein Referenzpunkt (Sentinel der Sprungregel oder Referenz steht still; Soll [441]+[442] == [440]) | PROBEN Soll 0 (nur _AN): [443] Masse Sum Df | [444] Impuls Sum c Df | [445] Normal n.M.n | [446] Ist=Soll u_t (u.e1 = u_WM, u.e2 = 0; 1e-3) | [447] Ist=Soll Pi_t1n/Pi_t2n (1e-3) | [448..453] u_t,l.t_ref/u_WM <0 | 0-0,5 | 0,5-0,9 | 0,9-1,1 | 1,1-2 | >=2 | [454..458] Pi_lok/Pi_WM <0 | 0-0,5 | 0,5-2 | 2-10 | >=10 | [459] Richtungsumkehr cos(t_ref, t_lok) < 0 | [460] |Df|max < 2^-11 |f^|max (Quantum, No-Op-Gefahr) | [461] Sprung k = 2 | [462..465] y+_w <5 | 5-30 | 30-300 | >=300 | [466..468] |rho du|/tau_w <1e2 | 1e2-1e4 | >=1e4 | [469] du.t_ref > 0 an t%zaehl_takt == 0 | [470] dasselbe an t%zaehl_takt == 1 (Periode-2-Waechter) | [471] f_i < 0 nach Setzung+Tausch (nur _AN) | [472] w_WM in der Kollision angewandt (stream_collide, nur _AN; Soll == [441], unter Stufe 3/_NUR_U Soll 0). ★ 04.10.2026 (Pruefbefunde H1/NEU): [473] Nenner-Kollaps der Sekante u_k1.e1 - u_WM <= 0 (Teilmenge von [442], dort nicht gesetzt) | [474] nu_s an der molekularen Untergrenze geklemmt (Teilmenge von [441]) | NETTO-FLUSS (nur _AN, am Schritt t%zaehl_takt == 1): [475..481] T/(-rho u_tau^2) <0 | 0-0,5 | 0,5-0,9 | 0,9-1,1 | 1,1-2 | 2-10 | >=10, T = Ausflusshalbmoment der gesetzten Zelle nach der Kollision (roff+8) + Einflusshalbmoment des Folgeschritts | [482] Messbesuche (gesetzt am Folgeschritt) | [483] davon ohne gueltiges T_aus (Soll Sum[475..481] + [483] == [482]). Unter _AN feuern zusaetzlich die REK-Proben [328..334] und die R3-Slots [331], [370..392] an denselben Zellen (Soll [370] == [328] == [441]).
 	kernel_stream_collide = Kernel(device, N, "stream_collide", fi, rho, u, flags.k(), t, fx, fy, fz, felder_voll_h, rho_clamp_hits); // ★ TODO 2: rho_voll HINTER fz, damit set_parameters(4u, t, fx, fy, fz, rho_voll) zusammenhaengend bleibt; absolute Indizes gibt es nur fuer 0 und 4..7
 	sc_spill = kernel_stream_collide.spill_bytes(); // ★ 02.10. Laufzeit-Spill von stream_collide (jeder Lauf; Wirkpfad des Messarms SC_SIMD16, Soll dort 0)
 	sc_private = kernel_stream_collide.private_bytes(); // ★ 02.10. Pruefbefund SC16b N3: auch Scratch (private) muss 0 sein, Spill allein deckt ihn nicht
+	if(zk_on) { // ★ 06.10.2026 ZKS Pruefbefund M1: der Lochterm je Untergruppe ist nur fuer Breite <= W = 16 exakt (Breite 32: falsche fi-Adressen bei echten
+		// Loechern, Pruefagent: 37 von 40 Geometrien). IGC waehlt die SIMD-Breite selbst -- deshalb hier, VOR run(0), die uebersetzte Breite abfragen.
+		const ulong sg_ = kernel_stream_collide.max_subgroup((ulong)WORKGROUP_SIZE);
+		println("ZK UNTERGRUPPE stream_collide auf "+device.info.name+": max. Breite "+to_string(sg_)+" (Soll 1..16, W = "+to_string(zk_w)+")");
+		if(sg_==0ull||sg_>(ulong)zk_w) print_error("ZK: Untergruppenbreite von stream_collide "+(sg_==0ull ? string("nicht abfragbar") : to_string(sg_))+" -- der Lochterm verlangt <= "+to_string(zk_w)+". Lauf nicht gestartet.");
+	}
 	print_info("stream_collide auf "+device.info.name+": Register-Spill "+(!device.info.is_gpu ? string("ohne Bedeutung (CPU-Laufzeit meldet 0)") : (sc_spill==~0ull ? string("nicht abfragbar") : to_string(sc_spill)+" B"))+", private "+(sc_private==~0ull ? string("nicht abfragbar") : to_string(sc_private)+" B")+", max. Work-Group "+to_string(kernel_stream_collide.max_workgroup())+(sc_simd16_jit ? " (SC_SIMD16 aktiv)" : ""));
 	println("SC_SPILL geraet="+to_string(device.info.id)+" gpu="+string(device.info.is_gpu?"1":"0")+" sc16="+string(sc_simd16_jit?"1":"0")+" spill_B="+(sc_spill==~0ull ? string("na") : to_string(sc_spill))+" private_B="+(sc_private==~0ull ? string("na") : to_string(sc_private))); // ★ 02.10. Pruefbefund SC16b M1: EINE ungebrochene Zeile fuer grep (print_info bricht auf 79 Zeichen um)
 	kernel_update_fields = Kernel(device, N, "update_fields", fi, rho, u, flags.k(), t, fx, fy, fz);
@@ -1079,6 +1144,22 @@ void LBM_Domain::allocate(Device& device) {
 	boden_eq_n = s_boden_eq_n; boden_eq_u = s_boden_eq_u; boden_eq_down = s_boden_eq_down; boden_eq_split = s_boden_eq_split; boden_eq_abstand = s_boden_eq_abstand; // u_road = u_lat-Projektkonvention; Konstruktionszeit-Kopie (read-once-Doktrin)
 	kernel_einlass_eq = Kernel(device, N, "einlass_eq", fi, flags.k(), t, 0.0f, 0u, rho_clamp_hits); // ★ EINLASS_EQ (V1-Port apply_inlet_velocity): Parameter t/u/nx je Enqueue
 	einlass_eq_n = s_einlass_eq_n; einlass_eq_u = s_einlass_eq_u; // Konstruktionszeit-Kopie (read-once-Doktrin)
+	{ // ★ 06.10.2026 F1 RAND-DISPATCH: Startbereich EINMAL aus den eingefrorenen Kopien. boden_eq arbeitet nur auf z = 1..max(nz, nz_down) (lokale
+	  // Koordinaten, Kernel-Test xyz.z>=1 && xyz.z<=nz_eff); diese Zellen bilden den zusammenhaengenden Indexbereich [Nx*Ny, Nx*Ny*(zmax+1)). Der Start
+	  // beginnt auf der Arbeitsgruppe abgerundet (enqueue_run_bereich verlangt offset % wg == 0); die Zusatz-Lanes darunter (z = 0) und die
+	  // Aufrundung am Ende steigen wie bisher am z- bzw. n-Test aus. Der Kernel bleibt zeichengleich. Ist=Soll: boden_eq_abnahme().
+		const ulong NxNy = (ulong)Nx*(ulong)Ny, Nd = get_N(), wg = (ulong)WORKGROUP_SIZE;
+		if(boden_eq_n>0u) {
+			const ulong zmax = (ulong)max(boden_eq_n, boden_eq_down);
+			const ulong e_voll = min(Nd, NxNy*(zmax+1ull));
+			const ulong e = rand_dispatch_haken_on ? (e_voll>NxNy ? e_voll-NxNy : 0ull) : e_voll; // Testhaken: eine z-Ebene weniger
+			rd_boden_a = (NxNy/wg)*wg;
+			rd_boden_anz = e>rd_boden_a ? e-rd_boden_a : 0ull;
+		}
+		println("RAND-DISPATCH geraet="+to_string(device.info.id)+" N="+to_string(Nd)+" modus="+string(rand_dispatch_on?"1":"0")+" haken="+string(rand_dispatch_haken_on?"1":"0")
+			+" boden_nz="+to_string(boden_eq_n)+" boden_down="+to_string(boden_eq_down)+" boden_start="+to_string(rand_dispatch_on&&boden_eq_n>0u ? rd_boden_a : (ulong)0)+" boden_items="+to_string(boden_eq_n==0u ? (ulong)0 : (rand_dispatch_on ? rd_boden_anz : Nd))
+			+" einlass_nx="+to_string(einlass_eq_n)+" einlass_items="+to_string(einlass_eq_n==0u ? (ulong)0 : Nd)); // ★ eine ungebrochene Zeile fuer grep (println, nicht print_info); Modus aus den eingefrorenen Flags (Pruefbefund N1)
+	}
 	rho_takt = s_rho_takt; // ★ TODO 2: Konstruktionszeit-Kopie wie die uebrigen (read-once-Doktrin)
 #ifdef SRT
 	klemm_bilanz_on = klemm_bilanz_env(); // ★ 15.09.2026 Klemmen S0b: Konstruktionszeit-Kopie, dieselbe Quelle wie die Emission (nur SRT, siehe Emission)
@@ -1226,7 +1307,7 @@ void LBM_Domain::allocate(Device& device) {
 	// allen anderen add_parameters angehaengt werden. Bei ausgeschaltetem Sparse ist TS_P leer, dann darf
 	// hier auch nichts gebunden werden -- sonst stimmt die Parameterzahl nicht mehr mit der Device-Seite
 	// ueberein, und das ist genau die Fehlerklasse, die still falsche Ergebnisse produziert.
-	if(sparse_on) {
+	if(sparse_on||zk_on) { // ★ 06.10.2026 ZKS Z4: TS_P wird auch unter ZK emittiert (Werkzeugfalle 8: gleiche Bedingung wie die Emission)
 		// Multi-GPU + Sparse ist nicht validiert: die transfer_*_fi-Kernel bekaemen tile_slot hier nicht
 		// gebunden. Lieber laut abbrechen als still falsch rechnen.
 		if(get_D()>1u) print_error("Block-Tiling (CFD_SPARSE_TILES) ist nur fuer eine einzelne GPU validiert, hier laufen "+to_string(get_D())+" Domaenen.");
@@ -1238,6 +1319,46 @@ void LBM_Domain::allocate(Device& device) {
 #ifdef FORCE_FIELD
 		kernel_update_force_field.add_parameters(tile_slot);
 #endif // FORCE_FIELD
+	}
+	// ★ 06.10.2026 ZKS Z2 (PLAN-ZKS-VOLLBAU-2026-10-06.md): zk_tab ist der LETZTE Parameter von stream_collide (kernel.cpp hinter TS_P unter
+	// #ifdef ZK) -- also nach allen anderen add_parameters, unter derselben Bedingung wie die Emission (Werkzeugfalle 8). In Z2 ist die Tabelle
+	// LEER (P = 0, kein Loch): [k] = r'_k*Nx, Nachbarzeilen (dy,dz) periodisch wie calculate_indices, [8+k] = 0 -> Adressen bytegleich zu
+	// ZELLBASEN, S = N. Danach Pad-Dispatch: jede Arbeitsgruppe liegt ganz in einer Zeile.
+	if(zk_on) {
+		const ulong NR = (ulong)get_Ny()*(ulong)get_Nz(), Nx_ = (ulong)get_Nx(), Ny_ = (ulong)get_Ny(), Nz_ = (ulong)get_Nz();
+		for(ulong q=0ull; q<tile_slot.length(); q++) tile_slot[q] = 0u; // Z4: Platzhalterinhalt (leere Tabelle, S = N) bis zk_finalisieren
+		const int zdy[7] = { 0, 1, 0, 1, -1,  0,  1 };
+		const int zdz[7] = { 0, 0, 1, 1,  0, -1, -1 };
+		for(ulong r=0ull; r<NR; r++) {
+			const ulong y = r%Ny_, z = r/Ny_;
+			for(uint k=0u; k<7u; k++) {
+				const ulong yy = (y+Ny_+(ulong)(long)zdy[k])%Ny_;
+				const ulong zz = (z+Nz_+(ulong)(long)zdz[k])%Nz_;
+				tile_slot[16ull+16ull*r+(ulong)k] = (uint)((yy+Ny_*zz)*Nx_);
+			}
+		}
+		tile_slot[0] = 0x5A4B5330u; // Magic "ZKS0" = PLATZHALTER (zk_finalisieren schreibt "ZKS1")
+		tile_slot[1] = (uint)get_N(); // S = fi-Stride (Platzhalter: N)
+		tile_slot[2] = (uint)get_N(); // PK (Papierkorb)
+		tile_slot[3] = 1u;            // eine Strecke je Zeile
+		tile_slot[4] = (uint)NR;
+		tile_slot[5] = zk_w;
+		tile_slot[6] = (uint)Nx_;
+		tile_slot[7] = zk_nxp;
+		tile_slot.write_to_device();
+		{ // Kopf-Gegenlese (Muster ur_selbsttest): finish, zuruecklesen, vergleichen -- Zero-Copy-Geraete lesen denselben Speicher
+			uint soll[16]; for(uint q=0u; q<16u; q++) soll[q] = tile_slot[q];
+			finish_queue();
+			tile_slot.read_from_device(0ull, 16ull);
+			uint abw = 0u; for(uint q=0u; q<16u; q++) abw += (uint)(tile_slot[q]!=soll[q]);
+			if(abw>0u) print_error("ZK: Kopf-Gegenlese der Zeilentabelle weicht in "+to_string(abw)+" von 16 Woertern ab.");
+		}
+		kernel_stream_collide.add_parameters(tile_slot); // Parameter zk_tab (dieselbe Tabelle wie TS_P, zweite Bindung)
+		kernel_zk_pruef = Kernel(device, get_N(), "zk_pruef", flags.k(), tile_slot, (ulong)0ull, rho_clamp_hits); // ★ M-2: zs2 an Position 2, gesetzt in zk_pruefen
+		zk_s2_pos = kernel_stream_collide.get_number_of_parameters();
+		kernel_stream_collide.add_parameters((ulong)sizeof(fpxx)*(ulong)get_N()); // zk_s2, Platzhalter bis zk_finalisieren
+		kernel_stream_collide.set_ranges((ulong)zk_nxp*NR); // Pad-Dispatch
+		println("ZK AKTIV Nx "+to_string(get_Nx())+" -> Nx_pad "+to_string(zk_nxp)+" (Leerlauf "+to_string(100.0*(double)(zk_nxp-get_Nx())/(double)get_Nx(), 2u)+" %), Gruppen je Zeile "+to_string(zk_nxp/(uint)WORKGROUP_SIZE)+", Zeilen "+to_string(NR)+", Dispatch "+to_string((ulong)zk_nxp*NR)+" statt "+to_string(get_N())+", Tabelle "+to_string((ulong)(tile_slot.length()*4ull/1024ull))+" KiB (Platzhalter bis zk_finalisieren), W "+to_string(zk_w)+", Nachbarn aus der Zeile");
 	}
 
 	if(get_D()>1u&&(fbnx!=Nx||fbny!=Ny||fbnz!=Nz)) print_error("F-BBox + Multi-GPU ist NICHT gebaut (transfer_F/graphics indizieren F voll-domaenig -- OOB)."); // ★ Tiefen-Audit B1: vorher pruefte er die read-once-GENULLTE Statik = toter Code; jetzt die aufgeloesten Member
@@ -1284,7 +1405,7 @@ void LBM_Domain::alloc_rho_rek(const ulong max_plane_cells) {
 	rho_rek_out  = Memory<float>(device, max_plane_cells*4ull, 1u);
 	rho_rek_wort = Memory<rhoxx>(device, max_plane_cells, 1u);
 	kernel_rho_rek_ebene = Kernel(device, max_plane_cells, "rho_rek_ebene", fi, rho, u, flags.k(), t, rho_rek_out, rho_rek_wort, 0u, 0u, 0u, 0u, 1u, 1u, 0u, rho_clamp_hits); // ★ C2a: modus an Index 13, hits 14, tile_slot 15
-	if(sparse_on) kernel_rho_rek_ebene.add_parameters(tile_slot); // Guard wie im Kernel (TS_P haengt an SPARSE_TILES, Falle 8)
+	if(sparse_on||zk_on) kernel_rho_rek_ebene.add_parameters(tile_slot); // Guard wie im Kernel (TS_P haengt an SPARSE_TILES, Falle 8)
 	print_info("rho-Rekonstruktion (RHO_RAND C1): Puffer fuer "+to_string(max_plane_cells)+" Ebenenzellen = "
 		+to_string((float)(max_plane_cells*(16ull+(ulong)sizeof(rhoxx)))/1.0e6f,2u)+" MB auf "+device.info.name+".");
 }
@@ -1326,7 +1447,7 @@ void LBM_Domain::alloc_schale(const std::vector<ulong>& liste, const std::vector
 	schale_gewicht.write_to_device();
 	kernel_schale_extract = Kernel(device, n, "schale_extract", u, flags.k(), schale_liste, (uint)n, ratio, 1u, schale_uout, rho_clamp_hits); // mittel (Pos. 5) je Enqueue; ★ 05.10.2026 A-M1/C-M1: hits (Pos. 7, Slot 484 unter U_RAND)
 	kernel_schale_blend   = Kernel(device, n, "schale_blend", fi, flags.k(), t, 0.0f, schale_liste, (uint)n, schale_unear, schale_gewicht, modus, rho_clamp_hits); // t/alpha (Pos. 2/3) je Enqueue; gewicht+modus VOR diag (Plan-Vorgabe)
-	if(sparse_on) kernel_schale_blend.add_parameters(tile_slot); // TS_P haengt NUR an SPARSE_TILES (XL-Audit-B1-Lektion); der Blend laeuft zwar nur im Fernfeld (ohne Tiling), aber die Signatur muss zur Emission der Domaene passen
+	if(sparse_on||zk_on) kernel_schale_blend.add_parameters(tile_slot); // TS_P haengt NUR an SPARSE_TILES (XL-Audit-B1-Lektion); der Blend laeuft zwar nur im Fernfeld (ohne Tiling), aber die Signatur muss zur Emission der Domaene passen
 	print_info("N2F-Schale: "+to_string(n)+" Zellen a 2x3+1 floats + Indexliste = "
 		+to_string((float)(n*(blendet?32ull:16ull))/1048576.0f,2u)+" MB auf "+device.info.name+" (alpha dieser Domaene: "+to_string(schale_alpha,3u)+", modus "+to_string(modus)+(modus==2u?" IDENT-Debug":modus==1u?" FNEQ":" EQ")+").");
 }
@@ -1377,8 +1498,24 @@ void LBM_Domain::enqueue_schale_blend() { // ★ P9c: post-stream Schalen-Blend 
 // "DRM-Debugfs", auch wenn der Wert aus fdinfo kam. Im ersten Selbsttest genau so passiert.
 static const char* g_vram_quelle = "keiner";
 const char* vram_quelle() { return g_vram_quelle; }
-ulong vram_frei_gemessen(const ulong kapazitaet_mib) {
+static const ulong vram_spaet_mib = 320ull;  // ★ 06.10.2026 ZKS Z3: Spaetpuffer nach dem Konstruktor (Facettengeometrie, Schale, Kopplungsebene, kf_liste), gemessen am 4-mm-Lauf p4_v3b
+static const ulong vram_luft_mib = (ulong)env_u("CFD_VRAM_MIN_FREI_MB", 1024u);  // ★ Heikos Mindestluft (06.10.: Schalter wirkt jetzt auch hier, Heiko: 512 bei 3,5 mm); Stufe 1 und Stufe 2 nutzen dieselben Konstanten (Pruefbefund M2)
+ulong vram_frei_gemessen(const ulong kapazitaet_mib, const uint haken_stufe) {
 	g_vram_quelle = "keiner";
+	{ // ★ 06.10.2026 ZKS Z3 TESTHAKEN: CFD_VRAM_HAKEN_FREI_MB ersetzt die Messung durch einen festen (zu kleinen) Wert -- Negativtest, dass Stufe 1
+	  // (Konstruktor) bzw. Stufe 2 (alloc_u_rand) VOR der Allokation sauber abbrechen. Nie in einer Produktionszeile (Sperre: nur 8 mm).
+	  // ★ Pruefbefund N2: CFD_VRAM_HAKEN_STUFE=1|2 begrenzt den Haken auf eine Stufe (ohne: beide Stufen und alle uebrigen Aufrufer).
+		const char* h_ = getenv("CFD_VRAM_HAKEN_FREI_MB");
+		if(h_!=nullptr&&atoll(h_)>0ll) {
+			if(env_f("CFD_DX", 8.0f)<8.0f) print_error("CFD_VRAM_HAKEN_FREI_MB ist ein Testhaken und nur bei 8 mm erlaubt (CFD_DX < 8 gesetzt).");
+			const uint st_ = env_u("CFD_VRAM_HAKEN_STUFE", 0u);
+			if(st_==0u||st_==haken_stufe) {
+				g_vram_quelle = "TESTHAKEN CFD_VRAM_HAKEN_FREI_MB";
+				print_warning("VRAM-TESTHAKEN aktiv: gemessener Frei-Wert ersetzt durch "+string(h_)+" MiB (Stufe "+to_string(haken_stufe)+").");
+				return (ulong)atoll(h_);
+			}
+		}
+	}
 	for(const string& pfad : {string("/sys/kernel/debug/dri/0/tile0/vram_mm"), string("/sys/kernel/debug/dri/0/i915_gem_objects")}) {
 		std::ifstream f(pfad);
 		if(!f) continue;
@@ -1571,14 +1708,14 @@ void LBM_Domain::alloc_sgs_band(const uchar* flags_host, const uint Nx, const ui
 	kernel_sgs_band = Kernel(device, band_N, "sgs_fdwand", u, flags.k(), band_zellen, (uint)band_N, band_sbar);
 	if(sism_on) kernel_sgs_band.add_parameters(t, band_sb, rho_clamp_hits, 1u); // sbar_out = 1: der Bandkernel liefert Sbar, kein w
 	else if(u_rand_on) kernel_sgs_band.add_parameters(rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: wie kernel_sgs_fdwand -- ohne SISM mit U_RAND nur der Zaehlerpuffer, VOR tile_slot
-	if(sparse_on) kernel_sgs_band.add_parameters(tile_slot); // ★ 22.09. Pruefbefund M1: TS_P ist der letzte Parameter von sgs_fdwand -- der Lage-1-Kernel bekam ihn (B-7-Lehre), der Bandkernel nicht; mit CFD_SPARSE_TILES waere der Band-Launch mit CL_INVALID_KERNEL_ARGS gestorben (bisher nie kombiniert)
+	if(sparse_on||zk_on) kernel_sgs_band.add_parameters(tile_slot); // ★ 22.09. Pruefbefund M1: TS_P ist der letzte Parameter von sgs_fdwand -- der Lage-1-Kernel bekam ihn (B-7-Lehre), der Bandkernel nicht; mit CFD_SPARSE_TILES waere der Band-Launch mit CL_INVALID_KERNEL_ARGS gestorben (bisher nie kombiniert)
 	}
 	if(gdiag_on) { // ★ 22.09.2026 BAND-g-DIAGNOSE: zweite Instanz desselben Kernels ueber die Bandliste (Liste traegt n, s. o.). Kein Kernel-, kein JIT-Text geaendert.
 		band_gd = Memory<float>(device, 8ull*band_N);
 		for(ulong q8=0ull; q8<8ull*band_N; q8++) band_gd[q8]=0.0f;
 		band_gd.write_to_device();
 		kernel_band_gdiag = Kernel(device, band_N, "sgs_gdiag", fi, u, flags.k(), band_zellen, (uint)band_N, band_gd, t, fx, fy, fz, s_sgs_guo?1u:0u);
-		if(sparse_on) kernel_band_gdiag.add_parameters(tile_slot); // TS_P zuletzt, wie bei kernel_sgs_gdiag (B-7)
+		if(sparse_on||zk_on) kernel_band_gdiag.add_parameters(tile_slot); // TS_P zuletzt, wie bei kernel_sgs_gdiag (B-7)
 		band_gdiag_on = true;
 		print_info("BAND-g-DIAGNOSE (CFD_SGS_GDIAG x CFD_SGS_BAND): "+to_string(band_N)+" Bandzellen, "+to_string((ulong)(32ull*band_N/1048576ull))+" MB -- misst |S|_FD, |S|_Pi, D_WALE, D_Sigma, |Omega| je Bandzelle (Lage 2.."+to_string(lagen)+"); Physik unangetastet.");
 	}
@@ -2156,8 +2293,13 @@ void LBM_Domain::alloc_u_rand(const uint modus, const float u_lat) {
 		r[ur_k::REGEL_VX+3u] = u_pack(0.0f); r[ur_k::REGEL_VX+4u] = u_pack(0.0f); r[ur_k::REGEL_VX+5u] = u_pack(0.0f); }
 	const ulong mib = (ur_len*(ulong)sizeof(velxx)+1048575ull)/1048576ull;
 	if(!device.info.uses_ram) { // Plan B.5: gegen den GEMESSENEN freien VRAM pruefen (Vorpruefung zaehlt u unter U_RAND nicht verlaesslich)
-		const ulong frei = vram_frei_gemessen((ulong)device.info.memory);
-		if(frei>0ull&&mib+1024ull>frei) print_error("alloc_u_rand: "+to_string(mib)+" MiB fuer u, gemessen frei nur "+to_string(frei)+" MiB (Mindestluft 1024 MiB).");
+		const ulong frei = vram_frei_gemessen((ulong)device.info.memory, 2u);
+		const ulong vram_spaet_mib = zk_on ? (zk_spaet_bytes(false)+1048575ull)/1048576ull : ::vram_spaet_mib; // ★ ZKS M-1: unter ZK hergeleitet (Facetten/Band liegen schon), sonst der bisherige Wert
+		// ★ 06.10. Pruefbefund M2: alloc_u_rand laeuft VOR Kopplungsebenen, Schale und kf_liste -- die Spaetpuffer gehoeren in die Pruefung, sonst
+		// faellt die Mindestluft still auf ~700 MiB (Stufe 1 hat sie gebucht, aber ohne u).
+		if(frei>0ull&&mib+vram_spaet_mib+vram_luft_mib>frei) print_error("alloc_u_rand (VRAM STUFE 2): "+to_string(mib)+" MiB fuer u + "+to_string(vram_spaet_mib)+" MiB Spaetpuffer + "+to_string(vram_luft_mib)+" MiB Mindestluft > gemessen frei "+to_string(frei)+" MiB -- Gitter kleiner waehlen (u nicht angelegt).");
+		if(frei==0ull) print_warning("alloc_u_rand: freier VRAM hier NICHT messbar -- hat die Vorpruefung (Stufe 1, ZKS Z3) den U_RAND-Puffer vertagt, ist er jetzt ungeprueft (siehe Zeile VRAM VORPRUEFUNG STUFE 1).");
+		println("VRAM VORPRUEFUNG STUFE 2 (alloc_u_rand) gemessen frei "+to_string(frei)+" MiB, u kompakt exakt "+to_string(mib)+" MiB + Spaetpuffer "+to_string(vram_spaet_mib)+" + Mindestluft "+to_string(vram_luft_mib)+" -> "+(frei==0ull ? string("NICHT MESSBAR") : (mib+vram_spaet_mib+vram_luft_mib<=frei ? string("passt, Schlupf "+to_string(frei-mib-vram_spaet_mib-vram_luft_mib)+" MiB") : string("ABBRUCH"))));
 		println("U_RAND ALLOC VRAM frei vorher "+to_string(frei)+" MiB ("+string(vram_quelle())+"), u kompakt "+to_string(mib)+" MiB");
 	}
 	u = Memory<velxx>(device, ur_len, 1u); // gibt den Platzhalter frei (klein)
@@ -2230,6 +2372,18 @@ void LBM_Domain::ur_v_anlegen() {
 	if(Nx<2ull*wg+8ull) print_error("U_RAND: Nx < 2*Arbeitsgruppe+8 -- die Scheibengrenze passt nicht ins Zeileninnere.");
 	ur_VN = ur_v_layout(Nx, Ny, Nz, &ur_scheiben);
 	ur_VOFF = ur_R1N+ur_AN;
+	if(zk_on) { // ★ 06.10.2026 ZKS (K5, Prototyp TILING-AUFHOLEN): stream_collide laeuft im Pad-Dispatch-Raum (gid = Zeile*Nx_pad + x). Der
+		// Scheibenstart muss dort ein Vielfaches der Arbeitsgruppe sein (enqueue_run_bereich, get_global_offset/64 im Kernel). Darum liegt jede
+		// innere Grenze in derselben z-Schicht und Zeile y = Ny/2 wie bisher, aber bei x = floor((Nx/2)/wg)*wg statt n-gerundet; die letzte
+		// Grenze ist N exakt. Die beruehrten z-Schichten jeder Scheibe (V-Box, ur_VN) aendern sich dadurch nicht. Esoteric Pull rechnet in-place
+		// und zellweise unabhaengig -- die Zerlegung des Schritts in Scheiben ist physikalisch neutral (dieselbe Begruendung wie fuer die n-Scheiben).
+		const ulong NxNy = Nx*Ny, xs = ((Nx/2ull)/wg)*wg;
+		for(size_t i=1u; i+1u<ur_scheiben.size(); i++) ur_scheiben[i] = (ur_scheiben[i]/NxNy)*NxNy+(Ny/2ull)*Nx+xs;
+		ur_scheiben.back() = NxNy*Nz;
+		for(size_t i=0u; i<ur_scheiben.size(); i++) if(zk_gid(ur_scheiben[i])%wg!=0ull) print_error("ZK: U_RAND-Scheibengrenze "+to_string(ur_scheiben[i])+" liegt im Dispatch-Raum nicht auf einer Arbeitsgruppe.");
+		for(size_t i=1u; i<ur_scheiben.size(); i++) if(ur_scheiben[i]<=ur_scheiben[i-1u]) print_error("ZK: U_RAND-Scheibengrenzen nicht streng steigend.");
+		println("ZK U_RAND-Scheiben "+to_string(ur_scheiben.size()-1u)+" im Dispatch-Raum (x-Schnitt "+to_string(xs)+", Ende gid "+to_string(zk_gid(ur_scheiben.back()))+")");
+	}
 	ur_v_y = (uint)(Ny/2ull);
 }
 void LBM_Domain::ur_saeule_setzen(const uint x, const uint y, const uint zn) {
@@ -2256,7 +2410,8 @@ void LBM_Domain::ur_voll_scheiben(const uint fv) { // VOLL am letzten Substep: S
 		const ulong a = ur_scheiben[i-1u], b = ur_scheiben[i], e = min(b, N);
 		const ulong za = a/NxNy, zb = (e-1ull)/NxNy, vb = za*NxNy; // V-Box = die beruehrten z-Schichten, V-Index = n - vb
 		ur_vbox(0u, 0u, (uint)za, (uint)Nx, (uint)Ny, (uint)(zb-za+1ull));
-		kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, fv|12u).enqueue_run_bereich(a, b-a);
+		if(zk_on) kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, fv|12u).enqueue_run_bereich(zk_gid(a), zk_gid(b)-zk_gid(a)); // ★ 06.10. ZKS: Bereich im Dispatch-Raum
+		else kernel_stream_collide.set_parameters(4u, t, fx, fy, fz, fv|12u).enqueue_run_bereich(a, b-a);
 		for(uint kk=0u; kk<3u; kk++) u.read_from_device(ur_DOFF+(ulong)kk*ur_US+ur_VOFF+(a-vb), e-a); // blockierend (Zero-Copy: finish)
 		parallel_for(e-a, [&](ulong q) {
 			const ulong n = a+q;
@@ -2707,10 +2862,10 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		if(u_rand_on) kernel_fac_nachbar.add_parameters(rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: #ifdef U_RAND in der Signatur (nach fac_idx, VOR TS_P) -- U_RAND wird genau bei u_rand_on emittiert (s_u_rand, eingefroren im Konstruktor)
 		if(apg_on) { // ★ 16.09. APG-Vorkernel: eigener Kernel (Gate-Befund Spill), liest die DDFs, schreibt grad rho nach fac_nb[2..4]; t (Position 5) wird je Schritt nachgesetzt
 			kernel_fac_apg = Kernel(device, aktiv, "fac_apg_ab", flags.k(), gd_zellen, (uint)aktiv, fac_nb, fi, t, rho_clamp_hits);
-			if(sparse_on) kernel_fac_apg.add_parameters(tile_slot);
+			if(sparse_on||zk_on) kernel_fac_apg.add_parameters(tile_slot);
 			print_info("APG-VORKERNEL fac_apg_ab gebunden (16.09.): grad rho aus den DDFs der 6 Achsnachbarn je Facette, "+to_string((float)(12ull*aktiv)/1048576.0f,1u)+" MB in fac_nb[2..4], Launch je Schritt nach fac_nachbar_ab.");
 		}
-		if(sparse_on) kernel_fac_nachbar.add_parameters(tile_slot); // B-7-Lehre: TS_P haengt an SPARSE_TILES
+		if(sparse_on||zk_on) kernel_fac_nachbar.add_parameters(tile_slot); // B-7-Lehre: TS_P haengt an SPARSE_TILES
 		{ const uint nbix=fac_param_pos+4u+(fac_ema_on?1u:0u)+(fac_pema_on?1u:0u)+(diagz_gebaut?1u:0u)+(fac_elibb_on?1u:0u)+(fac_kdiag_on?1u:0u);
 		  kernel_stream_collide.set_parameters(nbix, fac_nb); } // Rebind NACH dem Neubau (Platzhalter-Lektion wie fac_wfd)
 		print_info("NACHBARABTASTUNG deterministisch (03.09.): Kernel fac_nachbar_ab je Schritt nach stream_collide liest das FERTIGE u-Feld und schreibt (u_t_abt, y_abt) fuer "+to_string(aktiv)+" Facetten; apply_facette_imem liest den Vorschritt (ein Schritt Versatz wie fac_wfd). Der fruehere Direktzugriff u[nb] im selben Kernel war gemessen nicht bitreproduzierbar (xu_det_mit_a/b, 03.09.).");
@@ -2736,7 +2891,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 			print_info("SISM gebunden: fac_sb "+to_string((float)(24ull*aktiv)/1048576.0f,1u)+" MB fuer "+to_string(aktiv)+" Facetten, EMA T = "+to_string((ulong)sism_T)+" Schritte (alpha = 1/T im Kernel), klassisch bis Schritt "+to_string(sism_ab)+"; Slot 126/127 am Laufende.");
 		}
 		else if(u_rand_on) kernel_sgs_fdwand.add_parameters(rho_clamp_hits); // ★ 05.10.2026 A-M1/C-M1: ohne SISM, aber mit U_RAND traegt die Signatur den Zaehlerpuffer allein (#else-Zweig SGS_SISM), VOR tile_slot
-		if(sparse_on) kernel_sgs_fdwand.add_parameters(tile_slot); // gleiche B-7-Lehre wie sgs_gdiag
+		if(sparse_on||zk_on) kernel_sgs_fdwand.add_parameters(tile_slot); // gleiche B-7-Lehre wie sgs_gdiag
 		{ const uint fwix=fac_param_pos+4u+(fac_ema_on?1u:0u)+(fac_pema_on?1u:0u)+(diagz_gebaut?1u:0u)+(fac_elibb_on?1u:0u)+(fac_kdiag_on?1u:0u)+(nachbar_on?1u:0u); // +nachbar_on (03.09.): fac_nb sitzt VOR fac_wfd
 		  kernel_stream_collide.set_parameters(fwix, fac_wfd); band_param_pos = fwix+1u; } // ★ 08.09.: dieselbe Rechnung fuer das Band merken -- alloc_sgs_band laeuft spaeter und sieht diagz_gebaut nicht mehr // ★ Rebind NACH dem Neubau -- der Rebind stand zuerst VOR dem Move-Assignment und band den gleich darauf ZERSTOERTEN Platzhalter (CL -52 beim ersten Enqueue; exakt die DIAGZ-Use-after-free-Lektion, 02.09. erneut bezahlt)
 		print_info("SGS-GEISTERMODEN-FIX (CFD_SGS_FDWAND): w an "+to_string(aktiv)+" Facettenzellen aus |S|_FD (u-Feld, geistermodenfrei) statt aus dem Pi-Tensor; FD-Kernel je Schritt nach stream_collide (ein Schritt Versatz, deterministisch), Wirkpfad Slot 76 (B70).");
@@ -2750,7 +2905,7 @@ void LBM_Domain::alloc_facetten_domain(const std::vector<Facette>& F, const uint
 		for(ulong q8=0ull;q8<8ull*aktiv;q8++) fac_gd[q8]=0.0f;
 		fac_gd.write_to_device();
 		kernel_sgs_gdiag = Kernel(device, aktiv, "sgs_gdiag", fi, u, flags.k(), gd_zellen, (uint)aktiv, fac_gd, t, fx, fy, fz, s_sgs_guo?1u:0u);
-		if(sparse_on) kernel_sgs_gdiag.add_parameters(tile_slot); // Pruefbefund B-7: TS_P haengt an SPARSE_TILES -- ohne dieses Argument stuerbe der erste Launch mit CL_INVALID_KERNEL_ARGS
+		if(sparse_on||zk_on) kernel_sgs_gdiag.add_parameters(tile_slot); // Pruefbefund B-7: TS_P haengt an SPARSE_TILES -- ohne dieses Argument stuerbe der erste Launch mit CL_INVALID_KERNEL_ARGS
 		print_info("g-DIAGNOSE (CFD_SGS_GDIAG): "+to_string(aktiv)+" Wandzellen, "+to_string((ulong)(40ull*aktiv/1048576ull))+" MB -- misst |S|_FD, |S|_Pi, D_WALE, D_Sigma, |Omega| je Zelle; Physik unangetastet.");
 	}
 	facetten_bound = true;
@@ -2815,6 +2970,7 @@ void LBM_Domain::finalize_sparse_tiles() {
 }
 
 void LBM_Domain::enqueue_initialize() { // call kernel_initialize
+	if(zk_on&&zk_S==0ull) print_error("ZK: initialize ohne zk_finalisieren -- fi ist der Platzhalter, die Tabelle traegt S = N (Pruefbefund N-7)."); // ★ 06.10.2026
 	kernel_initialize.enqueue_run();
 	if(nachbar_on&&fac_N>0ull) kernel_fac_nachbar.enqueue_run(); // ★ 16.09. (Pruefagent NIEDRIG): fac_apg_ab NICHT im Init -- fac_nb[2..4] ist 0-initialisiert (= kein Gradient, Aequilibrium-Start), und ein Init-Launch bei t=1 zaehlte [306] am Zaehltakt 1 ohne Facettenbesuch
 }
@@ -2875,12 +3031,43 @@ void LBM_Domain::enqueue_stream_collide() { // call kernel_stream_collide to per
 void LBM_Domain::enqueue_boden_eq() { // ★ V1-Port: post-stream Boden-Equilibrium (Staggered-Mode-Kur); No-Op bei n==0
 	if(boden_eq_n==0u) return;
 	if(!(boden_eq_u>=0.0f)) print_error("BODEN_EQ ist aktiv (n = "+to_string(boden_eq_n)+"), aber boden_eq_u traegt noch den Sentinel "+to_string(boden_eq_u,4u)+" -- das Setup hat LBM_Domain::s_boden_eq_u nicht auf sein u_lat gesetzt. Die mitbewegte Fahrbahn liefe mit einer anderen Geschwindigkeit als die Stroemung (Pruefbefund B7, 12.09.2026).");
-	kernel_boden_eq.set_parameters(2u, t, boden_eq_u, boden_eq_n, boden_eq_down, boden_eq_split, boden_eq_abstand).enqueue_run();
+	if(t%zaehl_takt()==0ull) boden_eq_stichproben++; // ★ 06.10.2026 M2: dieselbe Stichprobe wie das Kernel-Gatter t%def_zaehl_takt==0 (Slots 20/117)
+	kernel_boden_eq.set_parameters(2u, t, boden_eq_u, boden_eq_n, boden_eq_down, boden_eq_split, boden_eq_abstand);
+	if(!rand_dispatch_on) kernel_boden_eq.enqueue_run();
+	else if(rd_boden_anz>0ull) kernel_boden_eq.enqueue_run_bereich(rd_boden_a, rd_boden_anz); // ★ 06.10.2026 F1: nur die z-Lagen des Bandes (Bereich in allocate); anz 0 = keine Zelle z >= 1, der Volllauf haette nichts getan
 }
 void LBM_Domain::enqueue_einlass_eq() { // ★ V1-Port apply_inlet_velocity: post-stream Einlass-Equilibrium x=1..nx; No-Op bei n==0
 	if(einlass_eq_n==0u) return;
 	if(!(einlass_eq_u>=0.0f)) print_error("EINLASS_EQ ist aktiv (n = "+to_string(einlass_eq_n)+"), aber einlass_eq_u traegt noch den Sentinel "+to_string(einlass_eq_u,4u)+" -- das Setup hat LBM_Domain::s_einlass_eq_u nicht auf sein u_lat gesetzt (Pruefbefund B7, 12.09.2026).");
 	kernel_einlass_eq.set_parameters(2u, t, einlass_eq_u, einlass_eq_n).enqueue_run();
+}
+// ★ 06.10.2026 Pruefbefund M2: Ist=Soll-Abnahme des boden_eq-Startbereichs IM Binary, in Modus 0 und 1 gleich. Der Kernel steigt in dieser
+// Reihenfolge aus: n/Halo -> z-Test (z in [1, nz_eff(x)]) -> bo in {S,E} -> ABSTAND (Slot 117) -> Wirkpfad (Slot 20). Jede Bandzelle mit
+// bo nicht in {S,E} zaehlt je Stichprobe also GENAU EINMAL in 20 oder 117. Soll = diese Zellen (Hostzaehlung aus dem Byte-Hostfeld; initialize
+// aendert S/E nicht, nur TYPE_MS an Fluidzellen, und MS ist weder S noch E) x Stichproben (t%zaehl_takt==0, in enqueue_boden_eq gezaehlt).
+// Beide Slots WICKELN (atomic_inc ohne Saettigung) -> Vergleich mod 2^32. Der Aufrufer liest rho_clamp_hits VORHER vom Geraet; diese Funktion
+// liest nichts vom Geraet (kein Geraete-Read als letzte Aktion vor exit, Lehre bcs-Reset 06.10. 13:00).
+void LBM_Domain::boden_eq_abnahme(const string& wo) {
+	if(boden_eq_n==0u) return;
+	if(sparse_on) { print_warning("BODEN_EQ-Abnahme "+wo+": Block-Tiling aktiv -- tote Tiles sind im Hostfeld nicht abgebildet, Abnahme uebersprungen."); return; }
+	const uchar* fl = flags.data();
+	const ulong NxNy = (ulong)Nx*(ulong)Ny;
+	const uint zmax = min(max(boden_eq_n, boden_eq_down), Nz>0u ? Nz-1u : 0u);
+	ulong zellen = 0ull;
+	for(uint z=1u; z<=zmax; z++) for(uint y=0u; y<Ny; y++) for(uint x=0u; x<Nx; x++) {
+		const uint nz_eff = x>=boden_eq_split ? boden_eq_down : boden_eq_n;
+		if(nz_eff==0u||z>nz_eff) continue;
+		if((Dx>1u&&(x==0u||x>=Nx-1u))||(Dy>1u&&(y==0u||y>=Ny-1u))||(Dz>1u&&(z==0u||z>=Nz-1u))) continue; // is_halo
+		const uchar bo = fl[(ulong)x+(ulong)y*(ulong)Nx+(ulong)z*NxNy]&(TYPE_S|TYPE_E); // Host-Maske fuer TYPE_BO (device-seitig 0x03; TYPE_MS = 0x03 ist weder S noch E und wird wie im Kernel behandelt)
+		if(bo==TYPE_S||bo==TYPE_E) continue;
+		zellen++;
+	}
+	const ulong soll = zellen*boden_eq_stichproben;
+	const ulong ist = (ulong)rho_clamp_hits[20]+(ulong)rho_clamp_hits[117];
+	const bool ok = (soll&0xFFFFFFFFull)==(ist&0xFFFFFFFFull);
+	println("BODEN_EQ IST-SOLL "+wo+" modus="+string(rand_dispatch_on?"1":"0")+" haken="+string(rand_dispatch_haken_on?"1":"0")+" bandzellen="+to_string(zellen)+" stichproben="+to_string(boden_eq_stichproben)
+		+" soll="+to_string(soll)+" ist="+to_string(ist)+" slot20="+to_string((ulong)rho_clamp_hits[20])+" slot117="+to_string((ulong)rho_clamp_hits[117])+" ok="+string(ok?"1":"0")); // eine ungebrochene Zeile fuer grep; ok vergleicht mod 2^32
+	if(!ok) print_error("BODEN_EQ-Abnahme "+wo+" verletzt: Ist "+to_string(ist)+" != Soll "+to_string(soll)+" (mod 2^32) -- boden_eq hat nicht genau die Bandzellen behandelt"+string(rand_dispatch_on ? " (CFD_RAND_DISPATCH=1: Startbereich pruefen)" : "")+".");
 }
 void LBM_Domain::sgs_gdiag_gpu() { // ★ g-Diagnose: ein Mess-Launch ueber die Wandzellenliste (31.08.)
 	if(!gdiag_on) return;
@@ -2998,7 +3185,7 @@ void LBM_Domain::bind_kraft_facetten(const std::vector<ulong>& liste, const ucha
 			kp1_u = Memory<uint>(device, 12ull*(ulong)kp1_groups);
 		}
 		kernel_kraft_p1 = Kernel(device, (ulong)kp1_groups*(ulong)WORKGROUP_SIZE, "kraft_p1_gpu", fi, flags.k(), f_maske, liste_m, (uint)liste_n, (ulong)0ull, 0u, kp1_f, kp1_u); // fi 0, flags 1, f_maske 2, kf_liste 3, kf_N 4, tt 5, haken 6, kp1_f 7, kp1_u 8, tile_slot 9
-		if(sparse_on) kernel_kraft_p1.add_parameters(tile_slot); // TS_P haengt NUR an SPARSE_TILES (Werkzeugfalle 8)
+		if(sparse_on||zk_on) kernel_kraft_p1.add_parameters(tile_slot); // TS_P haengt NUR an SPARSE_TILES (Werkzeugfalle 8)
 		kp1_bound = true;
 	}
 }
@@ -3144,6 +3331,7 @@ void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, con
 	// ★ 05.10.2026 Korrektur C-M2: unter U_RAND schreibt voxelize_mesh u nur an gespeicherte Zellen (vor alloc_u_rand an KEINE), und
 	// update_moving_boundaries laese ungespeicherte Solids aus dem Papierkorb -- eine bewegte Wand verloere ihre Geschwindigkeit still
 	// (kein TYPE_MS, keine Mitbewegung, kein Zaehler). Bis der Zensus bewegte Solids kennt: harte Sperre.
+	if(zk_on&&(length(linear_velocity)>0.0f||length(rotational_velocity)>0.0f)) print_error("ZK x bewegte Voxelisierung (set_u): nicht gebaut -- voxelize_mesh schreibt unter ZK keine DDFs (fi kann Platzhalter sein), wie unter SPARSE_TILES."); // ★ 06.10.2026 ZKS Z4
 	if(u_rand_on&&(length(linear_velocity)>0.0f||length(rotational_velocity)>0.0f)) print_error("U_RAND x bewegte Voxelisierung (linear/rotational_velocity != 0): nicht gebaut -- die Wandgeschwindigkeit ginge im kompakten u-Puffer still verloren. CFD_U_RAND=0 fahren (Pruefbefund C-M2).");
 	Memory<float3> p0(device, mesh->triangle_number, 1u, mesh->p0);
 	Memory<float3> p1(device, mesh->triangle_number, 1u, mesh->p1);
@@ -3191,7 +3379,7 @@ void LBM_Domain::voxelize_mesh_on_device(const Mesh* mesh, const uchar flag, con
 #ifdef SURFACE
 	kernel_voxelize_mesh.add_parameters(mass, massex);
 #endif // SURFACE
-	if(sparse_on) kernel_voxelize_mesh.add_parameters(tile_slot); // TS_P haengt tile_slot hinten an
+	if(sparse_on||zk_on) kernel_voxelize_mesh.add_parameters(tile_slot); // TS_P haengt tile_slot hinten an
 	p0.write_to_device();
 	p1.write_to_device();
 	p2.write_to_device();
@@ -3508,6 +3696,7 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	+((s_facetten&&s_fac_imem&&s_fac_apg!=0.0f&&s_fac_apg_haken==3u) ? (string)"\n	#define FACETTEN_APG_HAKEN3" : (string)"") // ★ 16.09. Testhaken 3 (Pruefagent MITTEL-1): analytisches rho = 1 + x/1024 im Vorkernel, gz := kx -- Host prueft gx exakt
 	+((s_facetten&&s_fac_imem&&s_fac_kdiag>0u) ? (string)"\n	#define FACETTEN_KDIAG" : (string)"") // ★ 30.08. Klassen-Diagnostik
 	+((s_rho_takt>0u&&s_smbox[3]>0u) ? (string)"\n	#define RHO_SMBOX" : (string)"") // ★ TODO 2: im Fernfeld deckt die rho-Maske auch die Entnahmeebenen ab
+	+(zk_on ? (string)"\n	#define ZK"+"\n	#define def_ZK_NXP "+to_string(zk_nxp)+"u"+"\n	#define def_ZK_G "+to_string(zk_nxp/(uint)WORKGROUP_SIZE)+"u"+(zk_haken==5u ? "\n	#define ZK_HAKEN_SG" : "")+(device_info.uses_ram ? "\n	#define ZK_S2_KOPF" : "")+"\n	#define ZK_NBPAD" : (string)"") // ★ 06.10.2026 ZKS (CFD_ZK): Pad-Dispatch-Zeilenlaenge und Gruppen je Zeile + Nachbarn aus der Zeile (M-Z Arm 11); ohne das Define ist der Geraetecode zeichengleich
 	+(zellbasen_on ? (string)"\n	#define ZELLBASEN" : (string)"") // ★ 05.10.2026 ZELLBASEN (CFD_ZELLBASEN, Vorgabe 1): stream_collide mit Byte-Zellbasen; ohne das Define ist der Geraetecode zeichengleich zu vorher
 	+(flags4_on ? (string)"\n	#define FLAGS4" : (string)"") // ★ 05.10.2026 FLAGS4: fl()/st_fl() lesen/schreiben 4 Bit je Zelle; ohne das Define Byte wie bisher
 	+((s_u_rand>0u) ? u_rand_defines() : (string)"") // ★ 04.10.2026 U_RAND: Kopfbelegung (ur_k) und Init-Regel (★ C-N8: hier stand "+ Zaehlschritt fuer C" -- Segment C entfallen); ohne das Define ist der Geraetecode zeichengleich
@@ -3711,6 +3900,10 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 		"\n	#define TS_P , const global uint* tile_slot"
 		"\n	#define TS_A , tile_slot"
 		"\n	#define index_f(n, i) index_f_impl((n), (i), tile_slot)"
+	) : zk_on ? (string)( // ★ 06.10.2026 ZKS Z4: kalter Index ueber die Zeilentabelle (kernel.cpp zk_index_f), Signaturen wie SPARSE_TILES
+		"\n	#define TS_P , const global uint* tile_slot"
+		"\n	#define TS_A , tile_slot"
+		"\n	#define index_f(n, i) zk_index_f((n), (i), tile_slot)"
 	) : (string)(
 		"\n	#define TS_P"
 		"\n	#define TS_A"
@@ -4175,6 +4368,38 @@ void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, con
 #ifdef FORCE_FIELD
 	bytes_bekannt += 1024ull*(19ull+12ull)*4ull; // ★ 04.10.2026 KRAFT-P1: kp1_f + kp1_u, feste 1024 Gruppen = 0,12 MB (Spaetpuffer, entsteht am ersten Kraftsample)
 #endif // FORCE_FIELD
+	// ★ 06.10.2026 ZKS Z3 (V3, PLAN-ZKS-VOLLBAU-2026-10-06.md Z3/K4): VORPRUEFUNG ZWEISTUFIG.
+	// (a) ZK-Zeilentabelle buchen (16 uint Kopf + 16 uint je Zeile; lbm.cpp allocate, zk_on).
+	// (b) Stufe 1 (hier) prueft nur, was VOR der Voxelierung feststeht. Der U_RAND-Puffer ist hier nur als Obergrenze bekannt (ur_vorpruef_bytes,
+	//     bei 4 mm +431 MiB zu viel); er wird VERTAGT auf Stufe 2 = alloc_u_rand, die gegen den GEMESSENEN Frei-Wert (Mindestluft 1024 MiB) prueft,
+	//     bevor sie anlegt. Vertagt wird NUR, wenn der Frei-Wert hier messbar ist -- sonst traegt Stufe 2 nicht (sie ueberspringt ohne Messung).
+	// (c) Desktop als MESSWERT: ist der Frei-Wert messbar (Selbstabfrage vor dem Bau, vram_frei_gemessen), gilt hart
+	//     bekannt_ohne_vertagt + 320 MB Spaetpuffer + 1024 MB Mindestluft <= gemessen frei; die alte Pauschale (2496 = 320 + 1152 Desktop + 1024)
+	//     bleibt fuer den Fall ohne Messung und wenn CFD_VRAM_RESERVE_MB ausdruecklich gesetzt ist.
+	if(LBM_Domain::s_zk>0u&&Dx*Dy*Dz==1u) {
+		const ulong tab_b = (16ull+16ull*(ulong)local_Ny*(ulong)local_Nz)*4ull;
+		bytes_bekannt += tab_b;
+		println("ZK VORPRUEFUNG Zeilentabelle "+to_string((float)((double)tab_b/1048576.0), 2u)+" MiB gebucht (fi: bei messbarem Frei-Wert vertagt auf zk_finalisieren, sonst dicht gebucht)");
+	}
+	ulong frei_v1 = 0ull; // gemessener Frei-Wert der (einzigen) VRAM-Karte dieses Gitters, 0 = nicht messbar
+	{	bool hat_vram = false; ulong kap_min = 0ull;
+		for(Device_Info di : device_infos) if(!di.uses_ram) { kap_min = hat_vram ? std::min(kap_min, (ulong)di.memory) : (ulong)di.memory; hat_vram = true; }
+		if(hat_vram&&Dx*Dy*Dz==1u) frei_v1 = vram_frei_gemessen(kap_min, 1u);
+	}
+	ulong bytes_vertagt = 0ull;
+	if(LBM_Domain::s_u_rand>0u&&Dx*Dy*Dz==1u&&frei_v1>0ull) bytes_vertagt = ur_vorpruef_bytes(Nx, Ny, Nz, LBM_Domain::s_u_rand);
+	ulong fi_vertagt = 0ull; // ★ 06.10.2026 ZKS Z4 (Pruefbefund M4): unter ZK steht fi erst nach der Voxelierung fest -> Stufe 2 in zk_finalisieren (gemessen)
+	if(LBM_Domain::s_zk>0u&&Dx*Dy*Dz==1u&&frei_v1>0ull) fi_vertagt = N_dom*(ulong)velocity_set*(ulong)sizeof(fpxx);
+	bytes_vertagt += fi_vertagt;
+	const ulong mib_hart = (bytes_bekannt-bytes_vertagt+1048575ull)/1048576ull;
+	const bool reserve_gesetzt = getenv("CFD_VRAM_RESERVE_MB")!=nullptr;
+	if(frei_v1>0ull) {
+		const ulong spaet = vram_spaet_mib, luft = vram_luft_mib;
+		const bool passt = mib_hart+spaet+luft<=frei_v1;
+		println("VRAM VORPRUEFUNG STUFE 1 gemessen frei "+to_string(frei_v1)+" MiB ("+string(vram_quelle())+"), hart gebucht "+to_string(mib_hart)+" MiB + Spaetpuffer "+to_string(spaet)+" + Mindestluft "+to_string(luft)+(bytes_vertagt>0ull ? ", vertagt "+to_string((ulong)(bytes_vertagt/1048576ull))+" MiB (U_RAND-Obergrenze auf alloc_u_rand"+(fi_vertagt>0ull ? string(", fi dicht "+to_string((ulong)(fi_vertagt/1048576ull))+" MiB auf zk_finalisieren") : string(""))+", Stufe 2 gemessen)" : string(""))+", Schlupf "+(passt ? to_string(frei_v1-mib_hart-spaet-luft)+" MiB" : string("NEGATIV"))+(reserve_gesetzt ? " (CFD_VRAM_RESERVE_MB gesetzt: zusaetzlich die Pauschale)" : ""));
+		if(!passt) print_error("VRAM VORPRUEFUNG STUFE 1: "+to_string(mib_hart)+" MiB fest + 1344 MiB Spaetpuffer/Mindestluft > gemessen frei "+to_string(frei_v1)+" MiB -- Gitter kleiner waehlen (Lauf nicht gebaut).");
+	}
+	if(frei_v1>0ull&&!reserve_gesetzt) bytes_bekannt -= bytes_vertagt; // Messung traegt: die Pauschale unten prueft nur noch den festen Teil (Desktop steckt im Messwert)
 	uint memory_required = (uint)(bytes_bekannt/1048576ull); // in MB
 	// D1: RESERVE. ★ Pruefagent A-1: die Pruefung sieht `device_info.memory`, also den
 	// GESAMTspeicher -- `memory_used` wird hier nicht abgezogen (und Device_Info ist eine Kopie,
@@ -4192,7 +4417,7 @@ void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, con
 	// sonst einen Deckel, der mit dem Hostbedarf kollidiert.
 	bool nur_ram = true;
 	for(Device_Info di : device_infos) nur_ram = nur_ram && di.uses_ram;
-	const uint reserve = nur_ram ? 0u : (uint)env_u("CFD_VRAM_RESERVE_MB", 2496u);
+	const uint reserve = nur_ram ? 0u : (frei_v1>0ull&&!reserve_gesetzt ? 1344u : (uint)env_u("CFD_VRAM_RESERVE_MB", 2496u)); // ★ 06.10.2026 Z3: mit Messung 320 + 1024 (Desktop steckt in frei_v1, Stufe 1 oben); ohne Messung die alte Pauschale
 	// D2: Speicherplan drucken. Kostet nichts und macht jeden kuenftigen Lauf nachrechenbar --
 	// genau das fehlte, als die alte Pruefung ein passendes Gitter ablehnte.
 	print_info("SPEICHERPLAN je Domaene: bekannt "+to_string(memory_required)+" MB"
@@ -4519,8 +4744,262 @@ void LBM::update_fields() { // update fields (rho, u, T) manually
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
 }
 
+// ★ 06.10.2026 ZKS Z1 (PLAN-ZKS-VOLLBAU-2026-10-06.md §6, PLAN-ZEILENKOMPAKT-2026-10-05.md §2.2): Lochzensus auf den Host-Flags nach der
+// Voxelierung. Lochkandidat = Zelle, deren GANZE Chebyshev-2-Umgebung (periodisch wie neighbors()) reines Solid ist ((flags&TYPE_BO)==TYPE_S;
+// TYPE_MS = S|E zaehlt NICHT als Solid). Je Zeile r = y+Ny*z die laengste Kandidatenstrecke nach der Ausrichtung auf W = 16 (Anfang auf-,
+// Ende abgerundet; bei Gleichstand die erste). Daraus das exklusive Praefix P[r] und N' = N - Summe L. In Z1 bleibt das Geraet dicht: die
+// Zahlen werden nur gerechnet, geprueft und gedruckt. Selbsttests (alle Soll 0, sonst print_error VOR dem Lauf):
+//  (1) Monotonie/Bijektion: c(n) = n - P[r] - (x >= E ? L : 0) laeuft ueber alle Nicht-Loch-Zellen lueckenlos 0, 1, ..., N'-1;
+//  (2) jede Lochzelle ist Kandidat und liegt in [A, E) mit A, E Vielfache von W;
+//  (3) kein Loch beruehrt x = 0 oder x = Nx-1 (Umlauf-Schluss des Lochterms im Kernel);
+//  (4) unabhaengige Gegenprobe der Erosion: fuer jede Lochzelle die 5x5x5-Umgebung direkt (periodisch) -- nur reines Solid.
+// Testhaken CFD_ZK_HAKEN=4 (nur Host): Praefix einer Zeile mit Loch um 1 erhoeht -> (1) muss reissen.
+void LBM_Domain::zk_zensus() {
+	const ulong Nx = get_Nx(), Ny = get_Ny(), Nz = get_Nz(), N = get_N(), NR = Ny*Nz, W = (ulong)zk_w;
+	const uchar* fl = flags.data();
+	vector<uchar> D(N), T(N);
+	parallel_for(N, [&](ulong n) { D[n] = (uchar)((fl[n]&(TYPE_S|TYPE_E))==TYPE_S); }); // (TYPE_S|TYPE_E) = TYPE_BO des Geraetecodes
+	const ulong st[3] = { 1ull, Nx, Nx*Ny }, ln[3] = { Nx, Ny, Nz };
+	for(uint a=0u; a<3u; a++) { // separable Erosion mit Radius 2, periodisch
+		parallel_for(N, [&](ulong n) {
+			const ulong k = (n/st[a])%ln[a], b = n-k*st[a];
+			uchar alle = 1u;
+			for(long d=-2l; d<=2l&&alle; d++) alle = D[b+(ulong)(((long)k+d+2l*(long)ln[a])%(long)ln[a])*st[a]];
+			T[n] = alle;
+		});
+		D.swap(T);
+	}
+	if(zk_haken==3u) { // ★ Pruefbefund N1, Testhaken 3 (Umgebung): Kandidatenmaske einer Lochzeile um 32 Zellen hinter ein Streckenende verlaengert -- die
+		// Strecke folgt der Maske (Selbsttest 2 bleibt still), die direkte 5x5x5-Gegenprobe (4) muss reissen
+		for(ulong r=NR/2ull; r<NR; r++) {
+			ulong x = Nx;
+			for(ulong q=0ull; q+1ull<Nx; q++) if(D[r*Nx+q]&&!D[r*Nx+q+1ull]) { x = q+1ull; break; }
+			if(x+32ull<Nx) {
+				for(ulong q=x; q<x+32ull; q++) D[r*Nx+q] = 1u;
+				println("ZK TESTHAKEN 3: Zeile "+to_string(r)+" Kandidaten ab x = "+to_string(x)+" um 32 verlaengert (Soll: Selbsttest Umgebung > 0)");
+				break;
+			}
+		}
+	}
+	vector<uint> zA(NR, 0u), zL(NR, 0u);
+	parallel_for(NR, [&](ulong r) {
+		const ulong b = r*Nx;
+		ulong x = 0ull, bestA = 0ull, bestL = 0ull;
+		while(x<Nx) {
+			if(!D[b+x]) { x++; continue; }
+			const ulong a = x;
+			while(x<Nx&&D[b+x]) x++;
+			const ulong A = (a+W-1ull)/W*W, E = x/W*W;
+			const ulong L = E>A ? E-A : 0ull;
+			if(L>bestL) { bestL = L; bestA = A; }
+		}
+		zA[r] = (uint)bestA; zL[r] = (uint)bestL;
+	});
+	vector<ulong> P(NR+1ull, 0ull);
+	ulong zeilen = 0ull;
+	for(ulong r=0ull; r<NR; r++) { P[r+1ull] = P[r]+(ulong)zL[r]; if(zL[r]>0u) zeilen++; }
+	const ulong loecher = P[NR];
+	if(zk_haken==1u||zk_haken==2u) { // ★ Pruefbefund N1, Testhaken 1 (Kandidat: Loch einer Zeile um W ueber das Kandidatenende verlaengert) / 2 (Rand: Loch bis x = 0)
+		for(ulong r=NR/2ull; r<NR; r++) if(zL[r]>0u&&(ulong)zA[r]+(ulong)zL[r]+W<Nx) {
+			if(zk_haken==1u) zL[r] += (uint)W;
+			else { zL[r] += zA[r]; zA[r] = 0u; }
+			println("ZK TESTHAKEN "+to_string(zk_haken)+": Zeile "+to_string(r)+" Loch jetzt ["+to_string(zA[r])+", "+to_string(zA[r]+zL[r])+") (Soll: Selbsttest "+string(zk_haken==1u ? "Kandidat" : "Rand")+" > 0)");
+			break;
+		}
+		for(ulong r=0ull; r<NR; r++) P[r+1ull] = P[r]+(ulong)zL[r];
+	}
+	if(zk_haken==4u) { // Testhaken 4: Praefix einer Lochzeile + 1 -> Monotonie muss reissen
+		for(ulong r=NR/2ull; r<NR; r++) if(zL[r]>0u) { P[r]++; println("ZK TESTHAKEN 4: Praefix der Zeile "+to_string(r)+" um 1 erhoeht (Soll: Selbsttest Monotonie > 0)"); break; }
+	}
+	// (1) Monotonie/Bijektion -- sequentiell ueber alle Zellen
+	ulong f_mono = 0ull, f_kand = 0ull, f_rand = 0ull, k = 0ull;
+	for(ulong r=0ull; r<NR; r++) {
+		const ulong A = zA[r], L = zL[r], E = A+L, b = r*Nx;
+		if(L>0ull&&(A%W!=0ull||E%W!=0ull)) f_kand++;
+		if(L>0ull&&(A==0ull||E>=Nx)) f_rand++; // (3) Loch an x = 0 oder bis x = Nx-1
+		for(ulong x=0ull; x<Nx; x++) {
+			const bool loch = L>0ull&&x>=A&&x<E;
+			if(loch) { if(!D[b+x]) f_kand++; continue; } // (2)
+			const ulong c = b+x-P[r]-(x>=E ? L : 0ull);
+			if(c!=k) f_mono++;
+			k++;
+		}
+	}
+	if(k!=N-P[NR]) f_mono++;
+	// (4) direkte Gegenprobe der Umgebung jeder Lochzelle
+	std::atomic<ulong> f_umg(0ull);
+	parallel_for(NR, [&](ulong r) {
+		const ulong L = zL[r]; if(L==0ull) return;
+		const ulong y = r%Ny, z = r/Ny, A = zA[r];
+		ulong f = 0ull;
+		for(ulong x=A; x<A+L; x++) {
+			for(long dz=-2l; dz<=2l; dz++) for(long dy=-2l; dy<=2l; dy++) for(long dx=-2l; dx<=2l; dx++) {
+				const ulong xx = (ulong)(((long)x+dx+2l*(long)Nx)%(long)Nx), yy = (ulong)(((long)y+dy+2l*(long)Ny)%(long)Ny), zz = (ulong)(((long)z+dz+2l*(long)Nz)%(long)Nz);
+				if((fl[xx+(yy+zz*Ny)*Nx]&(TYPE_S|TYPE_E))!=TYPE_S) f++;
+			}
+		}
+		if(f>0ull) f_umg += f;
+	});
+	zk_loecher = loecher; zk_zeilen_loch = zeilen; zk_n_strich = N-loecher;
+	zk_A.swap(zA); zk_L.swap(zL); zk_P.swap(P); // ★ Z4: fuer zk_finalisieren (Haken 1/2/4 bleiben hier wirksam, die Selbsttests haben ihre Werte gesehen)
+	const double MiB = 1048576.0, fz = (double)velocity_set*(double)sizeof(fpxx);
+	println("ZK-ZENSUS Nahfeld Gitter "+to_string(Nx)+"x"+to_string(Ny)+"x"+to_string(Nz)+" W "+to_string(W)+" Zeilen "+to_string(NR)+" mit_Loch "+to_string(zeilen)+" Loecher "+to_string(loecher)+" N' "+to_string(N-loecher)+" fi_dicht_MiB "+to_string((double)N*fz/MiB, 1u)+" fi_kompakt_MiB "+to_string((double)(N-loecher)*fz/MiB, 1u)+" frei_MiB "+to_string((double)loecher*fz/MiB, 1u)+" Tabelle_MiB "+to_string((double)(16ull+16ull*NR)*4.0/MiB, 2u)+" Pad "+to_string(Nx)+"->"+to_string(zk_nxp)+" | Selbsttests Monotonie "+to_string(f_mono)+" Kandidat "+to_string(f_kand)+" Rand "+to_string(f_rand)+" Umgebung "+to_string(f_umg.load())+" (Soll 0/0/0/0) | Geraet Z1 dicht");
+	if(f_mono+f_kand+f_rand+f_umg.load()>0ull) print_error("ZK-ZENSUS: Selbsttest verletzt (Monotonie "+to_string(f_mono)+", Kandidat "+to_string(f_kand)+", Rand "+to_string(f_rand)+", Umgebung "+to_string(f_umg.load())+") -- Lauf nicht gestartet.");
+}
+
+// ★ 06.10.2026 ZKS Z4 (PLAN-ZKS-VOLLBAU §6 Z4, Pruefbefund M4): echte Loecher. Nach zk_zensus: (1) Zeilentabelle aus dem Zensus fuellen
+// ([16+16r+k] = r'_k*Nx - P[r'_k], [16+16r+8+k] = E_k | L_k<<16, k = (dy,dz) (0,0) (+1,0) (0,+1) (+1,+1) (-1,0) (0,-1) (+1,-1) periodisch),
+// Kopf S = N'+1 auf 64 gerundet, PK = N', Magic "ZKS1"; Gegenlese. (2) VORPRUEFUNG STUFE 2 gegen den gemessenen Frei-Wert: fi kompakt
+// + U_RAND-Obergrenze (u entsteht spaeter) + Spaetpuffer + Mindestluft. (3) fi = Memory(S, 19) (Move-Assign gibt nur den Platzhalter frei,
+// NEO-Defekt beim Freigeben grosser Puffer) und SOFORT alle fi-Kernel neu binden (Liste wie finalize_sparse_tiles), zk_s2 setzen.
+// Abnahme: Belegung nach fi = Belegung davor + Vorhersage (memory_used, MB je Puffer abgeschnitten wie im Allokator).
+// ★ 06.10.2026 ZKS Pruefbefund M-1: Spaetpuffer aus bekannten Groessen statt des 4-mm-Handwerts 320 MiB. Exakt gezaehlt aus den Host-Flags in der
+// F-Box: Wandsolids (reines Solid mit Nicht-Solid-Nachbar, D3Q19) und Facettenkandidaten (Nicht-Solid mit Solid-Nachbar). Bytes je Posten wie
+// in der Konstruktor-Vorpruefung (Facette 60 B + ELIBB 18 + FDWAND 8 + NACHBAR 8/20 (+REK) + SISM 24 + KDIAG 64; Band je Lage; F-Liste 16 B je
+// Wandsolid + Maske), dazu Kopplungsebenen (groesste Nahfeld-Ebene x 39 B), Schale (Randflaechen x 16 B, Obergrenze), kf_liste/kfb_liste
+// (2 x 4 B je Wandsolid), kp1 (1024 Gruppen x 31 x 4 B). mit_facetten = false nach alloc_facetten/alloc_sgs_band (alloc_u_rand).
+ulong LBM_Domain::zk_spaet_bytes(const bool mit_facetten) const {
+	const ulong Nx = get_Nx(), Ny = get_Ny(), Nz = get_Nz();
+	const uchar* fl = flags.data();
+	std::atomic<ulong> wand(0ull), fac(0ull);
+	const ulong FN = (ulong)fbnx*(ulong)fbny*(ulong)fbnz;
+	parallel_for((ulong)fbny*(ulong)fbnz, [&](ulong q) {
+		const ulong yy = (ulong)fby0+q%(ulong)fbny, zz = (ulong)fbz0+q/(ulong)fbny;
+		ulong w_ = 0ull, f_ = 0ull;
+		for(ulong xx=(ulong)fbx0; xx<(ulong)fbx0+(ulong)fbnx; xx++) {
+			const bool s0 = (fl[xx+(yy+zz*Ny)*Nx]&(TYPE_S|TYPE_E))==TYPE_S;
+			bool anders = false;
+			for(int dz=-1; dz<=1&&!anders; dz++) for(int dy=-1; dy<=1&&!anders; dy++) for(int dx=-1; dx<=1&&!anders; dx++) {
+				if(dx*dx+dy*dy+dz*dz!=1&&dx*dx+dy*dy+dz*dz!=2) continue; // D3Q19-Nachbarn
+				const ulong x2 = (xx+Nx+(ulong)(long)dx)%Nx, y2 = (yy+Ny+(ulong)(long)dy)%Ny, z2 = (zz+Nz+(ulong)(long)dz)%Nz;
+				anders = (((fl[x2+(y2+z2*Ny)*Nx]&(TYPE_S|TYPE_E))==TYPE_S)!=s0);
+			}
+			if(anders) { if(s0) w_++; else f_++; }
+		}
+		wand += w_; fac += f_;
+	});
+	ulong b = 0ull;
+	if(mit_facetten) {
+		if(facetten_on) {
+			ulong b_fac = 60ull;
+			if(fac_elibb_on) b_fac += 18ull;
+			if(fdwand_on) b_fac += 8ull;
+			if(nachbar_on) b_fac += (apg_on ? 20ull : 8ull)+((fac_rek_on||fac_rekpi_on) ? 4ull*nb_rek_floats : 0ull)+(fac_rekpi_on ? 4ull*nb_rekpi_floats : 0ull);
+			if(sism_on) b_fac += 24ull;
+			if(fac_kdiag_on) b_fac += 64ull;
+			b += fac.load()*b_fac+8ull*((FN+31ull)/32ull);
+			if(band_on) b += 8ull*((FN+31ull)/32ull)+fac.load()*(ulong)(band_lagen>1u ? band_lagen-1u : 1u)*(sism_on ? 32ull : 8ull); // ★ Pruefbefund N-a: Instanz band_lagen, nicht die vor dem Fernfeld genullte Statik s_sgs_band (Werkzeugfalle 21)
+		}
+		b += 16ull*wand.load()+8ull*((FN+31ull)/32ull); // F-Liste (F 12 B + Slotliste 4 B je Wandsolid) und Maske
+	}
+	const ulong ebene = std::max({Nx*Ny, Nx*Nz, Ny*Nz});
+	b += ebene*39ull;                          // Kopplungsebene 16 + slice_flags 1 + rho_rek 16 + rho_rek_wort 2 + rho_aus 4
+	b += 2ull*(Nx*Ny+Nx*Nz+Ny*Nz)*16ull;        // N2F-Schale, Obergrenze ueber die Randflaechen
+	b += 8ull*wand.load()+1024ull*31ull*4ull;  // kf_liste + kfb_liste, kp1
+	println("ZK SPAETPUFFER hergeleitet ("+string(mit_facetten ? "mit" : "ohne")+" Facetten/Band/F-Liste): Wandsolids "+to_string(wand.load())+" Facettenkandidaten "+to_string(fac.load())+" -> "+to_string((double)b/1048576.0, 1u)+" MiB (Handwert bisher "+to_string(vram_spaet_mib)+")");
+	return b;
+}
+void LBM_Domain::zk_pruefen() {
+	if(!zk_on) return;
+	if(zk_S==0ull) print_error("ZK: zk_pruefen ohne zk_finalisieren (Pruefbefund N-7).");
+	finish_queue();
+	kernel_zk_pruef.set_parameters(2u, zk_s2_wert).run();
+	rho_clamp_hits.read_from_device();
+	const ulong h496 = rho_clamp_hits[496], h497 = rho_clamp_hits[497], h498 = rho_clamp_hits[498], h499 = rho_clamp_hits[499];
+	const bool ok = h496==0ull&&h497==0ull&&h498==0ull&&h499==0ull;
+	println("ZK PRUEFKERNEL nach initialize Papierkorb_Leser[496] "+to_string(h496)+" heiss_kalt_Tabelle[497] "+to_string(h497)+" Kopf_Stride[498] "+to_string(h498)+" Halo[499] "+to_string(h499)+" (Soll 0/0/0/0)"+(ok ? " BESTANDEN" : " VERLETZT"));
+	if(!ok) print_error("ZK PRUEFKERNEL verletzt -- Lauf vor der Zeitschleife abgebrochen (siehe Zeile ZK PRUEFKERNEL).");
+}
+void LBM_Domain::zk_finalisieren() {
+	const ulong Nx = get_Nx(), Ny = get_Ny(), Nz = get_Nz(), N = get_N(), NR = Ny*Nz;
+	if(zk_A.size()!=NR||zk_L.size()!=NR||zk_P.size()!=NR+1ull) print_error("ZK: zk_finalisieren ohne Zensus (Zeilenfelder fehlen).");
+	const ulong Ns = N-zk_P[NR];
+	zk_S = ((Ns+1ull+63ull)/64ull)*64ull;
+	if((ulong)sizeof(fpxx)*zk_S>=4294967296ull) print_error("ZK: sizeof(fpxx)*S >= 2^32.");
+	const int zdy[7] = { 0, 1, 0, 1, -1,  0,  1 };
+	const int zdz[7] = { 0, 0, 1, 1,  0, -1, -1 };
+	for(ulong r=0ull; r<NR; r++) {
+		const ulong y = r%Ny, z = r/Ny;
+		for(uint k=0u; k<7u; k++) {
+			const ulong rr = (y+Ny+(ulong)(long)zdy[k])%Ny+Ny*((z+Nz+(ulong)(long)zdz[k])%Nz);
+			tile_slot[16ull+16ull*r+(ulong)k] = (uint)(rr*Nx-zk_P[rr]);
+			tile_slot[16ull+16ull*r+8ull+(ulong)k] = (zk_A[rr]+zk_L[rr])|(zk_L[rr]<<16);
+		}
+		tile_slot[16ull+16ull*r+7ull] = 0u;
+		tile_slot[16ull+16ull*r+15ull] = 0u;
+	}
+	tile_slot[0] = 0x5A4B5331u; // "ZKS1" = GUELTIG
+	tile_slot[1] = (uint)zk_S;
+	tile_slot[2] = (uint)Ns;    // Papierkorb PK = N'
+	tile_slot.write_to_device();
+	{	uint soll[16]; for(uint q=0u; q<16u; q++) soll[q] = tile_slot[q];
+		finish_queue();
+		tile_slot.read_from_device(0ull, 16ull);
+		uint abw = 0u; for(uint q=0u; q<16u; q++) abw += (uint)(tile_slot[q]!=soll[q]);
+		if(abw>0u) print_error("ZK: Kopf-Gegenlese der gefuellten Zeilentabelle weicht in "+to_string(abw)+" von 16 Woertern ab.");
+	}
+	// (2) Vorpruefung Stufe 2
+	const ulong fi_b = zk_S*(ulong)velocity_set*(ulong)sizeof(fpxx);
+	const ulong fi_mib = (fi_b+1048575ull)/1048576ull;
+	const ulong spaet_mib = (zk_spaet_bytes(true)+1048575ull)/1048576ull; // ★ Pruefbefund M-1: hergeleitet statt 320 MiB
+	const ulong ur_mib = u_rand_on ? (ur_vorpruef_bytes((uint)Nx, (uint)Ny, (uint)Nz, ur_modus_soll)+1048575ull)/1048576ull : 0ull;
+	if(!device.info.uses_ram) {
+		const ulong frei = vram_frei_gemessen((ulong)device.info.memory, 2u);
+		const ulong bedarf = fi_mib+ur_mib+spaet_mib+vram_luft_mib;
+		println("VRAM VORPRUEFUNG STUFE 2 (ZK) gemessen frei "+to_string(frei)+" MiB ("+string(vram_quelle())+"), fi kompakt "+to_string(fi_mib)+" MiB (dicht "+to_string((ulong)((N*(ulong)velocity_set*(ulong)sizeof(fpxx)+1048575ull)/1048576ull))+") + U_RAND-Obergrenze "+to_string(ur_mib)+" + Spaetpuffer (hergeleitet) "+to_string(spaet_mib)+" + Mindestluft "+to_string(vram_luft_mib)+" -> "+(frei==0ull ? string("NICHT MESSBAR") : (bedarf<=frei ? "passt, Schlupf "+to_string(frei-bedarf)+" MiB" : string("ABBRUCH"))));
+		if(frei>0ull&&bedarf>frei) print_error("ZK VRAM STUFE 2: "+to_string(bedarf)+" MiB Bedarf > gemessen frei "+to_string(frei)+" MiB -- Gitter kleiner waehlen (fi nicht angelegt).");
+		if(frei==0ull) print_warning("ZK VRAM STUFE 2: freier VRAM nicht messbar -- fi kompakt ungeprueft angelegt (Stufe 1 hat fi vertagt).");
+	}
+	// (3) fi kompakt
+	const uint belegt_vor = device.info.memory_used;
+	const ulong frei_vor_fi = device.info.uses_ram ? 0ull : vram_frei_gemessen((ulong)device.info.memory);
+	fi = Memory<fpxx>(device, zk_S, velocity_set, false); // Move-Assign gibt nur den Platzhalter frei
+	const uint belegt_nach = device.info.memory_used;
+	{ // ★ 06.10.2026 Pruefbefund M-1: fi SOFORT resident machen. Der Treiber zaehlt einen Puffer in drm-total-vram0 erst ab dem ersten Zugriff --
+	  // ohne das sahen alle gemessenen Frei-Werte bis run(0) das kompakte fi nicht (8 mm 2,8 GB, 3,5 mm ~25 GiB zu optimistisch).
+		const fpxx null_ = (fpxx)0;
+		const cl_int e_ = clEnqueueFillBuffer(device.get_cl_queue()(), fi.get_cl_buffer()(), &null_, sizeof(fpxx), 0, (size_t)fi.capacity(), 0, nullptr, nullptr);
+		if(e_!=CL_SUCCESS) print_error("ZK: clEnqueueFillBuffer auf fi kompakt scheiterte (Fehler "+to_string(e_)+").");
+		finish_queue();
+		if(!device.info.uses_ram) {
+			const ulong frei_nach_fi = vram_frei_gemessen((ulong)device.info.memory);
+			const long diff_ = (long)frei_vor_fi-(long)frei_nach_fi;
+			println("ZK FI RESIDENT gemessen frei vor fi "+to_string(frei_vor_fi)+" MiB, nach fi (gefuellt) "+to_string(frei_nach_fi)+" MiB, Differenz "+to_string(diff_)+" MiB, fi "+to_string((double)fi_b/1048576.0, 1u)+" MiB -> "+(frei_vor_fi>0ull&&frei_nach_fi>0ull&&std::abs((double)diff_-(double)fi_b/1048576.0)<=2.0 ? string("gleich (+-2 MiB)") : string("ABWEICHEND")));
+		}
+	}
+	kernel_initialize.set_parameters(0u, fi);
+	kernel_stream_collide.set_parameters(0u, fi);
+	kernel_update_fields.set_parameters(0u, fi);
+	kernel_boden_eq.set_parameters(0u, fi);
+	kernel_einlass_eq.set_parameters(0u, fi);
+	if(rho_rek_max>0ull) kernel_rho_rek_ebene.set_parameters(0u, fi);
+	if(rho_aus_max>0ull) kernel_rho_ausgabe_ebene.set_parameters(0u, fi);
+	if(apg_on&&fac_N>0ull) kernel_fac_apg.set_parameters(4u, fi);
+#ifdef FORCE_FIELD
+	kernel_update_force_field.set_parameters(0u, fi);
+	if(kp1_bound) kernel_kraft_p1.set_parameters(0u, fi);
+#endif // FORCE_FIELD
+	zk_s2_wert = (ulong)sizeof(fpxx)*zk_S;
+	kernel_stream_collide.set_parameters(zk_s2_pos, zk_s2_wert);
+	if(zk_haken==6u) { // ★ Testhaken 6 (nur CPU/iGPU): ein Tabellenwort +1 -> zk_pruef [497] muss feuern
+		for(ulong r=NR/2ull; r<NR; r++) if(zk_L[r]>0u) { tile_slot[16ull+16ull*r] += 1u; tile_slot.write_to_device(); println("ZK TESTHAKEN 6: Zeile "+to_string(r)+" Basiswort +1 (Soll: [497] > 0)"); break; }
+	}
+	if(zk_haken==8u) { // ★ Testhaken 8 (nur CPU/iGPU, Pruefbefund N-c): ALLE Zeilenbasen gleichfoermig +1 -- Nachbarsaetze und Praefixkette bleiben stimmig, nur die Anker in zk_pruef [497] muessen feuern
+		for(ulong r=0ull; r<NR; r++) for(ulong q=0ull; q<7ull; q++) tile_slot[16ull+16ull*r+q] += 1u;
+		tile_slot.write_to_device();
+		println("ZK TESTHAKEN 8: alle Zeilenbasen +1 (Soll: [497] > 0 allein ueber die Anker)");
+	}
+	if(zk_haken==7u) { // ★ Testhaken 7 (nur CPU/iGPU): Zelle direkt vor einem Loch (Solid, Abstand 1) auf Fluid -> zk_pruef [499] muss feuern
+		for(ulong r=NR/2ull; r<NR; r++) if(zk_L[r]>0u) { const ulong n_ = r*Nx+(ulong)zk_A[r]-1ull; flags[n_] = 0u; flags.write_to_device(); println("ZK TESTHAKEN 7: Zelle "+to_string(n_)+" vor dem Loch der Zeile "+to_string(r)+" auf Fluid (Soll: [499] > 0)"); break; }
+	}
+	const uint vorhersage = belegt_vor+(uint)(fi.capacity()/1048576ull)-0u; // Allokator zaehlt MB je Puffer abgeschnitten; der Platzhalter (19 x 2 B) zaehlte 0
+	println("ZK FI KOMPAKT N "+to_string(N)+" N' "+to_string(Ns)+" S "+to_string(zk_S)+" PK "+to_string(Ns)+" fi "+to_string((double)fi_b/1048576.0, 1u)+" MiB statt "+to_string((double)(N*(ulong)velocity_set*(ulong)sizeof(fpxx))/1048576.0, 1u)+" MiB (frei "+to_string((double)((N-zk_S)*(ulong)velocity_set*(ulong)sizeof(fpxx))/1048576.0, 1u)+" MiB) | Belegung vor "+to_string(belegt_vor)+" nach "+to_string(belegt_nach)+" Vorhersage "+to_string(vorhersage)+" MB -> "+(belegt_nach==vorhersage ? string("gleich") : string("ABWEICHEND")));
+	if(belegt_nach!=vorhersage) print_warning("ZK FI KOMPAKT: Belegung nach der Allokation weicht von der Vorhersage ab.");
+}
+
 void LBM::finalize_sparse_tiles() { // FORK: Block-Tiling abschliessen (no-op wenn ausgeschaltet)
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finalize_sparse_tiles();
+	for(uint d=0u; d<get_D(); d++) if(lbm_domain[d]->zk_on) { lbm_domain[d]->zk_zensus(); lbm_domain[d]->zk_finalisieren(); } // ★ 06.10.2026 ZKS Z1/Z4: Lochzensus nach der Voxelierung, dann Tabelle, Stufe 2, fi kompakt (initialize kommt spaeter)
 }
 
 
@@ -4779,7 +5258,7 @@ void LBM_Domain::alloc_rho_ausgabe(const ulong max_plane_cells) {
 	rho_aus_max = max_plane_cells;
 	rho_aus = Memory<float>(device, max_plane_cells, 1u);
 	kernel_rho_ausgabe_ebene = Kernel(device, max_plane_cells, "rho_ausgabe_ebene", fi, rho, flags.k(), t, rho_aus, 0u, 0u, 0u, 0u, 1u, 1u, 0u, rho_clamp_hits); // fi 0, rho 1, flags 2, t 3, out 4, Ebene 5..10, zaehlen 11, hits 12, tile_slot 13
-	if(sparse_on) kernel_rho_ausgabe_ebene.add_parameters(tile_slot); // Guard wie im Kernel (Falle 8)
+	if(sparse_on||zk_on) kernel_rho_ausgabe_ebene.add_parameters(tile_slot); // Guard wie im Kernel (Falle 8)
 	print_info("rho-Ausgabe (RHO_RAND C2a, Nachkollisionssumme): Puffer fuer "+to_string(max_plane_cells)+" Ebenenzellen = "+to_string((float)(4ull*max_plane_cells)/1.0e6f,2u)+" MB auf "+device.info.name+".");
 }
 

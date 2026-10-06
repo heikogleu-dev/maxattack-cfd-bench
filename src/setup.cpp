@@ -7012,6 +7012,27 @@ static void lese_rho_rand_einzelgitter(const string& fall) {
 // ★ 04.10.2026 U_RAND -- ABNAHME der Wirkpfad-Zaehler (PLAN-VRAM-URAND-FLAGS-2026-10-04.md B.8). Druckt, wirft NICHT (Werkzeugfalle 24):
 // der Aufrufer wirft einmal hinter allen uebrigen Abnahmen. Slots: 484 Papierkorb gelesen (Soll 0), 485 Kopf-Magic ungueltig (Soll 0),
 // 486/487 geschrieben/ohne Slot an t = zaehl_takt+2 (Ist = Soll aus den Host-Flags und ur_idx_host), 489/490 Ausgabe V (U1c).
+// ★ 06.10.2026 ZKS Z2 -- ABNAHME der Wirkpfad-Zaehler, gesammelt (Werkzeugfalle 24: druckt, wirft NICHT; der Aufrufer wirft am Fallende).
+// [493] Arbeitsgruppen durch den ZK-Kopf an t = zaehl_takt+2, Soll (Nx_pad/64)*Ny*Nz; [494] Zellen hinter dem Solid-Ausstieg mit n%1024 == 0
+// am selben Schritt, Soll aus den Host-Flags (TYPE_MS = S|E zaehlt mit, nur reines Solid steigt aus); [495] Untergruppen-Geraetetest, Soll 0.
+// Ohne ZK muessen alle drei 0 sein (die Slots sind sonst frei).
+static bool berichte_zk(LBM& L, const string& wo) {
+	LBM_Domain* d = L.lbm_domain[0];
+	// ★ 06.10.2026 Pruefbefund M3: OHNE ZK kein Geraete-Read (die Slots 493..495 sind ohne das Define ZK konstruktiv 0) -- sonst waere bei
+	// CFD_U_RAND=0 dieser Read wieder die letzte Geraeteaktion vor _exit(0), die Konstellation des bcs-Engine-Resets vom 06.10.
+	if(!d->zk_on) return true;
+	d->finish_queue(); d->rho_clamp_hits.read_from_device();
+	const ulong h493 = d->rho_clamp_hits[493], h494 = d->rho_clamp_hits[494], h495 = d->rho_clamp_hits[495];
+	const ulong N = L.get_N();
+	ulong s494 = 0ull;
+	for(ulong n=0ull; n<N; n+=1024ull) if((L.flags[n]&(TYPE_S|TYPE_E))!=TYPE_S) s494++; // (TYPE_S|TYPE_E) = TYPE_BO des Geraetecodes
+	const ulong s493 = (ulong)(d->zk_nxp/(uint)WORKGROUP_SIZE)*(ulong)d->get_Ny()*(ulong)d->get_Nz();
+	const ulong zs = zaehl_takt()+2ull;
+	const bool z_im_lauf = L.get_t()>zs;
+	const bool ok = z_im_lauf ? (h493==s493&&h494==s494&&h495==0ull) : false;
+	println("ZK ABNAHME "+wo+" Gruppen[493] "+to_string(h493)+" Soll "+to_string(s493)+" Zellen_n1024[494] "+to_string(h494)+" Soll "+to_string(s494)+" Untergruppe[495] "+to_string(h495)+" Soll 0 (t = "+to_string(zs)+(z_im_lauf?"":", NICHT im Lauf")+")"+(ok?" BESTANDEN":" VERLETZT"));
+	return ok;
+}
 static bool berichte_u_rand(LBM& L, const string& wo) {
 	LBM_Domain* d = L.lbm_domain[0];
 	if(!d->u_rand_on) return true;
@@ -7877,6 +7898,7 @@ void main_setup_kugel() {
 		const ulong bq=(ulong)lbm.lbm_domain[0]->rho_clamp_hits[20];
 		print_info("BODEN_EQ-Wirkpfad Kugel: "+to_string(bq)+" Band-Resets (t%100-Stichprobe).");
 		if(bq==0ull) print_error("CFD_BODEN_EQ gesetzt, aber Kugel-Wirkpfad NULL -- lautloser No-Op.");
+		lbm.lbm_domain[0]->boden_eq_abnahme("kugel"); // ★ 06.10.2026 M2: Ist=Soll Slot 20+117 gegen Bandzellen x Stichproben (hits eben gelesen, kein weiterer Geraete-Read)
 	}
 	// ★ P-TRT-ABNAHME AUF EBENE 1, ausserhalb JEDER Bedingung (Pruefbefund 10.09. abends).
 	// Sie stand zuerst im CFD_FACETTEN-Block; im Fahrzeugbericht haette sie sogar zusaetzlich
@@ -9040,6 +9062,17 @@ static void main_setup_fahrzeug_dd() {
 	      if(flags4_selbsttest()>0u) print_error("FLAGS4 SELBSTTEST: Beanstandung(en) im Host-Packer -- siehe Zeile darueber. Lauf nicht gestartet.");
 	      println("FLAGS4 LESESTELLE CFD_FLAGS4="+to_string(LBM_Domain::s_flags4)+" (Nahfeld: flags 4 Bit je Zelle auf dem Geraet, Hostfeld bleibt ein Byte je Zelle)");
 	    }
+	    // ★ 06.10.2026 ZKS (CFD_ZK, PLAN-ZKS-VOLLBAU-2026-10-06.md): LESESTELLE neben s_flags4 (Werkzeugfalle 21: nie im Konstruktor). NUR das
+	    // Nahfeld; der Fernfeld-Block unten nullt die Statik vor dem Bau von lbm_c. Sperren hier an der Lesestelle (Werkzeugfalle 12); der
+	    // Konstruktor prueft dieselben Sperren noch einmal an der Instanz. Eigene Statik: s_sparse_tiles_on bleibt unberuehrt.
+	    LBM_Domain::s_zk = env_u("CFD_ZK", 0u);
+	    if(LBM_Domain::s_zk>1u) print_error("CFD_ZK kennt nur 0 (aus, Vorgabe) und 1 (Zeilenkompaktierung von fi im Nahfeld).");
+	    if(LBM_Domain::s_zk==0u&&env_u("CFD_ZK_HAKEN", 0u)>0u) print_warning("CFD_ZK_HAKEN ist gesetzt, CFD_ZK aber 0 -- wirkungslos (Ansage-Doktrin).");
+	    if(env_u("CFD_ZK_HAKEN", 0u)>8u) print_error("CFD_ZK_HAKEN kennt nur 1 (Zensus Kandidat), 2 (Rand), 3 (Umgebung), 5 ([495] Untergruppe), 6 (Tabellenwort -> [497]), 7 (Zelle vor Loch -> [499]), 8 (alle Basen +1 -> Anker [497]) -- 5..8 nur CPU/iGPU -- und 4 (Praefix einer Lochzeile + 1, Soll: Selbsttest Monotonie reisst; nur Host).");
+	    if(LBM_Domain::s_zk>0u) {
+	      if(env_on("CFD_SPARSE_TILES")) print_error("CFD_ZK mit CFD_SPARSE_TILES: ausgeschlossen (beide bilden fi um).");
+	      println("ZK LESESTELLE CFD_ZK="+to_string(LBM_Domain::s_zk)+" (Nahfeld: Zeilenkompaktierung; Zensus nach der Voxelierung)");
+	    }
 	    if(rs_>0u&&env_u("CFD_RHO_RAND", 1u)==0u) print_info("rho-SPARSAM (CFD_RHO_SPARSAM, TODO 2 Schritt 1): stream_collide schreibt rho nur noch fuer x >= Nx-2 (konstruktive Obermenge von po_interior -- der Druckauslass ist die x_max-Flaeche, die Innenzelle stammt aus einer 26er-Nachbarsuche) sowie an jedem "+to_string(LBM_Domain::s_rho_takt)+"-ten feinen Schritt, also an der Sample-Kadenz, nach der der Host das Feld liest. u bleibt UNANGETASTET. Abnahme ist der Bytevergleich gegen einen Arm mit CFD_RHO_SPARSAM=0.");
 	  }
 	  { // ★ 15.09.2026 RHO_RAND, Commit C0 (RHO_RAND-PLAN.md): rho nur noch in der Domaenen-Randschale R1,
@@ -9132,6 +9165,7 @@ static void main_setup_fahrzeug_dd() {
 	  LBM_Domain::s_rho_rand = 0u; // ★ 15.09. RHO_RAND: Fernfeld bleibt voll (Plan K3); explizit, weil die Statik vom Nahfeld-Bau noch steht
 	  LBM_Domain::s_u_rand = 0u;   // ★ 04.10.2026 U_RAND: Fernfeld bleibt voll (nur Nahfeld); explizit, die Statik vom Nahfeld-Bau steht noch
 	  LBM_Domain::s_flags4_pruef = false; // ★ 05.10.2026 FLAGS4: keine Geraeteprobe im Fernfeld
+	  LBM_Domain::s_zk = 0u;       // ★ 06.10.2026 ZKS: Fernfeld bleibt dicht (nur Nahfeld); explizit, die Statik vom Nahfeld-Bau steht noch
 	  LBM_Domain::s_flags4 = 0u;   // ★ 05.10.2026 FLAGS4: Fernfeld bleibt bei einem Byte je Zelle (nur Nahfeld); explizit, die Statik vom Nahfeld-Bau steht noch
 	  LBM_Domain::s_u_takt   = (us_>0u) ? se_ : 0u;
 	  if(rs_>0u||us_>0u) print_info("FELD-SPARSAM Fernfeld: Schreibmasken-Box = Nahfeld-Fussabdruck ("+to_string(NF_OX)+","+to_string(NF_OY)+","+to_string(NF_OZ)+") + ("+to_string(cex)+","+to_string(cey)+","+to_string(cez)+"), plus Randschale 2; Takt "+to_string(se_)+" GROBE Schritte fuer die Hostlesungen. Gleiche Bauform wie im Nahfeld, andere Box.");
@@ -10472,6 +10506,7 @@ static void main_setup_fahrzeug_dd() {
 	if(lbm_c.lbm_domain[0]->u_rand_on) print_error("U_RAND: das Fernfeld traegt u_rand_on -- die Statik wurde vor lbm_c nicht genullt.");
 	lbm_f.run(0u); // nur initialisieren
 	lbm_c.run(0u);
+	lbm_f.lbm_domain[0]->zk_pruefen(); // ★ 06.10.2026 ZKS Pruefbefund M-2: einmaliger Pruefkernel nach initialize (No-Op ohne ZK), Abbruch vor der Zeitschleife
 	KlemmBilanz kb_nah, kb_fern; // ★ 15.09.2026 Klemmen S0c: Startstand beider Domaenen
 	klemm_lesen(lbm_f, kb_nah, 0.0, false, out_dir+"klemmen_nah.csv", "Nahfeld"); klemm_lesen(lbm_c, kb_fern, 0.0, false, out_dir+"klemmen_fern.csv", "Fernfeld");
 	// ★ SPEICHER-ZWISCHENSTAND (Heiko 29.08.: "was wir wirklich nutzen"). Die Zeile
@@ -10579,6 +10614,12 @@ static void main_setup_fahrzeug_dd() {
 		print_info("SPEICHER-SPITZENWERT (Kopplung und Schale gebunden): Nahfeld belegt "+to_string(belegt_f)
 			+" MB von "+to_string(kap_f)+" MB, rechnerisch frei "+to_string(frei_r)+" MB"
 			+(frei_g>0ull ? string("; GEMESSEN frei "+to_string(frei_g)+" MB (enthaelt den Desktop)") : string("")));
+		if(lbm_f.lbm_domain[0]->zk_on&&!lbm_f.lbm_domain[0]->get_device().info.uses_ram) { // ★ 06.10.2026 ZKS Pruefbefund M-1: Restluft HART pruefen, vor der Zeitschleife
+			const ulong kf_mib = (8ull*lbm_f.lbm_domain[0]->f_slots+1024ull*31ull*4ull+1048575ull)/1048576ull; // noch offen: kf_liste + kfb_liste (2 x 4 B je Wandsolid) und kp1
+			println("ZK RESTLUFT vor der Zeitschleife gemessen frei "+to_string(frei_g)+" MiB, noch offen kf_liste/kp1 "+to_string(kf_mib)+" MiB, Mindestluft 1024 -> "+(frei_g==0ull ? string("NICHT MESSBAR") : (frei_g>=kf_mib+1024ull ? "passt, Restluft "+to_string(frei_g-kf_mib)+" MiB" : string("ABBRUCH"))));
+			if(frei_g>0ull&&frei_g<kf_mib+1024ull) print_error("ZK RESTLUFT: gemessen frei "+to_string(frei_g)+" MiB - kf_liste/kp1 "+to_string(kf_mib)+" MiB < 1024 MiB Mindestluft -- Lauf vor der Zeitschleife abgebrochen.");
+			if(frei_g==0ull) print_warning("ZK RESTLUFT: freier VRAM nicht messbar -- Mindestluft vor der Zeitschleife ungeprueft.");
+		}
 		print_info("   NOCH OFFEN: kf_liste bindet erst in der Zeitschleife beim ersten Kraefte-Sample."
 			" Der wahre Spitzenwert faellt also NACH jedem Speicherwaechter -- ein Lauf kann den"
 			" Aufbau ueberleben und danach am Speicher sterben. Wer knapp faehrt, rechnet sie dazu.");
@@ -12341,6 +12382,8 @@ static void main_setup_fahrzeug_dd() {
 	  if(env_u("CFD_BODEN_EQ_ABSTAND",0u)>0u&&bqa_n==0ull) print_warning("CFD_BODEN_EQ_ABSTAND gesetzt, aber im Nahfeld keine Aussparung gezaehlt -- Reifenschutz wirkungslos?"); }
 		if(env_u("CFD_BODEN_EQ",0u)>0u&&bqf==0ull) print_error("CFD_BODEN_EQ gesetzt, aber Nahfeld-Wirkpfad NULL -- lautloser No-Op.");
 		if(env_u("CFD_FERN_BODEN_EQ",0u)>0u&&bqc==0ull) print_error("CFD_FERN_BODEN_EQ gesetzt, aber Fernfeld-Wirkpfad NULL -- lautloser No-Op.");
+		lbm_f.lbm_domain[0]->boden_eq_abnahme("nah"); // ★ 06.10.2026 M2: Ist=Soll Slot 20+117 gegen Bandzellen x Stichproben (hits eben gelesen, kein weiterer Geraete-Read)
+		lbm_c.lbm_domain[0]->boden_eq_abnahme("fern");
 	}
 	if(env_u("CFD_FERN_EINLASS_EQ",0u)>0u) { // ★ EINLASS_EQ-Wirkpfad-Nachweis (Muster BODEN_EQ, Slot 21)
 		lbm_f.lbm_domain[0]->rho_clamp_hits.read_from_device(); lbm_c.lbm_domain[0]->rho_clamp_hits.read_from_device();
@@ -12562,6 +12605,9 @@ static void main_setup_fahrzeug_dd() {
 	// Der Arm waere dann nicht nur P-TRT-disqualifiziert, sondern voellig ungeprueft.
 	pruefe_ptrt(lbm_f.lbm_domain[0], "Nahfeld");
 	pruefe_ptrt(lbm_c.lbm_domain[0], "Fernfeld"); // ★ das Fernfeld bekommt PTRT ueber dasselbe getenv MIT -- ungeprueft waere es eine zweite, stille Variable
+	// ★ 06.10.2026 ZKS: sammelt, geworfen wird am Fallende (Werkzeugfalle 24). Pruefbefund M3: VOR berichte_rho_rand und den uebrigen
+	// Fallende-Abnahmen -- ein Geraete-Read darf nie die letzte Aktion vor _exit(0) sein (bcs-Reset 06.10.).
+	const bool zk_ok = berichte_zk(lbm_f, "Nahfeld");
 	berichte_rho_rand(lbm_f, "Nahfeld", true); // ★ 15.09. RHO_RAND C2c
 	if(env_u("CFD_RHO_REK_PRUEF", 0u)>0u) { // ★ 15.09. RHO_RAND C1: Probezellen und Ausgabe-Kandidaten im NAHFELD bei entwickelter Stroemung, hinter allen Abnahmen
 		if(lbm_f.lbm_domain[0]->rho_takt>0u) print_error("CFD_RHO_REK_PRUEF im dd-Fall braucht CFD_RHO_SPARSAM=0 (Nahfeld): sonst schreibt stream_collide rho im Inneren nicht, und der Vergleich laese Altwerte.");
@@ -12576,9 +12622,19 @@ static void main_setup_fahrzeug_dd() {
 		const Flags_Puffer& fp_ = lbm_f.lbm_domain[0]->flags;
 		println("FLAGS4 BERICHT Nahfeld "+string(fp_.ist_vier() ? "4 Bit" : "Byte")+" Geraetepuffer "+to_string(fp_.geraet_bytes())+" B, gepackt hochgeladen "+to_string(fp_.n_hoch)+" gelesen "+to_string(fp_.n_runter)+", Rundreise abweichend "+to_string(fp_.rundreise_abw)+" fremd "+to_string(fp_.fremd)+" (Soll 0/0)");
 	}
+	// ★ 06.10.2026 ZKS: berichte_zk VOR berichte_u_rand. Stand es dahinter, war sein Zaehler-Read (finish + blockierende Kopie) die letzte
+	// Geraeteaktion wenige ms vor _exit(0) [Hypothese, Gegenprobe Serie zk2b_*] -- auf der B70 folgte dann bei fast jedem Laufende ein bcs-Engine-Reset (xe GT0, guc_id 26,
+	// 06.10. 12:01-13:20, auch mit CFD_ZK=0 und im Prototyp mit berichte_zk_probe; master und Z1 ohne diesen Read: kein Reset). Dahinter
+	// liest berichte_u_rand Zaehler und Geraete-Flags und rechnet danach lange auf dem Host -- wie in master.
 	const bool ur_ok = berichte_u_rand(lbm_f, "Nahfeld"); // ★ 04.10.2026 U_RAND: druckt hier, geworfen wird hinter klemm_bilanz_abschluss
+	if(lbm_f.lbm_domain[0]->zk_on) { // ★ 06.10.2026 ZKS Pruefbefund N-1: sauberes Laufende -- alle Domaenen leeren, danach nur noch Host-Arbeit bis _exit (kein Geraete-Read als letzte Aktion, bcs-Reset 06.10.)
+		for(uint d=0u; d<lbm_f.get_D(); d++) lbm_f.lbm_domain[d]->finish_queue();
+		for(uint d=0u; d<lbm_c.get_D(); d++) lbm_c.lbm_domain[d]->finish_queue();
+		println("ZK LAUFENDE alle Domaenen geleert (finish), es folgt nur Host-Arbeit");
+	}
 	klemm_bilanz_abschluss("main_setup_fahrzeug_dd"); // ★ 15.09.2026 Klemmen S0b: Abbruch bei verletzter Abnahme erst am Fallende
 	if(!ur_ok) print_error("U_RAND-Abnahme VERLETZT -- siehe die Zeilen 'U_RAND ABNAHME' oben.");
+	if(!zk_ok) print_error("ZK-Abnahme VERLETZT -- siehe die Zeile 'ZK ABNAHME' oben.");
 	_exit(0);
 }
 
@@ -13079,6 +13135,10 @@ void main_setup() { // Fallauswahl: CFD_CASE = kugel (Default) | kanal | fahrzeu
 	if(env_u("CFD_FAC_R1Q", 0u)>0u) { // ★ 28.09. R1Q: dieselbe Ansage wie fuer REK -- nur kanal, kugel und fahrzeug_dd rufen Zensus und Abnahme
 		const string fall_r1q = c!=nullptr ? string(c) : string("kugel");
 		if(fall_r1q!="kanal"&&fall_r1q!="kugel"&&fall_r1q!="fahrzeug_dd") print_error("CFD_FAC_R1Q>0 gesetzt, aber CFD_CASE="+fall_r1q+" ruft weder den Zensus (Marke) noch pruefe_r1q_wirkpfad -- der Lauf rechnete ohne Quelle und meldete es nicht.");
+	}
+	if(env_u("CFD_ZK", 0u)>0u) { // ★ 06.10.2026 ZKS: nur fahrzeug_dd liest CFD_ZK (Lesestelle neben s_flags4); jeder andere Fall rechnete still dicht
+		const string fall_zk = c!=nullptr ? string(c) : string("kugel");
+		if(fall_zk!="fahrzeug_dd") print_error("CFD_ZK>0 gesetzt, aber CFD_CASE="+fall_zk+" -- die Zeilenkompaktierung ist nur im fahrzeug_dd-Nahfeld gebaut; der Lauf rechnete still dicht.");
 	}
 	if(env_u("CFD_FAC_REKPI", 0u)>0u) { // ★ 03.10. REK-PI: dieselbe Ansage -- nur kanal, kugel und fahrzeug_dd rufen pruefe_rekpi_vorbedingungen und pruefe_rekpi_wirkpfad
 		const string fall_rp = c!=nullptr ? string(c) : string("kugel");

@@ -794,6 +794,19 @@ public:
 		const cl_int e = clGetKernelWorkGroupInfo(cl_kernel(), device->info.cl_device(), CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(cl_ulong), &v, nullptr);
 		return e==CL_SUCCESS ? (ulong)v : ~0ull;
 	}
+	inline ulong max_subgroup(const ulong lokal) const { // ★ 06.10.2026 ZKS M1: max. Untergruppenbreite des uebersetzten Kernels fuer die lokale Groesse (OpenCL 2.1+), 0 = nicht abfragbar
+		// Ueber den Erweiterungszeiger clGetKernelSubGroupInfoKHR (cl_khr_subgroups): die mitgelieferte libOpenCL-Stub-Bibliothek (OpenCL 1.2)
+		// exportiert clGetKernelSubGroupInfo nicht, der Linker scheiterte (06.10.). KHR-Name und Kernkonstante 0x2033 sind wertgleich.
+		typedef cl_int (*sgi_fn)(::cl_kernel, ::cl_device_id, cl_uint, size_t, const void*, size_t, void*, size_t*);
+		cl_platform_id pf = nullptr;
+		if(clGetDeviceInfo(device->info.cl_device(), CL_DEVICE_PLATFORM, sizeof(cl_platform_id), &pf, nullptr)!=CL_SUCCESS||pf==nullptr) return 0ull;
+		const sgi_fn f = (sgi_fn)clGetExtensionFunctionAddressForPlatform(pf, "clGetKernelSubGroupInfoKHR");
+		if(f==nullptr) return 0ull;
+		size_t v = 0u;
+		const size_t l = (size_t)lokal;
+		const cl_int e = f(cl_kernel(), device->info.cl_device(), (cl_uint)CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE, sizeof(size_t), &l, sizeof(size_t), &v, nullptr);
+		return e==CL_SUCCESS ? (ulong)v : 0ull;
+	}
 	inline ulong max_workgroup() const {
 		size_t v = 0u;
 		const cl_int e = clGetKernelWorkGroupInfo(cl_kernel(), device->info.cl_device(), CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &v, nullptr);
