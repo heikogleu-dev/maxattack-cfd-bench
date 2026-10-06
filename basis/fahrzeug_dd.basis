@@ -3,6 +3,7 @@
 # dx_ref: 4
 # Spalten: NAME WERT EINHEIT
 # --- BEGRUENDUNGEN (bleiben bei Neuerzeugung erhalten) ---
+# NACHGEZOGEN (von Hand, 2026-10-06, Heiko 06.10.: "Dann muss leider N=12 Standard werden"): CFD_SCHRITTE_PRO_ZELLE 10 -> 12 (u_lat 0,1 -> 0,0833). Grund: 4-mm-Volllauf p4_n10_std2 traegt bei N = 10 die Gittermode ueber/hinter dem Dach (spz_leiter_auswertung.py: y-Mode 0,83 gegen 0,009 bei N = 12, Cp_rms_inst 0,22 gegen 0,067; AUSWERTUNG-P4-N10-2026-10-06.md). Die 8-mm-Grenze (zwischen 10 und 9) gilt bei 4 mm nicht. Anker 8 mm N = 12: 15378211796086792561.
 # NACHGEZOGEN (von Hand, 2026-10-05 spaet, Heiko 05.10.: "N=10 Standard" -- Sweep SWEEP-SPZ-ZB4-2026-10-05.md: Gittermode setzt erst zwischen 10 und 9 ein, N = 10 Cp'-rms/y-Mode wie 12, Dachfeld <= 0,7 SE am Bezug, -15,5 % Wanduhr): CFD_SCHRITTE_PRO_ZELLE 12 -> 10 (u_lat 0,0833 -> 0,1, Ma_lat 0,144 -> 0,173). basis_aus_lauf.py --nachziehen aendert keine Werte (bricht bei vorhandenem Schalter ab) -- deshalb von Hand. Die schritte_fein-Schalter (ZAEHL_TAKT, SISM_AB/T, SLICE_NEAR_STEPS) bleiben auf u_lat 0,075/dx_ref definiert und werden im Lauf umgerechnet (env_schritte). Voraussetzung erfuellt: Slot-206-Waechter zaehlt seit 5c92642 im 4-Schritt-Fenster (bei N = 10 traf der Einzelschritt einen Vollschreibschritt, rc 1). Bezuege mit 12 (Anker 15378211796086792561) deklarieren ab jetzt CFD_SCHRITTE_PRO_ZELLE=12. Offen: Einsatzpunkt der Gittermode bei 4 mm nicht gemessen (nur 8 mm).
 # NACHGEZOGEN (basis_aus_lauf.py --nachziehen, 2026-10-05, Grund: Pruefbefund C-N6 (AUDIT-LOOP-2026-10-05-C): Laufzeit-Schalter mit Vorgabe 1 ohne Basiszeile -- ein Wechsel der Code-Vorgabe waere fuer den Waechter unsichtbar (Klasse Nebenbefund 12); Werte = heutige Vorgaben, Feld unveraendert): Einheiten unveraendert; ergaenzt CFD_ZELLBASEN 1, CFD_RHO_RAND 1.
 # NACHGEZOGEN (basis_aus_lauf.py --nachziehen, 2026-10-05, Grund: Heiko 05.10.: geprueft + Wirkung belegt => Standard. FLAGS4 (flags 4 Bit), Pruefung bc35a5f ohne HOCH, B70 8 mm Anker bitgleich in 5 Armen (Binary 0784be9, auch mit U_RAND 3), 4 mm -312,3 MiB VRAM, Wanduhr gleich): Einheiten unveraendert; ergaenzt CFD_FLAGS4 1.
@@ -206,7 +207,7 @@ CFD_PTRT 1.90 modus
 CFD_REIB_TANGENTIAL 1 modus
 CFD_RHO_RAND 1 modus
 CFD_RHO_SPARSAM 1 modus
-CFD_SCHRITTE_PRO_ZELLE 10 modus
+CFD_SCHRITTE_PRO_ZELLE 12 modus
 CFD_SGS_BAND 2 modus
 CFD_SGS_BAND_PI 1 modus
 CFD_SGS_FDWAND 1 modus

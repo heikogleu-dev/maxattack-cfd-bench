@@ -12,8 +12,8 @@ on one workstation — and states how every number it reports was measured.**
 ![Resolution](https://img.shields.io/badge/resolution-4%20mm-0A7BBB?style=for-the-badge)
 ![Cells](https://img.shields.io/badge/fine%20cells-654.9%20M-0A7BBB?style=for-the-badge)
 ![VRAM](https://img.shields.io/badge/4%20mm%20near%20field-25%20687%20MiB%20VRAM-0A7BBB?style=for-the-badge)
-![Forces](https://img.shields.io/badge/pressure%20Cd%20%C2%B7%20Cz%20vs%20OpenFOAM%2013-89%25%20%C2%B7%2083%25%20%E2%80%94%20gap%20open-D97706?style=for-the-badge)
-![Bandwidth](https://img.shields.io/badge/main%20kernel-397%20GB%2Fs%20%C2%B7%2065%25%20of%20peak-6E7781?style=for-the-badge)
+![Forces](https://img.shields.io/badge/pressure%20Cd%20%C2%B7%20Cz%20vs%20OpenFOAM%2013-96%25%20%C2%B7%2080%25%20%E2%80%94%20gap%20open-D97706?style=for-the-badge)
+![Bandwidth](https://img.shields.io/badge/main%20kernel%20DRAM-400%20GB%2Fs%20%C2%B7%2066%25%20of%20peak-6E7781?style=for-the-badge)
 
 ![Hardware](https://img.shields.io/badge/Intel%20Arc%20Pro%20B70-32%20GB-0068B5?style=flat-square&logo=intel&logoColor=white)
 ![iGPU](https://img.shields.io/badge/Arrow%20Lake%20iGPU-far%20field-0068B5?style=flat-square&logo=intel&logoColor=white)
@@ -45,17 +45,17 @@ instrumentation layer that makes silent errors loud.
 |---|---|
 | **Case** | Road vehicle, 4 mm near field, Re ≈ 8 × 10⁶, moving ground, rotating wheel contact |
 | **Grid** | **654.9 M** fine cells on an Intel Arc Pro B70 (32 GB) + **289.0 M** coarse far-field cells @ 16 mm on an Arrow-Lake iGPU |
-| **Pressure drag** | **0.490** vs OpenFOAM 13 **0.548** — **89 %** of the reference (pressure field, contact band removed) |
-| **Pressure downforce** | **−1.085** vs OF13 **−1.306** — **83 %** of the reference — *the open problem* |
+| **Pressure drag** | **0.525** vs OpenFOAM 13 **0.548** — **96 %** of the reference (pressure field, contact band removed, time mean) |
+| **Pressure downforce** | **−1.041** vs OF13 **−1.306** — **80 %** of the reference — *the open problem* |
 | **Hardware** | One workstation. No cluster, no CUDA, no NVIDIA |
 | **Memory** | **41.2 B per cell** on device at 4 mm, all buffers included (measured), against 93 B for upstream FP32 |
-| **Bandwidth** | Main kernel `stream_collide` **≈ 397 GB/s — 65 % of the B70's 608 GB/s peak**, 76 % of what upstream reaches on the same card. Not bandwidth-bound (VTune stall profile) |
+| **Bandwidth** | Main kernel `stream_collide` **399.8 GB/s of real DRAM traffic — 66 % of the B70's 608 GB/s peak** (VTune hardware counters, 2026-10-06), 77 % of what upstream reaches on the same card. Limited before DRAM: L3 93 % busy, 42 % of cycles stalled |
 | **Pacer** | The **iGPU far field**, not the B70, sets the time per coarse step |
 | **Proof** | Every mechanism carries an action-path counter with an is = should acceptance. Every change that must not alter the physics is accepted only bit-identical: same field hash, every export file byte-equal |
 
 <sub>Forces: pressure field P1 (Σ 2 wᵢ (ρ − 1) cᵢ over the wall links), contact band = the lowest four
-cell layers, mean of two instantaneous fields (601 / 740 ms) of the 4 mm run `p4_b12_5L`
-(2026-10-04, 12 steps per cell, 741 ms). OpenFOAM 13: surface pressure without the same band.
+cell layers, time mean 0.201–0.741 s of the solver-side P1 series (4 mm run `p4_n10_std2`,
+2026-10-06, ±0.009 / ±0.015); the 12-step reference `p4_b12_5L` gives the same mean within ±0.003. OpenFOAM 13: surface pressure without the same band.
 Friction is left out on purpose; see *Results* for why, and for why the coefficients this page
 quoted before 2026-10-04 were withdrawn.</sub>
 
@@ -165,15 +165,14 @@ the quantity that is defined the same way in both solvers and at every grid spac
 
 | 4 mm, contact band removed | FX (P1) | OpenFOAM 13 | FX / OF13 |
 |---|---|---|---|
-| **Pressure drag** | **0.490** | 0.548 | 89 % |
-| **Pressure downforce** | **−1.085** | −1.306 | 83 % |
+| **Pressure drag** | **0.525** | 0.548 | 96 % |
+| **Pressure downforce** | **−1.041** | −1.306 | 80 % |
 | Friction drag / lift | *not comparable yet* | 0.042 / +0.0065 | |
 | *OF13 totals for reference* | | *Cd 0.599 · Cz −1.301* | |
 
-<sub>FX: run `p4_b12_5L` (2026-10-04, 12 steps per cell, 741 ms), mean of two instantaneous fields
-(601 / 740 ms). Two instants are not a time mean — the facet-path downforce at these two instants
-differs from its window mean by up to 0.09 — so from the next run on the solver writes P1 as a time
-series. OF13: k-ω-SST, t = 1200, same STL, same zones, same band edge.</sub>
+<sub>FX: time mean 0.201–0.741 s of the solver-side P1 series, 4 mm run `p4_n10_std2` (2026-10-06);
+the same mean for the 12-step reference `p4_b12_5L` agrees within ±0.003. The figures quoted here until
+2026-10-06 (0.490 / −1.085) were the mean of two instantaneous fields and happened to be low. OF13: k-ω-SST, t = 1200, same STL, same zones, same band edge.</sub>
 
 > [!NOTE]
 > **Every mechanism in this fork carries an action-path counter with an is = should acceptance,
@@ -260,10 +259,10 @@ velocity stored only where it is read (U_RAND), four-bit flags (FLAGS4), and the
 restricted to wall cells (KF-FILTER, which changes only the summation order and thus the last bits
 of the force sums).
 
-**Not yet run:** a 4 mm production run with the full 2026-10-05 default — 10 steps per cell, the
-corrected friction booking, and P1 written by the solver. It is the next step. Measured at 8 mm,
-10 steps per cell save **15.5 %** wall clock against 12 (279.6 → 236.3 s), byte cell bases another
-**3.3 %**. A 4 mm wall-clock figure for the new default does not exist yet, so none is given here.
+**4 mm with the new memory levers** (`p4_n10_std2`, 2026-10-06, 10 steps per cell): 25 687 MiB on the B70,
+6 925 s for the 741 ms time loop. At 10 steps per cell, however, the lattice mode appears above the roof at
+4 mm, so the default went back to 12 steps per cell; a 4 mm wall-clock figure with 12 steps and all levers
+has not been measured yet. Byte cell bases alone raise the near-field throughput by 2.7 %.
 The 75 min this page used to quote was `p4_bandpi2_4`: 501 ms at 8 steps per cell, not comparable.
 
 ### What sets the run time
@@ -274,10 +273,11 @@ bytes-per-cell formula, which counts every cell, including solid ones, and field
 not write every step. It is not a measured bandwidth. A traffic balance on 2026-09-11 found the display
 47 % above the real traffic.
 
-**Measured with VTune** (2026-10-05, 8 mm vehicle, kernel time × a byte model of 76 B per fluid cell
-plus 0.5 B of flags): `stream_collide` moves **≈ 397 GB/s** — **65 %** of the B70's 608 GB/s peak,
-75 % of a triad measured on this card (531 GB/s), **76 % of what upstream FluidX3D reaches on the
-same card (520 GB/s)**. And it is **not bandwidth-bound**: of its stall samples, 41 % are active,
+**Measured with VTune DRAM hardware counters** (2026-10-06, 8 mm vehicle): `stream_collide` moves
+**399.8 GB/s** (203.1 read + 196.6 write) — **66 %** of the B70's 608 GB/s peak, 75 % of a triad measured
+on this card (531 GB/s), **77 % of what upstream FluidX3D reaches on the same card (520 GB/s)**; 76.3 B per
+fluid cell, matching the byte model within 0.3 %. The L3 is 93 % busy. The far-field kernel on the iGPU is
+compute-bound (XVE 70 % active, 97 % occupancy, at its 2.0 GHz maximum) and uses about 50 GB/s of system memory. And it is **not bandwidth-bound**: of its stall samples, 41 % are active,
 29 % wait for load data, 10 % for instruction fetch, and only 7.7 % for a full memory queue. Code size,
 instruction issue and load latency limit it — the wall-model, sub-cell-boundary and band paths live
 in the hot kernel. At upstream's bandwidth the kernel would need 11.1 instead of 14.5 ms (−24 %);
@@ -342,7 +342,7 @@ for this case. Every figure was measured on this rig.
 | **Two-device domain decomposition** — fine near field on the B70, coarse far field on the iGPU, with a smoothed coupling | The far field costs system RAM instead of VRAM |
 | **Compact fields** — two-byte distributions, density and velocity; velocity stored only where it is read, density only on the boundary shell, flags in four bits | **41.2 B per cell** measured at 4 mm, all buffers; 4 mm near field **28 698 → 25 687 MiB** on 2026-10-05 |
 | **Sparse field writes**, register-level scheduling, byte cell bases | Measured lever by lever at 8 mm, each bit-identical: sparse velocity writes −1.5 %, byte cell bases −3.3 % wall clock |
-| **10 steps per cell** — the lattice velocity as high as the measured lattice-mode limit allows | −15.5 % wall clock against 12 steps (8 mm). Not bit-identical by nature (a physics variable); roof field within 0.7 SE of the 12-step run |
+| **12 steps per cell** — the lattice velocity below the measured lattice-mode limit | 10 steps would save 18.8 % wall clock at 4 mm, but there the lattice mode appears above the roof (spanwise mode share 0.83 against 0.009 at 12), so the default stays at 12 (2026-10-06) |
 | **Real VRAM accounting from `/proc/*/fdinfo`** | `intel_gpu_top` cannot see the B70 — the `xe` driver has no i915 PMU. Root-free per-device utilisation instead of a reconstruction |
 
 ### Intel platform robustness
@@ -415,8 +415,8 @@ reconstructing one by hand once cost a full morning of measurements.
 
 | | | |
 |---|---|---|
-| 🚧 | **Downforce** | **83 %** of the reference (pressure, 4 mm) — *the open problem* |
-| 🚧 | **Drag** | **89 %** of the reference (pressure, 4 mm) — not closed |
+| 🚧 | **Downforce** | **80 %** of the reference (pressure, 4 mm, time mean) — *the open problem* |
+| 🚧 | **Drag** | **96 %** of the reference (pressure, 4 mm, time mean) — nearly closed |
 | 🚧 | **Roof boundary layer** | too thick on windscreen and roof; same wall-treatment mechanism as the wing |
 | 🚧 | **Rank-1 wall cells** | restoration stage 4 run at 4 mm: boundary layer toward the reference, downforce away from it — not in the default |
 | ✅ | **Memory default 2026-10-05** | 4 mm near field −3 011 MiB, field hash unchanged |
@@ -428,7 +428,7 @@ reconstructing one by hand once cost a full morning of measurements.
 **Lattice mode.** From mid-September to 2026-10-03 every run used 8 steps per cell. At that lattice
 velocity a standing lattice mode (spanwise period about three cells) forms above the roof, with a
 pressure-coefficient rms of 0.46 at 4 mm. A sweep at 8 mm placed its onset sharply between 10 and 9
-steps per cell; the default has been 10 since 2026-10-05. The mode was not the main cause of the
+steps per cell; at 4 mm, however, 10 steps per cell still carry the mode (2026-10-06), so the default is 12. The mode was not the main cause of the
 early separation: removing it at 8 mm moved the separation point by +1.5 SE only.
 
 ### The open problem, made visible: rank-1 wall cells on gently sloping surfaces
@@ -523,9 +523,8 @@ form that belongs here.
 
 ### Next steps
 
-1. **The 4 mm production run with the 2026-10-05 default** — first forces with the corrected friction
-   booking and a solver-side P1 time series, and the check whether the lattice mode stays away at 4 mm
-   with 10 steps per cell.
+1. **A 4 mm production run with 12 steps per cell and all memory levers** — the reference for the
+   next physics changes; the corrected friction booking and the solver-side P1 series are in place.
 2. **Performance, far field first** — the iGPU sets the pace, so the far-field kernel, the boundary
    kernels and the order of the coupled step come before any B70 kernel work. Each lever is measured
    before it is built.
@@ -590,7 +589,7 @@ flags are loaded only at the roughly one million moving-boundary cells.
 | Arc Pro B70, peak | 608 GB/s ([Puget Systems](https://www.pugetsystems.com/labs/articles/intel-arc-pro-b70-review/), vendor figure — the same source's 22.94 TFLOPS matches our own device query, 22.938) |
 | Triad, measured on this card | 531 GB/s |
 | Upstream FluidX3D, measured on this card | 520 GB/s |
-| **This fork, `stream_collide`, 8 mm vehicle** | **≈ 397 GB/s = 65 % of peak, 76 % of upstream** — VTune kernel time × byte model |
+| **This fork, `stream_collide`, 8 mm vehicle** | **399.8 GB/s = 66 % of peak, 77 % of upstream** — VTune DRAM hardware counters (2026-10-06); the byte model (76.5 B per fluid cell, 397 GB/s) agrees within 0.3 % |
 | Upstream's claim across vendors | 96–100 % of peak |
 
 > [!IMPORTANT]
