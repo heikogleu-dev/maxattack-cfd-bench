@@ -441,8 +441,8 @@ early separation: removing it at 8 mm moved the separation point by +1.5 SE only
 <sub>Block above the roof (x 2.2–3.0 m, z 1.35–1.7 m); mode share = fraction of the fluctuation power at the
 spanwise period of about three cells, from a 3-D FFT of each density snapshot. 8 mm: sweep of 2026-10-05.
 4 mm: snapshots at ≥ 600 ms of the runs `p4_ref_5L`/`p4_r1q4_5L` (8), `p4_n10_std2` (10) and `p4_b12_5L` (12);
-an independent FFT on the field gives 0.89 at a period of exactly 3.00 cells for 10 steps. The onset moves to
-fewer lattice velocity as the grid gets finer, so the 8 mm limit does not carry over; forces averaged over
+an independent FFT on the field gives 0.89 at a period of exactly 3.00 cells for 10 steps. The onset moves to a
+lower lattice velocity (more steps per cell) as the grid gets finer, so the 8 mm limit does not carry over; forces averaged over
 the window did not change between 10 and 12 steps (0.525 / −1.041 against 0.527 / −1.047).</sub>
 
 ### The open problem, made visible: rank-1 wall cells on gently sloping surfaces
