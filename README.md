@@ -2,17 +2,16 @@
 
 # MaxAttack CFD Bench
 
-### Vehicle aerodynamics at 4 mm on a single Intel GPU
+### Vehicle aerodynamics at 4 mm and 3.5 mm on a single Intel GPU
 
 **A lattice-Boltzmann wall-modelled LES that resolves the flow around a road vehicle<br>
 on one workstation — and states how every number it reports was measured.**
 
 <br>
 
-![Resolution](https://img.shields.io/badge/resolution-4%20mm-0A7BBB?style=for-the-badge)
-![Cells](https://img.shields.io/badge/fine%20cells-654.9%20M-0A7BBB?style=for-the-badge)
+![Resolution](https://img.shields.io/badge/resolution-4%20mm%20%C2%B7%203.5%20mm-0A7BBB?style=for-the-badge)
 ![VRAM](https://img.shields.io/badge/4%20mm%20near%20field-25%20687%20MiB%20VRAM-0A7BBB?style=for-the-badge)
-![Forces](https://img.shields.io/badge/pressure%20Cd%20%C2%B7%20Cz%20vs%20OpenFOAM%2013-96%25%20%C2%B7%2080%25%20%E2%80%94%20gap%20open-D97706?style=for-the-badge)
+![Forces](https://img.shields.io/badge/pressure%20Cd%20%C2%B7%20Cz%20vs%20OpenFOAM%2013-95%25%20%C2%B7%2079%25%20at%203.5%20mm%20%E2%80%94%20gap%20open-D97706?style=for-the-badge)
 ![Bandwidth](https://img.shields.io/badge/main%20kernel%20DRAM-400%20GB%2Fs%20%C2%B7%2066%25%20of%20peak-6E7781?style=for-the-badge)
 ![3.5 mm](https://img.shields.io/badge/3.5%20mm%20near%20field-816.5%20M%20cells%20on%2032%20GB-0A7BBB?style=for-the-badge)
 
@@ -44,29 +43,28 @@ instrumentation layer that makes silent errors loud.
 
 | | |
 |---|---|
-| **Case** | Road vehicle, 4 mm near field, Re ≈ 8 × 10⁶, moving ground, rotating wheel contact |
-| **Grid** | **654.9 M** fine cells on an Intel Arc Pro B70 (32 GB) + **289.0 M** coarse far-field cells @ 16 mm on an Arrow-Lake iGPU |
-| **Pressure drag** | **0.525** vs OpenFOAM 13 **0.548** — **96 %** of the reference (pressure field, contact band removed, time mean) |
-| **Pressure downforce** | **−1.041** vs OF13 **−1.306** — **80 %** of the reference — *the open problem* |
+| **Case** | Road vehicle, 4 mm and 3.5 mm near field, Re ≈ 8 × 10⁶, moving ground, rotating wheel contact |
+| **Grid** | 3.5 mm: **816.5 M** fine cells on an Intel Arc Pro B70 (32 GB) + **437 M** far-field cells @ 14 mm on an Arrow-Lake iGPU · 4 mm: 654.9 M + 289.0 M @ 16 mm |
+| **Pressure drag** | **0.521** (3.5 mm) / 0.525 (4 mm) vs OpenFOAM 13 **0.548** — **95 % / 96 %** of the reference (pressure field, contact band removed, time mean) |
+| **Pressure downforce** | **−1.027** (3.5 mm) / −1.041 (4 mm) vs OF13 **−1.306** — **79 % / 80 %** — *the open problem; finer cells do not close it* |
 | **Hardware** | One workstation. No cluster, no CUDA, no NVIDIA |
-| **Memory** | **41.2 B per cell** on device at 4 mm, all buffers included (measured), against 93 B for upstream FP32 |
+| **Memory** | **41.2 B per cell** on device at 4 mm, all buffers included (measured), against 93 B for upstream FP32; at 3.5 mm row compaction skips 70.1 M solid cells and leaves 1.6 GB of the 32 GB free |
 | **Bandwidth** | Main kernel `stream_collide` **399.8 GB/s of real DRAM traffic — 66 % of the B70's 608 GB/s peak** (VTune hardware counters, 2026-10-06), 77 % of what upstream reaches on the same card. Limited before DRAM: L3 93 % busy, 42 % of cycles stalled |
 | **Pacer** | The **iGPU far field**, not the B70, sets the time per coarse step |
 | **Proof** | Every mechanism carries an action-path counter with an is = should acceptance. Every change that must not alter the physics is accepted only bit-identical: same field hash, every export file byte-equal |
 
 <sub>Forces: pressure field P1 (Σ 2 wᵢ (ρ − 1) cᵢ over the wall links), contact band = the lowest four
-cell layers, time mean 0.201–0.741 s of the solver-side P1 series (4 mm run `p4_n10_std2`,
-2026-10-06, ±0.009 / ±0.015); the 12-step reference `p4_b12_5L` gives the same mean within ±0.003. OpenFOAM 13: surface pressure without the same band.
+cell layers, time mean 0.201–0.741 s of the solver-side P1 series (3.5 mm run `p35_m375_zk` and
+4 mm run `p4_n10_std2`, both 2026-10-06, ±0.009 / ±0.015); the 12-step reference `p4_b12_5L` gives the same mean within ±0.003. OpenFOAM 13: surface pressure without the same band.
 Friction is left out on purpose; see *Results* for why, and for why the coefficients this page
 quoted before 2026-10-04 were withdrawn.</sub>
 
-![A 4 mm production run — near field at 500 ms](docs/anker_p4_bandpi2_nah_500ms.png)
+![The 3.5 mm run — near field at 701 ms](docs/p35_m375_zk_nah_701ms.png)
 
-*A 4 mm production run: `p4_bandpi2_4` (2026-09-22), Toyota MR2 at 30 m/s, near-field |u| on the
-Y = 0.025 m slice at t = 500 ms — 15→45 m/s blue→white→red, black = solid. 654.9 M cells at 4 mm on
-a single Arc Pro B70; engine bay with radiator fins resolved, rear wing attached, full turbulent
-wake. This is an instantaneous LES field, not a mean. The run used 8 steps per cell, at which a
-lattice mode is present above the roof (see* Status*); the forces on this page come from later runs.*
+*The 3.5 mm run `p35_m375_zk` (2026-10-06): Toyota MR2 at 30 m/s, near-field |u| on the
+Y = 0.025 m slice at t = 701 ms, the solver's own slice image (colour scale blue→white→red, black = solid).
+816.5 M cells at 3.5 mm on a single Arc Pro B70, 12 steps per cell, row compaction on. This is an
+instantaneous LES field, not a mean; the forces on this page are time means of the same run.*
 
 ---
 
@@ -164,14 +162,14 @@ the far field that sets the pace of every coarse step (see *What sets the run ti
 The comparison is made on the **pressure field**, without the wheel-contact band, because that is
 the quantity that is defined the same way in both solvers and at every grid spacing:
 
-| 4 mm, contact band removed | FX (P1) | OpenFOAM 13 | FX / OF13 |
-|---|---|---|---|
-| **Pressure drag** | **0.525** | 0.548 | 96 % |
-| **Pressure downforce** | **−1.041** | −1.306 | 80 % |
-| Friction drag / lift | *not comparable yet* | 0.042 / +0.0065 | |
-| *OF13 totals for reference* | | *Cd 0.599 · Cz −1.301* | |
+| Contact band removed | FX 3.5 mm (P1) | FX 4 mm (P1) | OpenFOAM 13 | FX / OF13 (3.5 / 4 mm) |
+|---|---|---|---|---|
+| **Pressure drag** | **0.521** | 0.525 | 0.548 | 95 % / 96 % |
+| **Pressure downforce** | **−1.027** | −1.041 | −1.306 | 79 % / 80 % |
+| Friction drag / lift | *not comparable yet* | *not comparable yet* | 0.042 / +0.0065 | |
+| *OF13 totals for reference* | | | *Cd 0.599 · Cz −1.301* | |
 
-<sub>FX: time mean 0.201–0.741 s of the solver-side P1 series, 4 mm run `p4_n10_std2` (2026-10-06);
+<sub>FX: time mean 0.201–0.741 s of the solver-side P1 series, 3.5 mm run `p35_m375_zk` and 4 mm run `p4_n10_std2` (both 2026-10-06);
 the same mean for the 12-step reference `p4_b12_5L` agrees within ±0.003. The figures quoted here until
 2026-10-06 (0.490 / −1.085) were the mean of two instantaneous fields and happened to be low. OF13: k-ω-SST, t = 1200, same STL, same zones, same band edge.</sub>
 
@@ -208,9 +206,17 @@ where OF13 carries 0.006. It is removed and reported separately rather than quie
 against an earlier version of one's own code is banned by project rule: it can only find porting
 errors, and it confirms shared mistakes.
 
+![3.5 mm against OpenFOAM 13 — velocity difference](docs/diff_p35_m375_zk_vs_of13_740ms.png)
+
+***The 3.5 mm field against the OpenFOAM 13 reference*** (`p35_m375_zk`, t = 740 ms), same convention as
+below: **RMS 3.98 m/s, median −0.45 m/s, 1.07 % of cells clipping the ±15 m/s scale** over 873 174
+evaluable cells. The red rim now runs continuously from the windscreen over the roof to the rear
+screen — the boundary layer is too thick there (its total-pressure loss is 1.8 × OF13's) although the
+roof's wall pressure matches.
+
 ![4 mm against OpenFOAM 13 — velocity difference](docs/diff_p4dt_deteps_vs_of13_501ms.png)
 
-***A 4 mm field against the OpenFOAM 13 reference***, Y = 0.025 m slice: ΔU = |u|_OF13 − |u|_FX,
+***An earlier 4 mm field against the OpenFOAM 13 reference***, Y = 0.025 m slice: ΔU = |u|_OF13 − |u|_FX,
 red = OF13 faster, blue = OF13 slower / FX over-accelerated, ±15 m/s, black = solid. The red rim
 hugging the body is the boundary layer — the wall model brakes slightly harder than the RANS
 reference. The mottled wake is the snapshot-versus-mean caveat and not a discrepancy: FX is an
@@ -223,6 +229,14 @@ average. **The mean-flow regions are the part that carries meaning.** Field stat
 smaller near box used before 2026-09-21. It is not the run whose forces head this page, and it is
 labelled as what it is rather than substituted. Later runs differ in the Π-band wall treatment, whose
 effect was measured separately at 12/8 mm (RMS against OF13 −9.9 %, share above 15 m/s −42.5 %).</sub>
+
+**Where the downforce is lost at 3.5 mm** (zone decomposition of `p35_m375_zk`, fields at 603 and 740 ms, P1 with
+free-stream pressure reference, against OF13): rear wing **+0.15** (about one third from the roof wake
+in its inflow, two thirds from its own suction side: suction peak too flat, no pressure recovery
+toward the trailing edge, reverse flow from 50–70 % of the chord where OF13 stays attached), front and
+nose **+0.11**, underbody/diffuser **+0.06**, roof and windscreen **+0.01** (closed in force, but not in
+the field). Compared with 4 mm, the wing and roof gain about 0.03 each and underbody, flanks and rear
+deck lose about 0.045 each — no net gain.
 
 **Where the downforce is lost** (zone decomposition, 4 mm, same fields, against OF13):
 
