@@ -431,6 +431,20 @@ pressure-coefficient rms of 0.46 at 4 mm. A sweep at 8 mm placed its onset sharp
 steps per cell; at 4 mm, however, 10 steps per cell still carry the mode (2026-10-06), so the default is 12. The mode was not the main cause of the
 early separation: removing it at 8 mm moved the separation point by +1.5 SE only.
 
+| Steps per cell (lattice velocity) | 8 mm: spanwise mode share | 4 mm: spanwise mode share | 4 mm: Cp rms above the roof |
+|---|---|---|---|
+| 8 (u = 0.125) | 0.90 | 0.90–0.91 | 0.53–0.56 |
+| 9 (u = 0.111) | 0.84 | – | – |
+| 10 (u = 0.100) | 0.015 | **0.83** | 0.22 |
+| 12 (u = 0.083) | 0.014 | **0.009** | 0.067 (turbulence only) |
+
+<sub>Block above the roof (x 2.2–3.0 m, z 1.35–1.7 m); mode share = fraction of the fluctuation power at the
+spanwise period of about three cells, from a 3-D FFT of each density snapshot. 8 mm: sweep of 2026-10-05.
+4 mm: snapshots at ≥ 600 ms of the runs `p4_ref_5L`/`p4_r1q4_5L` (8), `p4_n10_std2` (10) and `p4_b12_5L` (12);
+an independent FFT on the field gives 0.89 at a period of exactly 3.00 cells for 10 steps. The onset moves to
+fewer lattice velocity as the grid gets finer, so the 8 mm limit does not carry over; forces averaged over
+the window did not change between 10 and 12 steps (0.525 / −1.041 against 0.527 / −1.047).</sub>
+
 ### The open problem, made visible: rank-1 wall cells on gently sloping surfaces
 
 <div align="center">
